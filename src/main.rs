@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::{fs, usize::MAX, vec};
+use std::{fs, vec};
 
 struct Section {
     depth: usize,
@@ -14,54 +14,35 @@ fn main() -> Result<()> {
     let contents = fs::read_to_string(path)?;
 
     let mut in_fence = false;
-    let mut prev_section_line_num: usize = MAX;
-
     let mut section_list: Vec<Section> = vec![];
-    let mut heading_line_buffer: &str = "";
-
     let lines_list: Vec<&str> = contents.lines().collect();
 
     for (curr_section_line_num, line) in contents.lines().enumerate() {
         if line.contains("```") && line.starts_with("```") {
             in_fence = !in_fence;
         }
-
-        if line.starts_with('#')
-            && !in_fence
-            && let Some(heading_depth) = line.find(' ')
-            && heading_depth < 7
-        {
-            if prev_section_line_num != MAX {
-                if let Some(buffer_line_heading_depth) = heading_line_buffer.find(' ') {
-                    let (_, content) = heading_line_buffer.split_at(buffer_line_heading_depth + 1);
-                    let paragraphs =
-                        lines_list[prev_section_line_num + 1..curr_section_line_num].join("\n");
-                    section_list.push(Section {
-                        depth: buffer_line_heading_depth,
-                        title_content: content.to_string(),
-                        start_line_num: prev_section_line_num + 1,
-                        end_line_num: curr_section_line_num,
-                        paragraphs,
-                    });
+        let trimmed_heading_line = line.trim_start();
+        if trimmed_heading_line.len() >= 1 {
+            let depth = trimmed_heading_line
+                .chars()
+                .take_while(|&c| c == '#')
+                .count();
+            let (_, rest) = trimmed_heading_line.split_at(depth);
+            if !in_fence && depth >= 1 && depth < 7 && rest.starts_with(" ") {
+                if let Some(last_section) = section_list.last_mut() {
+                    last_section.end_line_num = curr_section_line_num;
+                    last_section.paragraphs = lines_list
+                        [last_section.start_line_num + 1..curr_section_line_num]
+                        .join("\n");
                 }
+                section_list.push(Section {
+                    depth,
+                    title_content: rest.trim_start().to_string(),
+                    start_line_num: curr_section_line_num,
+                    end_line_num: curr_section_line_num,
+                    paragraphs: String::new(),
+                });
             }
-            heading_line_buffer = line;
-            prev_section_line_num = curr_section_line_num;
-        }
-    }
-
-    if prev_section_line_num != MAX {
-        if let Some(buffer_line_heading_depth) = heading_line_buffer.find(' ') {
-            let (_, content) = heading_line_buffer.split_at(buffer_line_heading_depth + 1);
-            let paragraphs =
-                lines_list[prev_section_line_num + 1..lines_list.len()].join("\n");
-            section_list.push(Section {
-                depth: buffer_line_heading_depth,
-                title_content: content.to_string(),
-                start_line_num: prev_section_line_num + 1,
-                end_line_num: lines_list.len(),
-                paragraphs,
-            });
         }
     }
 
