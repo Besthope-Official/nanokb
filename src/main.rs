@@ -3,19 +3,19 @@ use nanokb::parse_markdown;
 use std::fs;
 
 fn main() -> Result<()> {
-    let content = fs::read_to_string("examples/example2.md")?;
+    let content = fs::read_to_string("examples/example.md")?;
     let sections = parse_markdown(&content);
 
     for (idx, section) in sections.iter().enumerate() {
         let path_text = section.path(&sections).join(">");
         println!(
-            "-----\nsection_idx: {}\nstart_line_num: {}\nend_line_num: {}\ndepth: {}\ntitle: {}\nparagraphs: {}\npath: {}\n-----",
+            "-----\nsection_idx: {}\nline {}-{}\nheading_level: {}\ntitle: {}\ncontent: {}\npath: {}\n-----",
             idx,
-            section.start_line_num,
-            section.end_line_num,
-            section.depth,
-            section.title,
-            section.paragraphs,
+            section.source_span.start + 1,
+            section.source_span.end + 1,
+            section.heading_level,
+            if !section.title.is_empty() { section.title.as_str() } else { "<NO TITLE>" },
+            if !section.content.is_empty() { section.content.as_str() } else { "<NO CONTENT>" },
             path_text
         )
     }
