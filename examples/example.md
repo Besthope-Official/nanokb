@@ -18,3 +18,7 @@ sudo apt update
 看 #hashtag 这个词不是标题
 
 ####### 七个井号不算标题
+
+### double space
+
+rfind 是 bug

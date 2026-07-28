@@ -50,7 +50,7 @@ fn main() -> Result<()> {
             && heading_depth < 7
         {
             if prev_section_line_num != MAX {
-                if let Some(buffer_line_heading_depth) = heading_line_buffer.rfind(' ') {
+                if let Some(buffer_line_heading_depth) = heading_line_buffer.find(' ') {
                     let (_, content) = heading_line_buffer.split_at(buffer_line_heading_depth + 1);
                     let paragraphs =
                         lines_list[prev_section_line_num + 1..curr_section_line_num].join("\n");
