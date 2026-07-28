@@ -108,3 +108,41 @@ fn path_root(sample_sections: Vec<Section>) {
 fn path_nested(sample_sections: Vec<Section>) {
     assert_eq!(sample_sections[3].path, ["h1", "h2", "h3"]);
 }
+
+#[rstest]
+#[case("---\ntitle: hello\n---\nbody text", "hello", "body text")]
+#[case("---\ntitle: \"hello world\"\n---\nbody", "hello world", "body")]
+#[case("---\ntitle: x\n---\n", "x", "")]
+fn fm_parses_title(#[case] input: &str, #[case] title: &str, #[case] body: &str) {
+    let (fm, body_out) = parse_frontmatter(input);
+    assert_eq!(fm.get("title").unwrap(), title);
+    assert_eq!(body_out, body);
+}
+
+#[test]
+fn fm_multiple_keys() {
+    let (fm, body) = parse_frontmatter(
+        "---\ntitle: foo\ndate: 2024-01-01\ntags: rust, kb\n---\n\n# Heading\ncontent",
+    );
+    assert_eq!(fm.get("title").unwrap(), "foo");
+    assert_eq!(fm.get("date").unwrap(), "2024-01-01");
+    assert_eq!(fm.get("tags").unwrap(), "rust, kb");
+    assert!(body.starts_with("\n# Heading"));
+}
+
+#[test]
+fn fm_skip_empty_and_comment_lines() {
+    let (fm, _) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+    assert_eq!(fm.len(), 1);
+    assert_eq!(fm.get("title").unwrap(), "kept");
+}
+
+#[rstest]
+#[case("just text\nno delimiter")]
+#[case("text\n---\ntitle: x\n---\n")]
+#[case("---\ntitle: x\nbut no close")]
+fn fm_returns_raw_when_no_frontmatter(#[case] input: &str) {
+    let (fm, body) = parse_frontmatter(input);
+    assert!(fm.is_empty());
+    assert_eq!(body, input);
+}

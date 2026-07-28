@@ -1,4 +1,17 @@
-use std::ops::Range;
+use anyhow::Result;
+use std::{collections::HashMap, ops::Range, path::Path};
+
+pub struct Document {
+    pub title: String,
+    pub content: String,
+    pub metadata: HashMap<String, String>,
+}
+
+impl Document {
+    pub fn from_markdown(path: &Path) -> Result<Self> { todo!() }
+
+    pub fn from_pdf(path: &Path) -> Result<Self> { todo!() }
+}
 
 /// Section of a Markdown document.
 /// NanoKB targets at structured, layered documents (e.g. paper, blog),
@@ -69,6 +82,10 @@ pub fn parse_markdown(content: &str) -> Vec<Section> {
     }
 
     sections
+}
+
+fn parse_frontmatter(raw: &str) -> (HashMap<String, String>, &str) {
+    todo!()
 }
 
 #[cfg(test)]
