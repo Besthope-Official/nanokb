@@ -53,6 +53,11 @@ fn main() -> Result<()> {
             }
         }
     }
+    if let Some(final_section) = section_list.last_mut() {
+        final_section.end_line_num = lines_list.len();
+        final_section.paragraphs =
+            lines_list[final_section.start_line_num + 1..lines_list.len()].join("\n");
+    }
 
     for heading in section_list {
         println!(
