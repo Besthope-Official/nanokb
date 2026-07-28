@@ -1,5 +1,84 @@
 use crate::parser::*;
 use rstest::*;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
+struct TempMarkdown {
+    path: PathBuf,
+}
+
+impl TempMarkdown {
+    fn new(file_name: &str, content: &str) -> Self {
+        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("nanokb-parser-{}-{id}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join(file_name);
+        fs::write(&path, content).unwrap();
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempMarkdown {
+    fn drop(&mut self) {
+        if let Some(dir) = self.path.parent() {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[test]
+fn from_markdown_loads_frontmatter_and_body() {
+    let source = TempMarkdown::new(
+        "guide.md",
+        "---\ntitle: Guide\nauthor: NanoKB\n---\n\n# Intro\nBody",
+    );
+
+    let document = Document::from_markdown(source.path()).unwrap();
+
+    assert_eq!(document.title, "Guide");
+    assert_eq!(document.content, "\n# Intro\nBody");
+    assert_eq!(
+        document
+            .metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>(),
+        [("author", "NanoKB"), ("title", "Guide")]
+    );
+}
+
+#[rstest]
+#[case::missing_title("plain body")]
+#[case::empty_title("---\ntitle: \"\"\n---\nbody")]
+fn from_markdown_uses_file_stem_when_title_is_absent(#[case] content: &str) {
+    let source = TempMarkdown::new("fallback-title.md", content);
+
+    let document = Document::from_markdown(source.path()).unwrap();
+
+    assert_eq!(document.title, "fallback-title");
+}
+
+#[test]
+fn from_markdown_reports_source_path_when_read_fails() {
+    let missing = std::env::temp_dir().join("nanokb-missing-document.md");
+
+    let error = match Document::from_markdown(&missing) {
+        Ok(_) => panic!("reading a missing document should fail"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains(&missing.display().to_string()));
+}
 
 #[rstest]
 #[case("# h1", 1, "h1")]

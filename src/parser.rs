@@ -1,5 +1,5 @@
-use anyhow::Result;
-use std::{collections::BTreeMap, ops::Range, path::Path};
+use anyhow::{Context, Result};
+use std::{collections::BTreeMap, fs, ops::Range, path::Path};
 
 pub struct Document {
     pub title: String,
@@ -9,10 +9,27 @@ pub struct Document {
 
 impl Document {
     pub fn from_markdown(path: &Path) -> Result<Self> {
-        todo!()
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read markdown document: {}", path.display()))?;
+        let (metadata, content) = parse_frontmatter(&raw);
+        let title = metadata
+            .get("title")
+            .filter(|title| !title.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            });
+
+        Ok(Self {
+            title,
+            content: content.to_owned(),
+            metadata,
+        })
     }
 
-    pub fn from_pdf(path: &Path) -> Result<Self> {
+    pub fn from_pdf(_path: &Path) -> Result<Self> {
         todo!()
     }
 }
