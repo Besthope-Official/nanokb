@@ -52,7 +52,7 @@ fn main() -> Result<()> {
             }
         }
     }
-    if let Some(curr) = section_list.last() && curr.paragraphs.is_empty() {
+    if let Some(curr) = section_list.last() && curr.title.is_empty() {
         section_list.pop();
     }
 
