@@ -1,8 +1,3 @@
-use std::{
-    fs::File,
-    io::{BufRead, BufReader},
-};
-
 #[derive(Default)]
 pub struct Section {
     pub depth: usize,
@@ -29,26 +24,26 @@ impl Section {
 
 pub fn parse_heading(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
+    let ident = line.len() - trimmed.len();
+    if ident >= 4 {
+        return None;
+    }
     let depth = trimmed.chars().take_while(|&c| c == '#').count();
     if !(1..7).contains(&depth) {
         return None;
     }
     let rest = &trimmed[depth..];
-    if !rest.starts_with(' ') {
+    if !rest.starts_with(' ') && !rest.is_empty() {
         return None;
     }
     Some((depth, rest.trim_start()))
 }
 
-pub fn parse_markdown(path: &str) -> anyhow::Result<Vec<Section>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
+pub fn parse_markdown(content: &str) -> Vec<Section> {
     let mut in_fence = false;
     let mut sections: Vec<Section> = vec![Section::default()];
 
-    for (i, line) in reader.lines().enumerate() {
-        let line: &str = &line?;
+    for (i, line) in content.lines().enumerate() {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
@@ -72,11 +67,6 @@ pub fn parse_markdown(path: &str) -> anyhow::Result<Vec<Section>> {
             }
         }
     }
-    if let Some(curr) = sections.last()
-        && curr.title.is_empty()
-    {
-        sections.pop();
-    }
 
-    Ok(sections)
+    sections
 }

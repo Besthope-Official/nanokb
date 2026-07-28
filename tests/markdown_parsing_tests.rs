@@ -22,6 +22,7 @@ fn valid_headings(#[case] input: &str, #[case] depth: usize, #[case] title: &str
 #[case("")]
 #[case("no heading here")]
 #[case("```")]
+#[case("    # indented code")]
 fn invalid_headings(#[case] input: &str) {
     assert!(parse_heading(input).is_none());
 }
@@ -31,6 +32,41 @@ fn heading_trailing_spaces() {
     let (d, t) = parse_heading("##  double space  ").unwrap();
     assert_eq!(d, 2);
     assert_eq!(t, "double space  ");
+}
+
+#[test]
+fn document_without_heading_preserves_content() {
+    let sections = parse_markdown(
+        r#"plain text
+second line
+"#,
+    );
+
+    assert_eq!(sections.len(), 1);
+    let section = &sections[0];
+    assert_eq!(section.depth, 0);
+    assert_eq!(section.title, "");
+    assert_eq!(section.start_line_num, 0);
+    assert_eq!(section.end_line_num, 1);
+    assert_eq!(section.paragraphs, "plain text\nsecond line");
+}
+
+#[test]
+fn empty_heading_preserves_its_content() {
+    let sections = parse_markdown(
+        r#"#
+body
+"#,
+    );
+
+    let section = sections
+        .iter()
+        .find(|section| section.depth == 1)
+        .expect("the empty heading section should be preserved");
+    assert_eq!(section.title, "");
+    assert_eq!(section.start_line_num, 0);
+    assert_eq!(section.end_line_num, 1);
+    assert_eq!(section.paragraphs, "body");
 }
 
 #[fixture]
