@@ -22,13 +22,13 @@ fn main() -> Result<()> {
             in_fence = !in_fence;
         }
         let trimmed_heading_line = line.trim_start();
-        if trimmed_heading_line.len() >= 1 {
+        if !trimmed_heading_line.is_empty() {
             let depth = trimmed_heading_line
                 .chars()
                 .take_while(|&c| c == '#')
                 .count();
             let (_, rest) = trimmed_heading_line.split_at(depth);
-            if !in_fence && depth >= 1 && depth < 7 && rest.starts_with(" ") {
+            if !in_fence && (1..7).contains(&depth) && rest.starts_with(" ") {
                 if let Some(last_section) = section_list.last_mut() {
                     last_section.end_line_num = curr_section_line_num;
                     last_section.paragraphs = lines_list
