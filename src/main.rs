@@ -1,7 +1,6 @@
 use anyhow::Result;
 use std::fs;
 
-#[derive(Clone)]
 struct Section {
     depth: usize,
     title_content: String,
@@ -15,18 +14,17 @@ fn main() -> Result<()> {
     let contents = fs::read_to_string(path)?;
 
     let mut in_fence = false;
-    let mut section_list: Vec<Section> = [Section {
+    let mut section_list: Vec<Section> = vec![Section {
         depth: 0,
         title_content: String::new(),
         start_line_num: 0,
         end_line_num: 0,
         paragraphs: String::new(),
-    }]
-    .to_vec();
+    }];
     let lines_list: Vec<&str> = contents.lines().collect();
 
     for (curr_section_line_num, line) in contents.lines().enumerate() {
-        if line.contains("```") && line.starts_with("```") {
+        if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
         let trimmed_heading_line = line.trim_start();
@@ -59,16 +57,15 @@ fn main() -> Result<()> {
             lines_list[final_section.start_line_num + 1..lines_list.len()].join("\n");
     }
 
-    for heading in section_list {
+    for section in section_list {
         println!(
             "start_line_num: {}, end_line_num: {}, depth: {}, content: {}, paragraphs: {}",
-            heading.start_line_num,
-            heading.end_line_num,
-            heading.depth,
-            heading.title_content,
-            heading.paragraphs
+            section.start_line_num,
+            section.end_line_num,
+            section.depth,
+            section.title_content,
+            section.paragraphs
         )
     }
-    // println!("{}", contents);
     Ok(())
 }
