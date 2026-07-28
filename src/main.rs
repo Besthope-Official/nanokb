@@ -1,13 +1,31 @@
 use anyhow::Result;
-use std::{fs::File, io::{BufRead, BufReader}};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader},
+};
 
 #[derive(Default)]
 struct Section {
     depth: usize,
+    parent_idx: Option<usize>,
     title: String,
     start_line_num: usize,
     end_line_num: usize,
     paragraphs: String,
+}
+
+impl Section {
+    fn path(&self, all: &[Section]) -> Vec<String> {
+        let mut result: Vec<String> = vec![self.title.clone()];
+        let mut curr = self.parent_idx;
+        while let Some(idx) = curr {
+            let section = &all[idx];
+            result.push(section.title.clone());
+            curr = section.parent_idx;
+        }
+        result.reverse();
+        result
+    }
 }
 
 fn parse_heading(line: &str) -> Option<(usize, &str)> {
@@ -29,7 +47,7 @@ fn main() -> Result<()> {
     let reader = BufReader::new(file);
 
     let mut in_fence = false;
-    let mut section_list: Vec<Section> = vec![Section::default()];
+    let mut sections: Vec<Section> = vec![Section::default()];
 
     for (i, line) in reader.lines().enumerate() {
         let line: &str = &line?;
@@ -37,33 +55,42 @@ fn main() -> Result<()> {
             in_fence = !in_fence;
         }
         if !in_fence && let Some((depth, title)) = parse_heading(line) {
-            section_list.push(Section {
+            let parent_idx = sections
+                .iter()
+                .rposition(|s| s.depth < depth && s.depth > 0);
+            sections.push(Section {
                 depth,
+                parent_idx,
                 title: title.to_string(),
                 start_line_num: i,
                 end_line_num: i,
                 paragraphs: String::new(),
             });
         } else {
-            if let Some(curr) = section_list.last_mut() {
+            if let Some(curr) = sections.last_mut() {
                 curr.end_line_num = i;
                 curr.paragraphs += if curr.paragraphs.is_empty() { "" } else { "\n" };
                 curr.paragraphs += line;
             }
         }
     }
-    if let Some(curr) = section_list.last() && curr.title.is_empty() {
-        section_list.pop();
+    if let Some(curr) = sections.last()
+        && curr.title.is_empty()
+    {
+        sections.pop();
     }
 
-    for section in section_list {
+    for (idx, section) in sections.iter().enumerate() {
+        let path_text = section.path(&sections).join(">");
         println!(
-            "start_line_num: {}, end_line_num: {}, depth: {}, content: {}, paragraphs: {}",
+            "-----\nsection_idx: {}\nstart_line_num: {}\nend_line_num: {}\ndepth: {}\ncontent: {}\nparagraphs: {}\npath: {}\n-----",
+            idx,
             section.start_line_num,
             section.end_line_num,
             section.depth,
             section.title,
-            section.paragraphs
+            section.paragraphs,
+            path_text
         )
     }
     Ok(())
