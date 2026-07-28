@@ -1,26 +1,16 @@
 use std::ops::Range;
 
+/// Section of a Markdown document.
+/// NanoKB targets at structured, layered documents (e.g. paper, blog),
+/// thus markdown a suitable intermediate representation for chunk input.
 #[derive(Default)]
 pub struct Section {
-    pub heading_level: usize,
-    pub parent_idx: Option<usize>,
-    pub source_span: Range<usize>,
     pub title: String,
     pub content: String,
-}
-
-impl Section {
-    pub fn path(&self, all: &[Section]) -> Vec<String> {
-        let mut result: Vec<String> = vec![self.title.clone()];
-        let mut curr = self.parent_idx;
-        while let Some(idx) = curr {
-            let section = &all[idx];
-            result.push(section.title.clone());
-            curr = section.parent_idx;
-        }
-        result.reverse();
-        result
-    }
+    pub heading_level: usize,
+    pub source_span: Range<usize>,
+    /// heading breadcrumb
+    pub path: Vec<String>,
 }
 
 pub fn parse_heading(line: &str) -> Option<(usize, &str)> {
@@ -52,12 +42,22 @@ pub fn parse_markdown(content: &str) -> Vec<Section> {
             let parent_idx = sections
                 .iter()
                 .rposition(|s| s.heading_level < heading_level && s.heading_level > 0);
+
+            let path = match parent_idx {
+                Some(pid) => {
+                    let mut parent_path = sections[pid].path.clone();
+                    parent_path.push(title.to_string());
+                    parent_path
+                }
+                None => vec![title.to_string()],
+            };
+
             sections.push(Section {
                 heading_level,
-                parent_idx,
                 title: title.to_string(),
                 source_span: Range { start: i, end: i },
                 content: String::new(),
+                path,
             });
         } else {
             if let Some(curr) = sections.last_mut() {
@@ -70,3 +70,7 @@ pub fn parse_markdown(content: &str) -> Vec<Section> {
 
     sections
 }
+
+#[cfg(test)]
+#[path = "parser_test.rs"]
+mod tests;
