@@ -1,4 +1,4 @@
-use nanokb::*;
+use crate::parser::*;
 use rstest::*;
 
 #[rstest]
