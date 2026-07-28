@@ -1,25 +1,16 @@
+use std::ops::Range;
+
+/// Section of a Markdown document.
+/// NanoKB targets at structured, layered documents (e.g. paper, blog),
+/// thus markdown a suitable intermediate representation for chunk input.
 #[derive(Default)]
 pub struct Section {
-    pub depth: usize,
-    pub parent_idx: Option<usize>,
     pub title: String,
-    pub start_line_num: usize,
-    pub end_line_num: usize,
-    pub paragraphs: String,
-}
-
-impl Section {
-    pub fn path(&self, all: &[Section]) -> Vec<String> {
-        let mut result: Vec<String> = vec![self.title.clone()];
-        let mut curr = self.parent_idx;
-        while let Some(idx) = curr {
-            let section = &all[idx];
-            result.push(section.title.clone());
-            curr = section.parent_idx;
-        }
-        result.reverse();
-        result
-    }
+    pub content: String,
+    pub heading_level: usize,
+    pub source_span: Range<usize>,
+    /// heading breadcrumb
+    pub path: Vec<String>,
 }
 
 pub fn parse_heading(line: &str) -> Option<(usize, &str)> {
@@ -28,15 +19,15 @@ pub fn parse_heading(line: &str) -> Option<(usize, &str)> {
     if ident >= 4 {
         return None;
     }
-    let depth = trimmed.chars().take_while(|&c| c == '#').count();
-    if !(1..7).contains(&depth) {
+    let heading_level = trimmed.chars().take_while(|&c| c == '#').count();
+    if !(1..7).contains(&heading_level) {
         return None;
     }
-    let rest = &trimmed[depth..];
+    let rest = &trimmed[heading_level..];
     if !rest.starts_with(' ') && !rest.is_empty() {
         return None;
     }
-    Some((depth, rest.trim_start()))
+    Some((heading_level, rest.trim_start()))
 }
 
 pub fn parse_markdown(content: &str) -> Vec<Section> {
@@ -47,26 +38,39 @@ pub fn parse_markdown(content: &str) -> Vec<Section> {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
-        if !in_fence && let Some((depth, title)) = parse_heading(line) {
+        if !in_fence && let Some((heading_level, title)) = parse_heading(line) {
             let parent_idx = sections
                 .iter()
-                .rposition(|s| s.depth < depth && s.depth > 0);
+                .rposition(|s| s.heading_level < heading_level && s.heading_level > 0);
+
+            let path = match parent_idx {
+                Some(pid) => {
+                    let mut parent_path = sections[pid].path.clone();
+                    parent_path.push(title.to_string());
+                    parent_path
+                }
+                None => vec![title.to_string()],
+            };
+
             sections.push(Section {
-                depth,
-                parent_idx,
+                heading_level,
                 title: title.to_string(),
-                start_line_num: i,
-                end_line_num: i,
-                paragraphs: String::new(),
+                source_span: Range { start: i, end: i },
+                content: String::new(),
+                path,
             });
         } else {
             if let Some(curr) = sections.last_mut() {
-                curr.end_line_num = i;
-                curr.paragraphs += if curr.paragraphs.is_empty() { "" } else { "\n" };
-                curr.paragraphs += line;
+                curr.source_span.end = i;
+                curr.content += if curr.content.is_empty() { "" } else { "\n" };
+                curr.content += line;
             }
         }
     }
 
     sections
 }
+
+#[cfg(test)]
+#[path = "parser_test.rs"]
+mod tests;

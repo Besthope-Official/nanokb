@@ -44,11 +44,11 @@ second line
 
     assert_eq!(sections.len(), 1);
     let section = &sections[0];
-    assert_eq!(section.depth, 0);
+    assert_eq!(section.heading_level, 0);
     assert_eq!(section.title, "");
-    assert_eq!(section.start_line_num, 0);
-    assert_eq!(section.end_line_num, 1);
-    assert_eq!(section.paragraphs, "plain text\nsecond line");
+    assert_eq!(section.source_span.start, 0);
+    assert_eq!(section.source_span.end, 1);
+    assert_eq!(section.content, "plain text\nsecond line");
 }
 
 #[test]
@@ -61,39 +61,39 @@ body
 
     let section = sections
         .iter()
-        .find(|section| section.depth == 1)
+        .find(|section| section.heading_level == 1)
         .expect("the empty heading section should be preserved");
     assert_eq!(section.title, "");
-    assert_eq!(section.start_line_num, 0);
-    assert_eq!(section.end_line_num, 1);
-    assert_eq!(section.paragraphs, "body");
+    assert_eq!(section.source_span.start, 0);
+    assert_eq!(section.source_span.end, 1);
+    assert_eq!(section.content, "body");
 }
 
 #[fixture]
 fn sample_sections() -> Vec<Section> {
     vec![
         Section {
-            depth: 0,
-            parent_idx: None,
+            heading_level: 0,
             title: String::new(),
+            path: vec![],
             ..Default::default()
         },
         Section {
-            depth: 1,
-            parent_idx: None,
+            heading_level: 1,
             title: "h1".into(),
+            path: vec!["h1".into()],
             ..Default::default()
         },
         Section {
-            depth: 2,
-            parent_idx: Some(1),
+            heading_level: 2,
             title: "h2".into(),
+            path: vec!["h1".into(), "h2".into()],
             ..Default::default()
         },
         Section {
-            depth: 3,
-            parent_idx: Some(2),
+            heading_level: 3,
             title: "h3".into(),
+            path: vec!["h1".into(), "h2".into(), "h3".into()],
             ..Default::default()
         },
     ]
@@ -101,13 +101,10 @@ fn sample_sections() -> Vec<Section> {
 
 #[rstest]
 fn path_root(sample_sections: Vec<Section>) {
-    assert_eq!(sample_sections[1].path(&sample_sections), vec!["h1"]);
+    assert_eq!(sample_sections[1].path, ["h1"]);
 }
 
 #[rstest]
 fn path_nested(sample_sections: Vec<Section>) {
-    assert_eq!(
-        sample_sections[3].path(&sample_sections),
-        vec!["h1", "h2", "h3"]
-    );
+    assert_eq!(sample_sections[3].path, ["h1", "h2", "h3"]);
 }
