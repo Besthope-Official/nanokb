@@ -29,7 +29,7 @@ fn main() -> Result<()> {
         }
         // last heading
         if curr_section_line_num + 1 == lines_list.len() {
-            if prev_section_line_num != 0 {
+            if prev_section_line_num != MAX {
                 if let Some(buffer_line_heading_depth) = heading_line_buffer.rfind(' ') {
                     let (_, content) = heading_line_buffer.split_at(buffer_line_heading_depth + 1);
                     let paragraphs =
