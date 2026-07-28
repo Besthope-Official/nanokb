@@ -110,39 +110,73 @@ fn path_nested(sample_sections: Vec<Section>) {
 }
 
 #[rstest]
-#[case("---\ntitle: hello\n---\nbody text", "hello", "body text")]
-#[case("---\ntitle: \"hello world\"\n---\nbody", "hello world", "body")]
-#[case("---\ntitle: x\n---\n", "x", "")]
-fn fm_parses_title(#[case] input: &str, #[case] title: &str, #[case] body: &str) {
-    let (fm, body_out) = parse_frontmatter(input);
-    assert_eq!(fm.get("title").unwrap(), title);
-    assert_eq!(body_out, body);
+#[case::single_key(
+    "---\ntitle: hello\n---\nbody text",
+    &[("title", "hello")],
+    "body text",
+)]
+#[case::quoted_values(
+    "---\ntitle: \"hello world\"\nauthor: 'Nano KB'\n---\nbody",
+    &[("title", "hello world"), ("author", "Nano KB")],
+    "body",
+)]
+#[case::multiple_keys(
+    "---\ntitle: foo\ndate: 2024-01-01\ntags: rust, kb\n---\n\n# Heading\ncontent",
+    &[("title", "foo"), ("date", "2024-01-01"), ("tags", "rust, kb")],
+    "\n# Heading\ncontent",
+)]
+#[case::empty_frontmatter("---\n---\nbody", &[], "body")]
+#[case::empty_body("---\ntitle: x\n---\n", &[("title", "x")], "")]
+#[case::trimmed_key_and_colon_in_value(
+    "---\n title : \"hello: world\" \n---\nbody",
+    &[("title", "hello: world")],
+    "body",
+)]
+#[case::crlf(
+    "---\r\ntitle: hello\r\n---\r\nfirst\r\nsecond",
+    &[("title", "hello")],
+    "first\r\nsecond",
+)]
+fn frontmatter_parses_metadata_and_preserves_body(
+    #[case] input: &str,
+    #[case] expected_metadata: &[(&str, &str)],
+    #[case] expected_body: &str,
+) {
+    let (metadata, body) = parse_frontmatter(input);
+
+    assert_eq!(metadata.len(), expected_metadata.len());
+    for (key, value) in expected_metadata {
+        assert_eq!(metadata.get(*key).map(String::as_str), Some(*value));
+    }
+    assert_eq!(body, expected_body);
 }
 
 #[test]
-fn fm_multiple_keys() {
-    let (fm, body) = parse_frontmatter(
-        "---\ntitle: foo\ndate: 2024-01-01\ntags: rust, kb\n---\n\n# Heading\ncontent",
-    );
-    assert_eq!(fm.get("title").unwrap(), "foo");
-    assert_eq!(fm.get("date").unwrap(), "2024-01-01");
-    assert_eq!(fm.get("tags").unwrap(), "rust, kb");
-    assert!(body.starts_with("\n# Heading"));
+fn frontmatter_accepts_yaml_comments_and_blank_lines() {
+    let (metadata, body) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata.get("title").map(String::as_str), Some("kept"));
+    assert_eq!(body, "body");
 }
 
 #[test]
-fn fm_skip_empty_and_comment_lines() {
-    let (fm, _) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
-    assert_eq!(fm.len(), 1);
-    assert_eq!(fm.get("title").unwrap(), "kept");
+fn frontmatter_discards_invalid_yaml_metadata() {
+    let (metadata, body) = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
+
+    assert!(metadata.is_empty());
+    assert_eq!(body, "body");
 }
 
 #[rstest]
-#[case("just text\nno delimiter")]
-#[case("text\n---\ntitle: x\n---\n")]
-#[case("---\ntitle: x\nbut no close")]
-fn fm_returns_raw_when_no_frontmatter(#[case] input: &str) {
-    let (fm, body) = parse_frontmatter(input);
-    assert!(fm.is_empty());
+#[case::plain_text("just text\nno delimiter")]
+#[case::delimiter_after_content("text\n---\ntitle: x\n---\n")]
+#[case::unclosed("---\ntitle: x\nbut no close")]
+#[case::leading_blank_line("\n---\ntitle: x\n---\nbody")]
+#[case::near_miss_delimiter("----\ntitle: x\n---\nbody")]
+fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
+    let (metadata, body) = parse_frontmatter(input);
+
+    assert!(metadata.is_empty());
     assert_eq!(body, input);
 }

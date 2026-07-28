@@ -1,16 +1,20 @@
 use anyhow::Result;
-use std::{collections::HashMap, ops::Range, path::Path};
+use std::{collections::BTreeMap, ops::Range, path::Path};
 
 pub struct Document {
     pub title: String,
     pub content: String,
-    pub metadata: HashMap<String, String>,
+    pub metadata: BTreeMap<String, String>,
 }
 
 impl Document {
-    pub fn from_markdown(path: &Path) -> Result<Self> { todo!() }
+    pub fn from_markdown(path: &Path) -> Result<Self> {
+        todo!()
+    }
 
-    pub fn from_pdf(path: &Path) -> Result<Self> { todo!() }
+    pub fn from_pdf(path: &Path) -> Result<Self> {
+        todo!()
+    }
 }
 
 /// Section of a Markdown document.
@@ -84,8 +88,40 @@ pub fn parse_markdown(content: &str) -> Vec<Section> {
     sections
 }
 
-fn parse_frontmatter(raw: &str) -> (HashMap<String, String>, &str) {
-    todo!()
+fn parse_frontmatter(raw: &str) -> (BTreeMap<String, String>, &str) {
+    let remains = if let Some(remains) = raw.strip_prefix("---\n") {
+        remains
+    } else if let Some(remains) = raw.strip_prefix("---\r\n") {
+        remains
+    } else {
+        return (BTreeMap::new(), raw);
+    };
+
+    let mut yaml_len = 0;
+    let mut closing_len = None;
+    for line in remains.split_inclusive('\n') {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            closing_len = Some(line.len());
+            break;
+        }
+        yaml_len += line.len();
+    }
+
+    let Some(closing_len) = closing_len else {
+        return (BTreeMap::new(), raw);
+    };
+
+    let yaml_section = &remains[..yaml_len];
+    let body = &remains[yaml_len + closing_len..];
+    let metadata = match yaml_serde::from_str(yaml_section) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("[WARN] invalid frontmatter yaml, skipping metadata: {e}");
+            BTreeMap::new()
+        }
+    };
+
+    (metadata, body)
 }
 
 #[cfg(test)]
