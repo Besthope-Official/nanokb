@@ -50,6 +50,9 @@ fn main() -> Result<()> {
             }
         }
     }
+    if let Some(curr) = section_list.last() && curr.paragraphs.is_empty() {
+        section_list.pop();
+    }
 
     for section in section_list {
         println!(
