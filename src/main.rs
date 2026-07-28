@@ -9,6 +9,20 @@ struct Section {
     paragraphs: String,
 }
 
+fn parse_heading(line: &str) -> Option<(usize, &str)> {
+    let trimmed = line.trim_start();
+    if !trimmed.is_empty() {
+        let depth = trimmed.chars().take_while(|&c| c == '#').count();
+        if (1..7).contains(&depth) {
+            let (_, rest) = trimmed.split_at(depth);
+            if rest.starts_with(" ") {
+                return Some((depth, rest.trim_start()));
+            }
+        }
+    }
+    None
+}
+
 fn main() -> Result<()> {
     let path = "examples/example.md";
     let contents = fs::read_to_string(path)?;
@@ -27,14 +41,8 @@ fn main() -> Result<()> {
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
-        let trimmed_heading_line = line.trim_start();
-        if !trimmed_heading_line.is_empty() {
-            let depth = trimmed_heading_line
-                .chars()
-                .take_while(|&c| c == '#')
-                .count();
-            let (_, rest) = trimmed_heading_line.split_at(depth);
-            if !in_fence && (1..7).contains(&depth) && rest.starts_with(" ") {
+        if let Some((depth, title)) = parse_heading(line) {
+            if !in_fence {
                 if let Some(last_section) = section_list.last_mut() {
                     last_section.end_line_num = curr_section_line_num;
                     last_section.paragraphs = lines_list
@@ -43,7 +51,7 @@ fn main() -> Result<()> {
                 }
                 section_list.push(Section {
                     depth,
-                    title_content: rest.trim_start().to_string(),
+                    title_content: title.to_string(),
                     start_line_num: curr_section_line_num,
                     end_line_num: curr_section_line_num,
                     paragraphs: String::new(),
