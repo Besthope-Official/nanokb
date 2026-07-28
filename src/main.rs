@@ -1,6 +1,7 @@
 use anyhow::Result;
-use std::{fs, vec};
+use std::fs;
 
+#[derive(Clone)]
 struct Section {
     depth: usize,
     title_content: String,
@@ -14,7 +15,14 @@ fn main() -> Result<()> {
     let contents = fs::read_to_string(path)?;
 
     let mut in_fence = false;
-    let mut section_list: Vec<Section> = vec![];
+    let mut section_list: Vec<Section> = [Section {
+        depth: 0,
+        title_content: String::new(),
+        start_line_num: 0,
+        end_line_num: 0,
+        paragraphs: String::new(),
+    }]
+    .to_vec();
     let lines_list: Vec<&str> = contents.lines().collect();
 
     for (curr_section_line_num, line) in contents.lines().enumerate() {
