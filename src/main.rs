@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::fs;
+use std::{fs::File, io::{BufRead, BufReader}};
 
 #[derive(Default)]
 struct Section {
@@ -25,12 +25,14 @@ fn parse_heading(line: &str) -> Option<(usize, &str)> {
 
 fn main() -> Result<()> {
     let path = "examples/example.md";
-    let contents = fs::read_to_string(path)?;
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
 
     let mut in_fence = false;
     let mut section_list: Vec<Section> = vec![Section::default()];
 
-    for (i, line) in contents.lines().enumerate() {
+    for (i, line) in reader.lines().enumerate() {
+        let line: &str = &line?;
         if line.trim_start().starts_with("```") {
             in_fence = !in_fence;
         }
