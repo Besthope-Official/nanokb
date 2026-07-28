@@ -24,7 +24,7 @@ fn main() -> Result<()> {
 
     for (curr_section_line_num, line) in contents.lines().enumerate() {
         // println!("line: {}", curr_section_line_num + 1);
-        if line.contains("```") {
+        if line.contains("```") && line.starts_with("```") {
             in_fence = !in_fence;
         }
         // last heading

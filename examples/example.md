@@ -1,3 +1,8 @@
+---
+name: example doc
+description: used for test md chunk utility
+---
+
 # 安装
 
 准备工作
@@ -12,6 +17,8 @@ apt install 一下
 # 这行是注释不是标题
 sudo apt update
 ```
+
+a```b is plain text
 
 ## 配置
 
