@@ -1,34 +1,32 @@
 use anyhow::Result;
-use nanokb::{apply_filters, chunk_sections, parse_markdown, ChunkStrategy, Filter};
-use std::fs;
+use nanokb::{
+    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_sections, parse_markdown,
+};
+use std::{env, path::PathBuf};
 
 fn main() -> Result<()> {
-    let content = fs::read_to_string("examples/example.md")?;
-    let sections = parse_markdown(&content);
+    let source_path = env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("examples/example.md"));
+    let filters = [Filter::DropReference];
+    let chunk_strategy = ChunkStrategy::Structured {
+        metadata_mode: MetadataMode::Path,
+    };
 
-    for (idx, section) in sections.iter().enumerate() {
-        let path_text = section.path.join(">");
-        println!(
-            "-----\nsection_idx: {}\nline {}-{}\nheading_level: {}\ntitle: {}\ncontent: {}\npath: {}\n-----",
-            idx,
-            section.source_span.start + 1,
-            section.source_span.end + 1,
-            section.heading_level,
-            if !section.title.is_empty() {
-                section.title.as_str()
-            } else {
-                "<NO TITLE>"
-            },
-            if !section.content.is_empty() {
-                section.content.as_str()
-            } else {
-                "<NO CONTENT>"
-            },
-            path_text
-        )
-    }
-    let sections = apply_filters(sections, &[Filter::DropReference]);
-    let chunks = chunk_sections(&sections, &ChunkStrategy::Structured);
+    let document = Document::from_markdown(&source_path)?;
+    let sections = parse_markdown(&document.content);
+    let sections = apply_filters(sections, &filters);
+    let chunks = chunk_sections(&sections, &chunk_strategy);
+
+    println!(
+        "document: {}\nsource: {}\nmetadata: {:?}\nsections: {}\nchunks: {}\n-----",
+        document.title,
+        source_path.display(),
+        document.metadata,
+        sections.len(),
+        chunks.len()
+    );
     for (idx, chunk) in chunks.iter().enumerate() {
         println!(
             "chunk_idx: {}\nchunk_id: {}\ntext: {}\nembedding_text: {}\n-----",

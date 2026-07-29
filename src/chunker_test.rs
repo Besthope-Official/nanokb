@@ -13,8 +13,12 @@ fn make_section(content: &str, path: &[&str]) -> Section {
     }
 }
 
-fn chunk_one(content: &str, path: &[&str]) -> Chunk {
-    let chunks = chunk_sections(&[make_section(content, path)], &ChunkStrategy::Structured);
+fn structured(metadata_mode: MetadataMode) -> ChunkStrategy {
+    ChunkStrategy::Structured { metadata_mode }
+}
+
+fn chunk_one_with_mode(content: &str, path: &[&str], metadata_mode: MetadataMode) -> Chunk {
+    let chunks = chunk_sections(&[make_section(content, path)], &structured(metadata_mode));
 
     assert_eq!(
         chunks.len(),
@@ -24,9 +28,13 @@ fn chunk_one(content: &str, path: &[&str]) -> Chunk {
     chunks.into_iter().next().unwrap()
 }
 
+fn chunk_one(content: &str, path: &[&str]) -> Chunk {
+    chunk_one_with_mode(content, path, MetadataMode::Path)
+}
+
 #[test]
 fn structured_returns_no_chunks_for_no_sections() {
-    assert!(chunk_sections(&[], &ChunkStrategy::Structured).is_empty());
+    assert!(chunk_sections(&[], &structured(MetadataMode::Path)).is_empty());
 }
 
 #[rstest]
@@ -60,10 +68,18 @@ fn structured_preserves_section_order() {
         make_section("Content two.", &["H1", "H2"]),
     ];
 
-    let chunks = chunk_sections(&sections, &ChunkStrategy::Structured);
+    let chunks = chunk_sections(&sections, &structured(MetadataMode::Path));
     let texts: Vec<_> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
 
     assert_eq!(texts, ["Content one.", "Content two."]);
+}
+
+#[test]
+fn structured_without_metadata_uses_content_as_embedding_text() {
+    let chunk = chunk_one_with_mode("Content.", &["Chapter", "Section"], MetadataMode::None);
+
+    assert_eq!(chunk.text, "Content.");
+    assert_eq!(chunk.embedding_text, "Content.");
 }
 
 #[test]
