@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use nanokb::AppConfig;
-use nanokb::postgres::{connect, create_kb, initialize};
+use nanokb::postgres::{connect, create_index, create_kb, initialize};
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 
@@ -47,6 +47,32 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
             .await
             .context("failed to load persisted conformance KB configuration")?;
     assert_eq!(stored_config, (chunk_config, embed_config));
+
+    let index_config = &config.database.index;
+    create_index(&pool, KB_NAME, index_config).await?;
+
+    let index_name = format!("idx_{KB_TABLE}_embedding");
+    let index_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = $1 AND indexname = $2)")
+            .bind(KB_TABLE)
+            .bind(&index_name)
+            .fetch_one(&pool)
+            .await
+            .context("failed to inspect pg_indexes")?;
+    assert!(index_exists, "HNSW index {index_name} should exist");
+
+    let index_method: String =
+        sqlx::query_scalar(
+            "SELECT am.amname FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indexrelid \
+             JOIN pg_am am ON am.oid = rel.relam \
+             WHERE rel.relname = $1"
+        )
+        .bind(&index_name)
+        .fetch_one(&pool)
+        .await
+        .context("failed to inspect index access method")?;
+    assert_eq!(index_method, "hnsw", "index should use HNSW access method");
 
     reset_test_kb(&pool).await?;
     Ok(())

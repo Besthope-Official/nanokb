@@ -1,5 +1,5 @@
 use crate::chunker::Chunk;
-use crate::config::EmbeddingConfig;
+use crate::config::{EmbeddingConfig, IndexConfig};
 use crate::postgres::{self, ChunkRow};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,7 @@ impl EmbeddedChunks {
         kb_name: &str,
         chunk_config: &Value,
         embed_config: &Value,
+        index_config: &IndexConfig,
     ) -> Result<()> {
         postgres::create_kb(pool, kb_name, self.dimension, chunk_config, embed_config).await?;
         let rows: Vec<ChunkRow> = self
@@ -105,7 +106,8 @@ impl EmbeddedChunks {
                 embedding: c.embedding,
             })
             .collect();
-        postgres::insert_chunks(pool, kb_name, &rows).await
+        postgres::insert_chunks(pool, kb_name, &rows).await?;
+        postgres::create_index(pool, kb_name, index_config).await
     }
 }
 

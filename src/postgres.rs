@@ -1,3 +1,4 @@
+use crate::config::IndexConfig;
 use anyhow::{Context, Result};
 use pgvector::Vector;
 use serde_json::Value;
@@ -140,6 +141,39 @@ pub async fn insert_chunks(
             .execute(pool)
             .await
             .with_context(|| format!("failed to insert chunk {}", chunk.chunk_id))?;
+    }
+    Ok(())
+}
+
+pub async fn create_index(
+    pool: &PgPool,
+    kb_name: &str,
+    index_config: &IndexConfig,
+) -> Result<()> {
+    let table_name = kb_table(kb_name)?;
+    match index_config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            let index_name = format!("idx_{table_name}_embedding");
+            let create_sql = format!(
+                "CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} \
+                 USING hnsw (embedding vector_cosine_ops) \
+                 WITH (m = {m}, ef_construction = {ef_construction})"
+            );
+            sqlx::query(AssertSqlSafe(create_sql))
+                .execute(pool)
+                .await
+                .with_context(|| format!("failed to create HNSW index for kb {kb_name}"))?;
+
+            sqlx::query("SET hnsw.ef_search = $1")
+                .bind(*ef_search as i32)
+                .execute(pool)
+                .await
+                .with_context(|| format!("failed to set hnsw.ef_search for kb {kb_name}"))?;
+        }
     }
     Ok(())
 }

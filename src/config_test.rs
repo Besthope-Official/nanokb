@@ -129,3 +129,92 @@ fn load_from_panics_when_a_placeholder_is_unresolved() {
 
     AppConfig::load_from(config_path);
 }
+
+#[test]
+fn index_config_default() {
+    let config = IndexConfig::default();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
+}
+
+#[test]
+fn index_config_deserialize_all_fields() {
+    let config: IndexConfig =
+        serde_json::from_str(r#"{"type":"hnsw","m":32,"ef_construction":128,"ef_search":100}"#)
+            .unwrap();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 32);
+            assert_eq!(ef_construction, 128);
+            assert_eq!(ef_search, 100);
+        }
+    }
+}
+
+#[test]
+fn index_config_deserialize_type_only_uses_defaults() {
+    let config: IndexConfig = serde_json::from_str(r#"{"type":"hnsw"}"#).unwrap();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
+}
+
+#[test]
+fn index_config_rejects_unknown_variant() {
+    let error = serde_json::from_str::<IndexConfig>(r#"{"type":"bm25"}"#).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn index_config_rejects_unknown_field() {
+    let error = serde_json::from_str::<IndexConfig>(
+        r#"{"type":"hnsw","m":16,"ef_construction":64,"wat":999}"#,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn database_config_without_index_defaults() {
+    let config: DatabaseConfig =
+        serde_json::from_str(r#"{"url":"postgres://localhost/nanokb"}"#).unwrap();
+    assert_eq!(config.url, "postgres://localhost/nanokb");
+    match config.index {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
+}

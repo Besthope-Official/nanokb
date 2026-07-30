@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
         .into_chunks(&ChunkStrategy::default())
         .into_embeddings(EmbedClient::from_config(&config.model.embedding)?)
         .await?
-        .store(&pool, "test", &chunk_config, &embed_config)
+        .store(&pool, "test", &chunk_config, &embed_config, &config.database.index)
         .await?;
 
     println!("imported {}", source_path.display());

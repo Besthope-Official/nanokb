@@ -34,3 +34,15 @@ async fn rejects_zero_dimension_before_connecting() {
         "embedding dimension must be greater than zero"
     );
 }
+
+#[tokio::test]
+async fn create_index_rejects_invalid_kb_name() {
+    let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
+    let config = IndexConfig::default();
+
+    let error = create_index(&pool, "contains-hyphen", &config)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "invalid kb name: contains-hyphen");
+}

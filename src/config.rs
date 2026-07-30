@@ -18,6 +18,8 @@ pub struct AppConfig {
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
+    #[serde(default)]
+    pub index: IndexConfig,
 }
 
 #[derive(Deserialize)]
@@ -32,6 +34,43 @@ pub struct EmbeddingConfig {
     pub model_name: String,
     pub api_base: String,
     pub api_key: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+pub enum IndexConfig {
+    #[serde(rename = "hnsw")]
+    Hnsw {
+        #[serde(default = "default_m")]
+        m: u16,
+        #[serde(default = "default_ef_construction")]
+        ef_construction: u16,
+        #[serde(default = "default_ef_search")]
+        ef_search: u32,
+    },
+}
+
+fn default_m() -> u16 {
+    16
+}
+
+fn default_ef_construction() -> u16 {
+    64
+}
+
+fn default_ef_search() -> u32 {
+    40
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        IndexConfig::Hnsw {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 40,
+        }
+    }
 }
 
 impl AppConfig {
