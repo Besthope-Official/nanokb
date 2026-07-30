@@ -20,6 +20,19 @@ fn root(children: Vec<NodeId>) -> Node {
     }
 }
 
+#[test]
+fn default_chunk_strategy_matches_standard_layered_configuration() {
+    let ChunkStrategy::Layered {
+        max_chunk_tokens,
+        overlap_ratio,
+        metadata_mode,
+    } = ChunkStrategy::default();
+
+    assert_eq!(max_chunk_tokens, 256);
+    assert_eq!(overlap_ratio, 0.1);
+    assert_eq!(metadata_mode, MetadataMode::Path);
+}
+
 fn heading(level: usize, title: &str, children: Vec<NodeId>) -> Node {
     Node {
         kind: NodeKind::Heading {
