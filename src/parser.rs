@@ -162,7 +162,7 @@ pub fn parse_markdown(document: &Document) -> StructuredDocument {
                             title: String::new(),
                         }
                     }
-                    Tag::Paragraph => NodeKind::Paragraph {
+                    Tag::Paragraph | Tag::Item => NodeKind::Paragraph {
                         text: String::new(),
                     },
                     Tag::CodeBlock(_) => NodeKind::CodeBlock {
@@ -198,7 +198,7 @@ pub fn parse_markdown(document: &Document) -> StructuredDocument {
             Event::HardBreak => node_text.push('\n'),
 
             Event::End(tag_end) => match tag_end {
-                TagEnd::Paragraph | TagEnd::CodeBlock | TagEnd::Table => {
+                TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Table => {
                     if let Some(node_id) = node_path.pop() {
                         match &mut tree[node_id.0].kind {
                             NodeKind::Paragraph { text }
