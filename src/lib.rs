@@ -1,8 +1,8 @@
 pub mod parser;
-pub use parser::{Document, Section, parse_heading, parse_markdown};
+pub use parser::{Document, Node, NodeId, NodeKind, StructuredDocument, parse_markdown};
 
 pub mod filter;
 pub use filter::{Filter, apply_filters};
 
 pub mod chunker;
-pub use chunker::{Chunk, ChunkStrategy, MetadataMode, chunk_sections};
+pub use chunker::{Chunk, ChunkStrategy, MetadataMode, chunk_document};

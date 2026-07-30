@@ -1,6 +1,4 @@
-use std::hash::{DefaultHasher, Hash, Hasher};
-
-use crate::Section;
+use crate::StructuredDocument;
 
 pub struct Chunk {
     /// embedding_text hash
@@ -18,55 +16,37 @@ pub enum MetadataMode {
 }
 
 pub enum ChunkStrategy {
-    /// One chunk per section.
-    Structured { metadata_mode: MetadataMode },
-    /// Recursive text splitting:
-    /// split by paragraph -> line -> sentence -> character,
-    /// merging into chunks <= chunk_size with overlapping context.
-    Recursive { chunk_size: usize, overlap: usize },
+    Layered {
+        min_chunk_size: usize,
+        max_chunk_size: usize,
+        overlap_ratio: f32,
+        metadata_mode: MetadataMode,
+    },
 }
 
-pub fn chunk_sections(sections: &[Section], strategy: &ChunkStrategy) -> Vec<Chunk> {
-    match strategy {
-        ChunkStrategy::Structured { metadata_mode } => structured_chunks(sections, *metadata_mode),
-        ChunkStrategy::Recursive {
-            chunk_size,
-            overlap,
-        } => recursive_chunks(sections, *chunk_size, *overlap),
-    }
+pub fn chunk_document(document: &StructuredDocument, strategy: &ChunkStrategy) -> Vec<Chunk> {
+    let ChunkStrategy::Layered {
+        min_chunk_size,
+        max_chunk_size,
+        overlap_ratio,
+        metadata_mode,
+    } = strategy;
+
+    layered_chunks(
+        document,
+        *min_chunk_size,
+        *max_chunk_size,
+        *overlap_ratio,
+        *metadata_mode,
+    )
 }
 
-fn structured_chunks(sections: &[Section], metadata_mode: MetadataMode) -> Vec<Chunk> {
-    let mut chunks: Vec<Chunk> = vec![];
-    for section in sections {
-        let embedding_text = match metadata_mode {
-            MetadataMode::None => section.content.clone(),
-            MetadataMode::Path => format!(
-                "Path: {}\nContent: {}",
-                section.path.join(" > "),
-                section.content
-            ),
-        };
-
-        let mut hasher = DefaultHasher::new();
-        embedding_text.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        chunks.push(Chunk {
-            text: section.content.clone(),
-            embedding_text,
-            chunk_id: hash.to_string(),
-        });
-    }
-    chunks
-}
-
-/// Split sections into chunks by recursive text splitting.
-/// Each sub-chunk inherits the section's heading path in its embedding text.
-fn recursive_chunks(_sections: &[Section], _chunk_size: usize, _overlap: usize) -> Vec<Chunk> {
+fn layered_chunks(
+    _document: &StructuredDocument,
+    _min_chunk_size: usize,
+    _max_chunk_size: usize,
+    _overlap_ratio: f32,
+    _metadata_mode: MetadataMode,
+) -> Vec<Chunk> {
     todo!()
 }
-
-#[cfg(test)]
-#[path = "chunker_test.rs"]
-mod tests;

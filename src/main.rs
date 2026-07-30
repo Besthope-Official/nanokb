@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nanokb::{
-    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_sections, parse_markdown,
+    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_document, parse_markdown,
 };
 use std::{env, path::PathBuf};
 
@@ -10,27 +10,30 @@ fn main() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("examples/example.md"));
     let filters = [Filter::DropReference];
-    let chunk_strategy = ChunkStrategy::Structured {
+    let chunk_strategy = ChunkStrategy::Layered {
+        min_chunk_size: 128,
+        max_chunk_size: 512,
+        overlap_ratio: 0.25,
         metadata_mode: MetadataMode::Path,
     };
 
     let document = Document::from_markdown(&source_path)?;
-    let sections = parse_markdown(&document.content);
-    let sections = apply_filters(sections, &filters);
-    let chunks = chunk_sections(&sections, &chunk_strategy);
+    let structured_document = parse_markdown(&document);
+    let structured_document = apply_filters(structured_document, &filters);
+    let chunks = chunk_document(&structured_document, &chunk_strategy);
 
     println!(
-        "document: {}\nsource: {}\nmetadata: {:?}\nsections: {}\nchunks: {}\n-----",
+        "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
         document.title,
         source_path.display(),
         document.metadata,
-        sections.len(),
+        structured_document.tree.len(),
         chunks.len()
     );
     for (idx, chunk) in chunks.iter().enumerate() {
         println!(
-            "chunk_idx: {}\nchunk_id: {}\ntext: {}\nembedding_text: {}\n-----",
-            idx, chunk.chunk_id, chunk.text, chunk.embedding_text
+            "chunk_idx: {}\nchunk_id: {}\nembedding_text: {}\n-----",
+            idx, chunk.chunk_id, chunk.embedding_text
         );
     }
     Ok(())

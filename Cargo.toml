@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+pulldown-cmark = "0.13"
 serde = "1.0"
 yaml_serde = "0.10"
 
