@@ -14,7 +14,7 @@ pub struct Chunk {
     pub embedding_text: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum MetadataMode {
     /// Do not inject metadata into the embedding text.
     None,
@@ -22,6 +22,7 @@ pub enum MetadataMode {
     Path,
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum ChunkStrategy {
     Layered {
         max_chunk_tokens: usize,
