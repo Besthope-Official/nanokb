@@ -45,27 +45,22 @@ fn from_markdown_loads_frontmatter_and_body() {
 
     let document = Document::from_markdown(source.path()).unwrap();
 
-    assert_eq!(document.title, "Guide");
+    assert_eq!(document.metadata.filename, "guide.md");
     assert_eq!(document.content, "\n# Intro\nBody");
-    assert_eq!(
-        document
-            .metadata
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect::<Vec<_>>(),
-        [("author", "NanoKB"), ("title", "Guide")]
-    );
+    let frontmatter = document.metadata.frontmatter.as_ref().unwrap();
+    assert_eq!(frontmatter.get("author").unwrap().as_str(), Some("NanoKB"));
+    assert_eq!(frontmatter.get("title").unwrap().as_str(), Some("Guide"));
 }
 
 #[rstest]
-#[case::missing_title("plain body")]
-#[case::empty_title("---\ntitle: \"\"\n---\nbody")]
-fn from_markdown_uses_file_stem_when_title_is_absent(#[case] content: &str) {
+#[case::plain_body("plain body")]
+#[case::with_frontmatter("---\ntitle: \"hello\"\n---\nbody")]
+fn from_markdown_uses_file_name_as_title(#[case] content: &str) {
     let source = TempMarkdown::new("fallback-title.md", content);
 
     let document = Document::from_markdown(source.path()).unwrap();
 
-    assert_eq!(document.title, "fallback-title");
+    assert_eq!(document.metadata.filename, "fallback-title.md");
 }
 
 #[test]
@@ -78,114 +73,6 @@ fn from_markdown_reports_source_path_when_read_fails() {
     };
 
     assert!(error.to_string().contains(&missing.display().to_string()));
-}
-
-#[rstest]
-#[case("# h1", 1, "h1")]
-#[case("## h2", 2, "h2")]
-#[case("### h3", 3, "h3")]
-#[case("#### h4", 4, "h4")]
-#[case("##### h5", 5, "h5")]
-#[case("###### h6", 6, "h6")]
-#[case("   ##  leading spaces", 2, "leading spaces")]
-fn valid_headings(#[case] input: &str, #[case] depth: usize, #[case] title: &str) {
-    let (d, t) = parse_heading(input).unwrap();
-    assert_eq!(d, depth);
-    assert_eq!(t, title);
-}
-
-#[rstest]
-#[case("####### seven hashes")]
-#[case("##no_space")]
-#[case("#hashtag")]
-#[case("")]
-#[case("no heading here")]
-#[case("```")]
-#[case("    # indented code")]
-fn invalid_headings(#[case] input: &str) {
-    assert!(parse_heading(input).is_none());
-}
-
-#[test]
-fn heading_trailing_spaces() {
-    let (d, t) = parse_heading("##  double space  ").unwrap();
-    assert_eq!(d, 2);
-    assert_eq!(t, "double space  ");
-}
-
-#[test]
-fn document_without_heading_preserves_content() {
-    let sections = parse_markdown(
-        r#"plain text
-second line
-"#,
-    );
-
-    assert_eq!(sections.len(), 1);
-    let section = &sections[0];
-    assert_eq!(section.heading_level, 0);
-    assert_eq!(section.title, "");
-    assert_eq!(section.source_span.start, 0);
-    assert_eq!(section.source_span.end, 1);
-    assert_eq!(section.content, "plain text\nsecond line");
-}
-
-#[test]
-fn empty_heading_preserves_its_content() {
-    let sections = parse_markdown(
-        r#"#
-body
-"#,
-    );
-
-    let section = sections
-        .iter()
-        .find(|section| section.heading_level == 1)
-        .expect("the empty heading section should be preserved");
-    assert_eq!(section.title, "");
-    assert_eq!(section.source_span.start, 0);
-    assert_eq!(section.source_span.end, 1);
-    assert_eq!(section.content, "body");
-}
-
-#[fixture]
-fn sample_sections() -> Vec<Section> {
-    vec![
-        Section {
-            heading_level: 0,
-            title: String::new(),
-            path: vec![],
-            ..Default::default()
-        },
-        Section {
-            heading_level: 1,
-            title: "h1".into(),
-            path: vec!["h1".into()],
-            ..Default::default()
-        },
-        Section {
-            heading_level: 2,
-            title: "h2".into(),
-            path: vec!["h1".into(), "h2".into()],
-            ..Default::default()
-        },
-        Section {
-            heading_level: 3,
-            title: "h3".into(),
-            path: vec!["h1".into(), "h2".into(), "h3".into()],
-            ..Default::default()
-        },
-    ]
-}
-
-#[rstest]
-fn path_root(sample_sections: Vec<Section>) {
-    assert_eq!(sample_sections[1].path, ["h1"]);
-}
-
-#[rstest]
-fn path_nested(sample_sections: Vec<Section>) {
-    assert_eq!(sample_sections[3].path, ["h1", "h2", "h3"]);
 }
 
 #[rstest]
@@ -221,30 +108,42 @@ fn frontmatter_parses_metadata_and_preserves_body(
     #[case] expected_metadata: &[(&str, &str)],
     #[case] expected_body: &str,
 ) {
-    let (metadata, body) = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input);
 
-    assert_eq!(metadata.len(), expected_metadata.len());
-    for (key, value) in expected_metadata {
-        assert_eq!(metadata.get(*key).map(String::as_str), Some(*value));
+    match frontmatter {
+        Some(metadata) => {
+            assert_eq!(metadata.len(), expected_metadata.len());
+            for (key, value) in expected_metadata {
+                assert_eq!(metadata.get(*key).and_then(|v| v.as_str()), Some(*value));
+            }
+        }
+        None => assert!(expected_metadata.is_empty()),
     }
-    assert_eq!(body, expected_body);
+    assert_eq!(strip_frontmatter(input), Some(expected_body));
 }
 
 #[test]
 fn frontmatter_accepts_yaml_comments_and_blank_lines() {
-    let (metadata, body) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+    let frontmatter = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
 
+    let metadata = frontmatter.unwrap();
     assert_eq!(metadata.len(), 1);
-    assert_eq!(metadata.get("title").map(String::as_str), Some("kept"));
-    assert_eq!(body, "body");
+    assert_eq!(metadata.get("title").and_then(|v| v.as_str()), Some("kept"));
+    assert_eq!(
+        strip_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody"),
+        Some("body")
+    );
 }
 
 #[test]
 fn frontmatter_discards_invalid_yaml_metadata() {
-    let (metadata, body) = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
+    let frontmatter = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
 
-    assert!(metadata.is_empty());
-    assert_eq!(body, "body");
+    assert!(frontmatter.is_none());
+    assert_eq!(
+        strip_frontmatter("---\ntitle: [unterminated\n---\nbody"),
+        Some("body")
+    );
 }
 
 #[rstest]
@@ -254,8 +153,38 @@ fn frontmatter_discards_invalid_yaml_metadata() {
 #[case::leading_blank_line("\n---\ntitle: x\n---\nbody")]
 #[case::near_miss_delimiter("----\ntitle: x\n---\nbody")]
 fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
-    let (metadata, body) = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input);
 
-    assert!(metadata.is_empty());
-    assert_eq!(body, input);
+    assert!(frontmatter.is_none());
+    assert_eq!(strip_frontmatter(input), None);
+}
+
+#[test]
+fn structured_document_returns_node_by_id() {
+    let document = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "guide.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Paragraph {
+                    text: "content".into(),
+                },
+                children: vec![],
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    assert_eq!(
+        document.node(NodeId(1)).kind,
+        NodeKind::Paragraph {
+            text: "content".into()
+        }
+    );
 }

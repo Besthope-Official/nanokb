@@ -1,117 +1,353 @@
-use rstest::rstest;
+use super::*;
+use crate::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument};
 
-use crate::Section;
-use crate::chunker::*;
-
-fn make_section(content: &str, path: &[&str]) -> Section {
-    Section {
-        title: path.last().copied().unwrap_or_default().to_owned(),
-        content: content.to_owned(),
-        heading_level: path.len(),
-        path: path.iter().map(|part| (*part).to_owned()).collect(),
-        ..Default::default()
+/// Build a doc from explicit node list. Root is always at index 0.
+fn make_doc(tree: Vec<Node>) -> StructuredDocument {
+    StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "test.md".into(),
+            frontmatter: None,
+        },
+        tree,
+        root: NodeId(0),
     }
 }
 
-fn structured(metadata_mode: MetadataMode) -> ChunkStrategy {
-    ChunkStrategy::Structured { metadata_mode }
+fn root(children: Vec<NodeId>) -> Node {
+    Node {
+        kind: NodeKind::Root,
+        children,
+    }
 }
 
-fn chunk_one_with_mode(content: &str, path: &[&str], metadata_mode: MetadataMode) -> Chunk {
-    let chunks = chunk_sections(&[make_section(content, path)], &structured(metadata_mode));
+fn heading(level: usize, title: &str, children: Vec<NodeId>) -> Node {
+    Node {
+        kind: NodeKind::Heading {
+            level,
+            title: title.into(),
+        },
+        children,
+    }
+}
 
+fn paragraph(text: &str) -> Node {
+    Node {
+        kind: NodeKind::Paragraph { text: text.into() },
+        children: vec![],
+    }
+}
+
+fn code_block(text: &str) -> Node {
+    Node {
+        kind: NodeKind::CodeBlock { text: text.into() },
+        children: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// basic structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_document_yields_no_chunks() {
+    let doc = make_doc(vec![root(vec![])]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert!(chunks.is_empty());
+}
+
+#[test]
+fn single_paragraph_fits_in_one_chunk() {
+    // 0: Root -> [1]
+    // 1: Paragraph "hello world"
+    let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph("hello world")]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "hello world");
+    assert_eq!(chunks[0].embedding_text, "hello world");
+}
+
+#[test]
+fn metadata_mode_none_does_not_inject_path() {
+    // 0: Root -> [1]
+    // 1: H2 "Section" -> [2]
+    // 2: Paragraph "text"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2)]),
+        paragraph("text"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "text");
+    assert_eq!(chunks[0].embedding_text, "text");
+}
+
+#[test]
+fn metadata_mode_path_injects_heading_path() {
+    // 0: Root -> [1]
+    // 1: H2 "Section" -> [2]
+    // 2: Paragraph "text"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2)]),
+        paragraph("text"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::Path);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "text");
+    assert_eq!(chunks[0].embedding_text, "Section\n\ntext");
+}
+
+#[test]
+fn breadcrumb_joins_heading_path() {
+    assert_eq!(make_breadcrumb(&[]), "");
     assert_eq!(
-        chunks.len(),
-        1,
-        "structured chunking should emit one chunk per section"
+        make_breadcrumb(&["Guide".into(), "Chunking".into()]),
+        "Guide > Chunking"
     );
-    chunks.into_iter().next().unwrap()
 }
 
-fn chunk_one(content: &str, path: &[&str]) -> Chunk {
-    chunk_one_with_mode(content, path, MetadataMode::Path)
+// ---------------------------------------------------------------------------
+// heading hierarchy
+// ---------------------------------------------------------------------------
+
+#[test]
+fn root_level_content_before_first_heading() {
+    // 0: Root -> [1, 2]
+    // 1: Paragraph "preamble"
+    // 2: H2 "H2" -> [3]
+    // 3: Paragraph "under h2"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph("preamble"),
+        heading(2, "H2", vec![NodeId(3)]),
+        paragraph("under h2"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 2);
+    // root-level chunk
+    assert_eq!(chunks[0].text, "preamble");
+    assert_eq!(chunks[0].embedding_text, "preamble");
+    // heading-level chunk
+    assert_eq!(chunks[1].text, "under h2");
 }
 
 #[test]
-fn structured_returns_no_chunks_for_no_sections() {
-    assert!(chunk_sections(&[], &structured(MetadataMode::Path)).is_empty());
-}
+fn nested_headings_produce_separate_chunks_with_path() {
+    // 0: Root -> [1]
+    // 1: H2 "A" -> [2, 3, 4]
+    // 2: Paragraph "a-intro"
+    // 3: H3 "A.1" -> [5]
+    // 4: Paragraph "a-outro"
+    // 5: Paragraph "a1-text"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "A", vec![NodeId(2), NodeId(3), NodeId(4)]),
+        paragraph("a-intro"),
+        heading(3, "A.1", vec![NodeId(5)]),
+        paragraph("a-outro"),
+        paragraph("a1-text"),
+    ]);
 
-#[rstest]
-#[case::top_level(
-    "Hello world.",
-    &["Intro"],
-    "Path: Intro\nContent: Hello world."
-)]
-#[case::nested(
-    "Deep content.",
-    &["Chapter", "Section", "Leaf"],
-    "Path: Chapter > Section > Leaf\nContent: Deep content."
-)]
-#[case::preamble("Preamble text.", &[], "Path: \nContent: Preamble text.")]
-fn structured_formats_embedding_text(
-    #[case] content: &str,
-    #[case] path: &[&str],
-    #[case] expected_embedding_text: &str,
-) {
-    let chunk = chunk_one(content, path);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::Path);
+    assert_eq!(chunks.len(), 3);
 
-    assert_eq!(chunk.text, content);
-    assert_eq!(chunk.embedding_text, expected_embedding_text);
-    assert!(!chunk.chunk_id.is_empty());
-}
+    // chunk 0: a-intro under "A"
+    assert_eq!(chunks[0].text, "a-intro");
+    assert_eq!(chunks[0].embedding_text, "A\n\na-intro");
 
-#[test]
-fn structured_preserves_section_order() {
-    let sections = vec![
-        make_section("Content one.", &["H1"]),
-        make_section("Content two.", &["H1", "H2"]),
-    ];
+    // chunk 1: a1-text under "A > A.1"
+    assert_eq!(chunks[1].text, "a1-text");
+    assert_eq!(chunks[1].embedding_text, "A > A.1\n\na1-text");
 
-    let chunks = chunk_sections(&sections, &structured(MetadataMode::Path));
-    let texts: Vec<_> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
-
-    assert_eq!(texts, ["Content one.", "Content two."]);
+    // chunk 2: a-outro under "A"
+    assert_eq!(chunks[2].text, "a-outro");
+    assert_eq!(chunks[2].embedding_text, "A\n\na-outro");
 }
 
 #[test]
-fn structured_without_metadata_uses_content_as_embedding_text() {
-    let chunk = chunk_one_with_mode("Content.", &["Chapter", "Section"], MetadataMode::None);
+fn heading_with_no_direct_content_only_has_sub_headings() {
+    // 0: Root -> [1]
+    // 1: H2 "Parent" -> [2]
+    // 2: H3 "Child" -> [3]
+    // 3: Paragraph "deep text"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Parent", vec![NodeId(2)]),
+        heading(3, "Child", vec![NodeId(3)]),
+        paragraph("deep text"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::Path);
+    // "Parent" has no direct leaf content, only sub-heading "Child"
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text, "deep text");
+    assert_eq!(chunks[0].embedding_text, "Parent > Child\n\ndeep text");
+}
 
-    assert_eq!(chunk.text, "Content.");
-    assert_eq!(chunk.embedding_text, "Content.");
+// ---------------------------------------------------------------------------
+// size-based splitting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn splits_at_paragraph_boundary_when_exceeding_max() {
+    let p1 = "A ".repeat(300);
+    let p2 = "B ".repeat(300);
+    let p3 = "C ".repeat(300);
+    // 0: Root -> [1, 2, 3]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        paragraph(&p1),
+        paragraph(&p2),
+        paragraph(&p3),
+    ]);
+
+    let chunks = layered_chunks(&doc, 500, 0.0, MetadataMode::None);
+    // p1+p2 = 600 > 500, so split after p1
+    assert!(chunks.len() >= 2);
+    for c in &chunks {
+        let size = bpe_token_count(&c.text);
+        assert!(size <= 500, "chunk too large: {size}");
+    }
 }
 
 #[test]
-fn structured_chunk_id_is_deterministic() {
-    let first = chunk_one("Same content.", &["A"]);
-    let second = chunk_one("Same content.", &["A"]);
+fn chunk_size_is_measured_in_bpe_tokens() {
+    let p1 = "token ".repeat(60);
+    let p2 = "token ".repeat(60);
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph(&p1),
+        paragraph(&p2),
+    ]);
 
-    assert_eq!(first.chunk_id, second.chunk_id);
+    let chunks = layered_chunks(&doc, 150, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 1);
 }
 
-#[rstest]
-#[case::content(
-    "Alpha.",
-    &["A"],
-    "Beta.",
-    &["A"],
-)]
-#[case::path(
-    "Same content.",
-    &["A"],
-    "Same content.",
-    &["B"],
-)]
-fn structured_chunk_id_changes_with_embedding_input(
-    #[case] first_content: &str,
-    #[case] first_path: &[&str],
-    #[case] second_content: &str,
-    #[case] second_path: &[&str],
-) {
-    let first = chunk_one(first_content, first_path);
-    let second = chunk_one(second_content, second_path);
+#[test]
+fn single_paragraph_exceeding_max_is_not_split() {
+    let big = "X".repeat(800);
+    // 0: Root -> [1]
+    let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph(&big)]);
+    let chunks = layered_chunks(&doc, 500, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].text.len(), 800);
+}
 
-    assert_ne!(first.embedding_text, second.embedding_text);
-    assert_ne!(first.chunk_id, second.chunk_id);
+// ---------------------------------------------------------------------------
+// overlap
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overlap_with_large_paragraph_does_not_loop() {
+    // regression: when overlap + next paragraph exceeds max, we must still
+    // advance idx (skip overlap, emit paragraph solo)
+    let small = "S ".repeat(100);
+    let large = "L ".repeat(600);
+    // 0: Root -> [1, 2]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph(&small),
+        paragraph(&large),
+    ]);
+    let chunks = layered_chunks(&doc, 500, 0.25, MetadataMode::None);
+    // small fits alone (100 < 500)
+    // next: overlap(25) + large(600) = 625 > 500, has_new=false → emit large solo
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, small);
+    assert_eq!(chunks[1].text, large);
+}
+
+#[test]
+fn overlap_between_consecutive_chunks() {
+    let p1 = "A ".repeat(390);
+    let p2 = "B ".repeat(100);
+    let p3 = "C ".repeat(390);
+    // 0: Root -> [1, 2, 3]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        paragraph(&p1),
+        paragraph(&p2),
+        paragraph(&p3),
+    ]);
+
+    let chunks = layered_chunks(&doc, 500, 0.25, MetadataMode::None);
+    // overlap_size = 500 * 0.25 = 125
+    assert!(chunks.len() >= 2);
+    assert!(
+        chunks[1].text.starts_with(&p2),
+        "chunk 1 should start with overlap from chunk 0"
+    );
+}
+
+#[test]
+fn overlap_token_budget_includes_paragraph_separators() {
+    let paragraphs = (0..80).map(|i| format!("p{i}")).collect::<Vec<_>>();
+    let mut tree = vec![root((1..=paragraphs.len()).map(NodeId).collect())];
+    tree.extend(paragraphs.iter().map(|text| paragraph(text)));
+    let doc = make_doc(tree);
+
+    let chunks = layered_chunks(&doc, 100, 0.1, MetadataMode::None);
+    let first = chunks[0].text.split("\n\n").collect::<Vec<_>>();
+    let second = chunks[1].text.split("\n\n").collect::<Vec<_>>();
+    let overlap_len = (1..=first.len().min(second.len()))
+        .rev()
+        .find(|&len| first[first.len() - len..] == second[..len])
+        .unwrap();
+    let overlap = second[..overlap_len].join("\n\n");
+
+    assert!(bpe_token_count(&overlap) <= 10);
+}
+
+#[test]
+fn overlap_not_applied_across_heading_boundaries() {
+    let p1 = "A".repeat(300);
+    let p2 = "B".repeat(300);
+    // 0: Root -> [1, 2]
+    // 1: Paragraph p1
+    // 2: H2 "Section" -> [3]
+    // 3: Paragraph p2
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph(&p1),
+        heading(2, "Section", vec![NodeId(3)]),
+        paragraph(&p2),
+    ]);
+    let chunks = layered_chunks(&doc, 500, 0.5, MetadataMode::None);
+    assert_eq!(chunks.len(), 2);
+    assert!(
+        !chunks[1].text.contains(&p1[..]),
+        "heading chunk should not contain root-level overlap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// chunk_id stability
+// ---------------------------------------------------------------------------
+
+#[test]
+fn chunk_id_is_stable() {
+    // 0: Root -> [1]
+    let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph("stable content")]);
+    let a = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    let b = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert_eq!(a[0].chunk_id, b[0].chunk_id);
+}
+
+// ---------------------------------------------------------------------------
+// mixed content types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn code_block_and_paragraph_mixed() {
+    // 0: Root -> [1, 2]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph("before"),
+        code_block("fn main() {}"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+    assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].text.contains("before"));
+    assert!(chunks[0].text.contains("fn main() {}"));
 }

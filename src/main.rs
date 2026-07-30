@@ -1,6 +1,6 @@
 use anyhow::Result;
 use nanokb::{
-    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_sections, parse_markdown,
+    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_document, parse_markdown,
 };
 use std::{env, path::PathBuf};
 
@@ -9,29 +9,32 @@ fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("examples/example.md"));
-    let filters = [Filter::DropReference];
-    let chunk_strategy = ChunkStrategy::Structured {
+    let _filters = [Filter::DropReference];
+    let chunk_strategy = ChunkStrategy::Layered {
+        max_chunk_tokens: 256,
+        overlap_ratio: 0.1,
         metadata_mode: MetadataMode::Path,
     };
 
     let document = Document::from_markdown(&source_path)?;
-    let sections = parse_markdown(&document.content);
-    let sections = apply_filters(sections, &filters);
-    let chunks = chunk_sections(&sections, &chunk_strategy);
+    let structured_document = parse_markdown(&document);
+    let structured_document = apply_filters(structured_document, &_filters);
+    println!("{}", structured_document);
+    let _chunks = chunk_document(&structured_document, &chunk_strategy);
 
-    println!(
-        "document: {}\nsource: {}\nmetadata: {:?}\nsections: {}\nchunks: {}\n-----",
-        document.title,
-        source_path.display(),
-        document.metadata,
-        sections.len(),
-        chunks.len()
-    );
-    for (idx, chunk) in chunks.iter().enumerate() {
-        println!(
-            "chunk_idx: {}\nchunk_id: {}\ntext: {}\nembedding_text: {}\n-----",
-            idx, chunk.chunk_id, chunk.text, chunk.embedding_text
-        );
-    }
+    // println!(
+    //     "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
+    //     document.metadata.filename,
+    //     source_path.display(),
+    //     document.metadata,
+    //     structured_document.tree.len(),
+    //     chunks.len()
+    // );
+    // for (idx, chunk) in chunks.iter().enumerate() {
+    //     println!(
+    //         "chunk_idx: {}\nchunk_id: {}\ntext: {}\nembedding_text: {}\n-----",
+    //         idx, chunk.chunk_id, chunk.text, chunk.embedding_text
+    //     );
+    // }
     Ok(())
 }
