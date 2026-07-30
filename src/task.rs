@@ -1,6 +1,8 @@
 use crate::config::AppConfig;
 use crate::postgres::{self, TaskRow};
-use crate::{ChunkStrategy, Document, EmbedClient, Filter, IntoEmbeddings};
+use crate::{
+    ChunkStrategy, Document, EmbedClient, EmbeddedChunk, EmbeddedChunks, Filter,
+};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::path::Path;
@@ -119,21 +121,70 @@ async fn run_pipeline(
     let chunk_config = serde_json::json!({"strategy": "layered"});
     let embed_config = serde_json::json!({"model": &config.model.embedding.model_name});
 
-    Document::from_markdown(Path::new(doc_path))?
+    let filename = Path::new(doc_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(doc_path);
+
+    // Stage 1: Parse
+    eprintln!("[{filename}] parsing...");
+    let document = Document::from_markdown(Path::new(doc_path))?
         .into_parsed()
-        .filter(&[Filter::DropReference])
-        .into_chunks(&ChunkStrategy::default())
-        .into_embeddings(EmbedClient::from_config(&config.model.embedding)?)
-        .await?
-        .store(
-            pool,
-            kb_name,
-            &chunk_config,
-            &embed_config,
-            &config.database.index,
-        )
+        .filter(&[Filter::DropReference]);
+    eprintln!("[{filename}] parsed, {} AST nodes", document.tree.len());
+
+    // Stage 2: Chunk
+    eprintln!("[{filename}] chunking...");
+    let chunks = document.into_chunks(&ChunkStrategy::default());
+    let total = chunks.len();
+    eprintln!("[{filename}] chunked into {total} chunks");
+
+    // Stage 3: Embed (batched with progress)
+    let model = EmbedClient::from_config(&config.model.embedding)?
+        .dimension()
         .await?;
 
+    let mut embedded = Vec::with_capacity(total);
+    const EMBED_BATCH: usize = 32;
+
+    for batch in chunks.chunks(EMBED_BATCH) {
+        let current = embedded.len();
+        eprintln!(
+            "[{filename}] embedding {}-{}/{}...",
+            current + 1,
+            current + batch.len(),
+            total
+        );
+
+        let texts: Vec<String> = batch.iter().map(|c| c.embedding_text.clone()).collect();
+        let embeddings = model.embed_batch(&texts).await?;
+
+        for (chunk, embedding) in batch.iter().zip(embeddings) {
+            embedded.push(EmbeddedChunk {
+                chunk_id: chunk.chunk_id.clone(),
+                text: chunk.text.clone(),
+                embedding_text: chunk.embedding_text.clone(),
+                embedding,
+            });
+        }
+    }
+
+    // Stage 4: Store
+    eprintln!("[{filename}] storing {total} chunks...");
+    EmbeddedChunks {
+        chunks: embedded,
+        dimension: model.dimension,
+    }
+    .store(
+        pool,
+        kb_name,
+        &chunk_config,
+        &embed_config,
+        &config.database.index,
+    )
+    .await?;
+
+    eprintln!("[{filename}] done ✓");
     Ok(())
 }
 

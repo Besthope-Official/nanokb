@@ -153,7 +153,7 @@ pub async fn insert_chunks(
     for chunk in chunks {
         let vector = Vector::from(chunk.embedding.clone());
         let sql = format!(
-            "INSERT INTO {table_name} (chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4)"
+            "INSERT INTO {table_name} (chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4) ON CONFLICT (chunk_id) DO NOTHING"
         );
         sqlx::query(AssertSqlSafe(sql))
             .bind(&chunk.chunk_id)
@@ -348,6 +348,22 @@ pub async fn notify_task_added(pool: &PgPool) -> Result<()> {
         .await
         .context("failed to notify task_added")?;
     Ok(())
+}
+
+pub async fn count_active_tasks(pool: &PgPool) -> Result<(i64, i64)> {
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'pending'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count pending tasks")?;
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'running'",
+    )
+    .fetch_one(pool)
+    .await
+    .context("failed to count running tasks")?;
+    Ok((pending, running))
 }
 
 pub async fn flush_db(pool: &PgPool) -> Result<()> {

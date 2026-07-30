@@ -109,31 +109,51 @@ async fn run_import_dir(
 
     let config_arc = Arc::new(config.clone());
     let mut handles = Vec::with_capacity(worker_count);
-    for i in 0..worker_count {
+    for _ in 0..worker_count {
         let pool = pool.clone();
         let config = config_arc.clone();
         let rx = shutdown_rx.clone();
         handles.push(tokio::spawn(async move {
             task::run_worker(pool, config, rx).await;
-            println!("worker {} stopped", i);
         }));
     }
 
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        eprintln!("\nshutting down...");
-        let _ = shutdown_tx.send(true);
-    });
+    let completed_normally = tokio::select! {
+        _ = wait_all_done(pool) => true,
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("\nshutting down...");
+            false
+        }
+    };
+
+    let _ = shutdown_tx.send(true);
 
     for handle in handles {
         let _ = handle.await;
     }
 
-    let canceled = postgres::cancel_all_running(pool).await?;
-    if canceled > 0 {
-        eprintln!("canceled {canceled} running tasks");
+    if !completed_normally {
+        let canceled = postgres::cancel_all_running(pool).await?;
+        if canceled > 0 {
+            eprintln!("canceled {canceled} running tasks");
+        }
     }
 
     println!("import-dir complete");
     Ok(())
+}
+
+async fn wait_all_done(pool: &sqlx::PgPool) {
+    loop {
+        match postgres::count_active_tasks(pool).await {
+            Ok((0, 0)) => break,
+            Err(e) => {
+                eprintln!("failed to check task status: {e:#}");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            _ => {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
