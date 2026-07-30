@@ -1,7 +1,5 @@
 use anyhow::Result;
-use nanokb::{
-    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_document, parse_markdown,
-};
+use nanokb::{ChunkStrategy, Document, Filter, MetadataMode, parse_markdown};
 use std::{env, path::PathBuf};
 
 fn main() -> Result<()> {
@@ -9,8 +7,8 @@ fn main() -> Result<()> {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("examples/example.md"));
-    let filters = [Filter::DropReference];
-    let chunk_strategy = ChunkStrategy::Layered {
+    let _filters = [Filter::DropReference];
+    let _chunk_strategy = ChunkStrategy::Layered {
         min_chunk_size: 128,
         max_chunk_size: 512,
         overlap_ratio: 0.25,

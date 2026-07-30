@@ -177,6 +177,7 @@ pub fn parse_markdown(document: &Document) -> StructuredDocument {
                     kind,
                     children: Vec::new(),
                 };
+                node_text.clear();
                 let node_id = NodeId(tree.len());
                 tree.push(node);
 
@@ -220,6 +221,7 @@ pub fn parse_markdown(document: &Document) -> StructuredDocument {
             },
 
             Event::DisplayMath(text) => {
+                node_text.clear();
                 let node = Node {
                     kind: NodeKind::MathBlock {
                         text: text.to_string(),
