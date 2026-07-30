@@ -46,3 +46,15 @@ async fn create_index_rejects_invalid_kb_name() {
 
     assert_eq!(error.to_string(), "invalid kb name: contains-hyphen");
 }
+
+#[tokio::test]
+async fn query_chunks_rejects_invalid_kb_name() {
+    let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
+    let embedding = vec![0.1f32; 768];
+
+    let error = query_chunks(&pool, "bad-name!", &embedding, 5)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "invalid kb name: bad-name!");
+}

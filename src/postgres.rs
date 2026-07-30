@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use pgvector::Vector;
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
 
 const KB_TABLE_PREFIX: &str = "kb_";
 const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
@@ -176,6 +176,47 @@ pub async fn create_index(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct QueryResult {
+    pub chunk_id: String,
+    pub text: String,
+    pub embedding_text: String,
+    pub distance: f64,
+}
+
+pub async fn query_chunks(
+    pool: &PgPool,
+    kb_name: &str,
+    query_embedding: &[f32],
+    top_k: usize,
+) -> Result<Vec<QueryResult>> {
+    let table_name = kb_table(kb_name)?;
+    let vector = Vector::from(query_embedding.to_vec());
+    let sql = format!(
+        "SELECT chunk_id, text, embedding_text, \
+                embedding <=> $1::vector AS distance \
+         FROM {table_name} \
+         ORDER BY embedding <=> $1::vector \
+         LIMIT $2"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(vector)
+        .bind(top_k as i64)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("failed to query kb {kb_name}"))?;
+
+    Ok(rows
+        .iter()
+        .map(|row| QueryResult {
+            chunk_id: row.get("chunk_id"),
+            text: row.get("text"),
+            embedding_text: row.get("embedding_text"),
+            distance: row.get("distance"),
+        })
+        .collect())
 }
 
 #[cfg(test)]

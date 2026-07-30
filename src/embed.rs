@@ -71,6 +71,14 @@ impl EmbedModel {
         )
         .await
     }
+
+    /// Embed a single query text.
+    pub async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let mut results = self.embed_batch(&[text.to_owned()]).await?;
+        results
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("embedding API returned empty response"))
+    }
 }
 
 pub struct EmbeddedChunk {

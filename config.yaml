@@ -1,5 +1,10 @@
 database:
   url: "postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb"
+  index:
+    type: hnsw
+    m: 16
+    ef_construction: 64
+    ef_search: 40
 
 model:
   embedding:
