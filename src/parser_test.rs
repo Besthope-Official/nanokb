@@ -45,27 +45,22 @@ fn from_markdown_loads_frontmatter_and_body() {
 
     let document = Document::from_markdown(source.path()).unwrap();
 
-    assert_eq!(document.title, "Guide");
+    assert_eq!(document.metadata.filename, "guide.md");
     assert_eq!(document.content, "\n# Intro\nBody");
-    assert_eq!(
-        document
-            .metadata
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str()))
-            .collect::<Vec<_>>(),
-        [("author", "NanoKB"), ("title", "Guide")]
-    );
+    let frontmatter = document.metadata.frontmatter.as_ref().unwrap();
+    assert_eq!(frontmatter.get("author").unwrap().as_str(), Some("NanoKB"));
+    assert_eq!(frontmatter.get("title").unwrap().as_str(), Some("Guide"));
 }
 
 #[rstest]
-#[case::missing_title("plain body")]
-#[case::empty_title("---\ntitle: \"\"\n---\nbody")]
-fn from_markdown_uses_file_stem_when_title_is_absent(#[case] content: &str) {
+#[case::plain_body("plain body")]
+#[case::with_frontmatter("---\ntitle: \"hello\"\n---\nbody")]
+fn from_markdown_uses_file_name_as_title(#[case] content: &str) {
     let source = TempMarkdown::new("fallback-title.md", content);
 
     let document = Document::from_markdown(source.path()).unwrap();
 
-    assert_eq!(document.title, "fallback-title");
+    assert_eq!(document.metadata.filename, "fallback-title.md");
 }
 
 #[test]
@@ -113,29 +108,38 @@ fn frontmatter_parses_metadata_and_preserves_body(
     #[case] expected_metadata: &[(&str, &str)],
     #[case] expected_body: &str,
 ) {
-    let (metadata, body) = parse_frontmatter(input);
+    let (frontmatter, body) = parse_frontmatter(input);
 
-    assert_eq!(metadata.len(), expected_metadata.len());
-    for (key, value) in expected_metadata {
-        assert_eq!(metadata.get(*key).map(String::as_str), Some(*value));
+    match frontmatter {
+        Some(metadata) => {
+            assert_eq!(metadata.len(), expected_metadata.len());
+            for (key, value) in expected_metadata {
+                assert_eq!(
+                    metadata.get(*key).and_then(|v| v.as_str()),
+                    Some(*value)
+                );
+            }
+        }
+        None => assert!(expected_metadata.is_empty()),
     }
     assert_eq!(body, expected_body);
 }
 
 #[test]
 fn frontmatter_accepts_yaml_comments_and_blank_lines() {
-    let (metadata, body) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+    let (frontmatter, body) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
 
+    let metadata = frontmatter.unwrap();
     assert_eq!(metadata.len(), 1);
-    assert_eq!(metadata.get("title").map(String::as_str), Some("kept"));
+    assert_eq!(metadata.get("title").and_then(|v| v.as_str()), Some("kept"));
     assert_eq!(body, "body");
 }
 
 #[test]
 fn frontmatter_discards_invalid_yaml_metadata() {
-    let (metadata, body) = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
+    let (frontmatter, body) = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
 
-    assert!(metadata.is_empty());
+    assert!(frontmatter.is_none());
     assert_eq!(body, "body");
 }
 
@@ -146,8 +150,8 @@ fn frontmatter_discards_invalid_yaml_metadata() {
 #[case::leading_blank_line("\n---\ntitle: x\n---\nbody")]
 #[case::near_miss_delimiter("----\ntitle: x\n---\nbody")]
 fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
-    let (metadata, body) = parse_frontmatter(input);
+    let (frontmatter, body) = parse_frontmatter(input);
 
-    assert!(metadata.is_empty());
+    assert!(frontmatter.is_none());
     assert_eq!(body, input);
 }

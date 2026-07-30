@@ -24,7 +24,7 @@ fn main() -> Result<()> {
 
     println!(
         "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
-        document.title,
+        document.metadata.filename,
         source_path.display(),
         document.metadata,
         structured_document.tree.len(),
