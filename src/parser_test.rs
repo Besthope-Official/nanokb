@@ -158,3 +158,33 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
     assert!(frontmatter.is_none());
     assert_eq!(strip_frontmatter(input), None);
 }
+
+#[test]
+fn structured_document_returns_node_by_id() {
+    let document = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "guide.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Paragraph {
+                    text: "content".into(),
+                },
+                children: vec![],
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    assert_eq!(
+        document.node(NodeId(1)).kind,
+        NodeKind::Paragraph {
+            text: "content".into()
+        }
+    );
+}

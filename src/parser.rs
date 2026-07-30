@@ -44,6 +44,10 @@ pub struct StructuredDocument {
 }
 
 impl StructuredDocument {
+    pub fn node(&self, node_id: NodeId) -> &Node {
+        &self.tree[node_id.0]
+    }
+
     fn fmt_children(&self, f: &mut fmt::Formatter<'_>, node: &Node, prefix: &str) -> fmt::Result {
         for (index, &child_id) in node.children.iter().enumerate() {
             let is_last = index == node.children.len() - 1;

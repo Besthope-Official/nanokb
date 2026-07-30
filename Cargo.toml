@@ -5,8 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+annotate-snippets = "0.12.16"
+anstream = "0.6"
 pulldown-cmark = "0.13"
 serde = "1.0"
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 yaml_serde = "0.10"
 
 [dev-dependencies]
