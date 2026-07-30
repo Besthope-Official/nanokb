@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use pgvector::Vector;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::types::Json;
+use sqlx::{AssertSqlSafe, PgPool, Postgres, Transaction};
 
 const KB_TABLE_PREFIX: &str = "kb_";
 const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
@@ -81,15 +83,15 @@ pub async fn create_kb(
         )"#
     );
 
-    sqlx::query(&create_table)
+    sqlx::query(AssertSqlSafe(create_table))
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
     sqlx::query("INSERT INTO kb_meta (name, chunk_config, embed_config) VALUES ($1, $2, $3)")
         .bind(name)
-        .bind(chunk_config)
-        .bind(embed_config)
+        .bind(Json(chunk_config))
+        .bind(Json(embed_config))
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to insert metadata for kb {name}"))?;
@@ -108,6 +110,36 @@ fn validate_kb_name(name: &str) -> Result<()> {
             .all(|character| character.is_ascii_alphanumeric() || character == '_')
     {
         anyhow::bail!("invalid kb name: {name}");
+    }
+    Ok(())
+}
+
+pub struct ChunkRow {
+    pub chunk_id: String,
+    pub text: String,
+    pub embedding_text: String,
+    pub embedding: Vec<f32>,
+}
+
+pub async fn insert_chunks(
+    pool: &PgPool,
+    kb_name: &str,
+    chunks: &[ChunkRow],
+) -> Result<()> {
+    let table_name = kb_table(kb_name)?;
+    for chunk in chunks {
+        let vector = Vector::from(chunk.embedding.clone());
+        let sql = format!(
+            "INSERT INTO {table_name} (chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4)"
+        );
+        sqlx::query(AssertSqlSafe(sql))
+            .bind(&chunk.chunk_id)
+            .bind(&chunk.text)
+            .bind(&chunk.embedding_text)
+            .bind(vector)
+            .execute(pool)
+            .await
+            .with_context(|| format!("failed to insert chunk {}", chunk.chunk_id))?;
     }
     Ok(())
 }

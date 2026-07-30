@@ -4,6 +4,9 @@ pub use chunker::{Chunk, ChunkStrategy, MetadataMode};
 pub mod config;
 pub use config::{AppConfig, DatabaseConfig};
 
+pub mod embed;
+pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks, IntoEmbeddings};
+
 pub mod filter;
 pub use filter::Filter;
 

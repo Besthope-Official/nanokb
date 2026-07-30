@@ -1,5 +1,6 @@
 use anyhow::Result;
-use nanokb::{ChunkStrategy, Document, Filter};
+use nanokb::{AppConfig, ChunkStrategy, Document, EmbedClient, Filter, IntoEmbeddings};
+use nanokb::postgres;
 use std::{env, path::PathBuf};
 
 trait Tap: Sized {
@@ -11,31 +12,30 @@ trait Tap: Sized {
 
 impl<T> Tap for T {}
 
-fn main() -> Result<()> {
-    let _chunks = Document::from_markdown(
-        &env::args_os()
-            .nth(1)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("examples/example.md")),
-    )?
-    .into_parsed()
-    .filter(&[Filter::DropReference])
-    .tap(|document| println!("{document}"))
-    .into_chunks(&ChunkStrategy::default());
+#[tokio::main]
+async fn main() -> Result<()> {
+    let source_path = env::args_os()
+        .nth(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("examples/example.md"));
 
-    // println!(
-    //     "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
-    //     document.metadata.filename,
-    //     source_path.display(),
-    //     document.metadata,
-    //     structured_document.tree.len(),
-    //     chunks.len()
-    // );
-    // for (idx, chunk) in chunks.iter().enumerate() {
-    //     println!(
-    //         "chunk_idx: {}\nchunk_id: {}\ntext: {}\nembedding_text: {}\n-----",
-    //         idx, chunk.chunk_id, chunk.text, chunk.embedding_text
-    //     );
-    // }
+    let config = AppConfig::load_from("config.yaml");
+    let pool = postgres::connect(&config.database.url).await?;
+    postgres::initialize(&pool).await?;
+
+    let chunk_config = serde_json::json!({"strategy": "layered"});
+    let embed_config = serde_json::json!({"model": &config.model.embedding.model_name});
+
+    Document::from_markdown(&source_path)?
+        .into_parsed()
+        .filter(&[Filter::DropReference])
+        .tap(|document| println!("{document}"))
+        .into_chunks(&ChunkStrategy::default())
+        .into_embeddings(EmbedClient::from_config(&config.model.embedding)?)
+        .await?
+        .store(&pool, "test", &chunk_config, &embed_config)
+        .await?;
+
+    println!("imported {}", source_path.display());
     Ok(())
 }

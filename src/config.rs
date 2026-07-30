@@ -11,12 +11,27 @@ use yaml_serde::Value;
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
+    pub model: ModelConfig,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub model_name: String,
+    pub api_base: String,
+    pub api_key: String,
 }
 
 impl AppConfig {

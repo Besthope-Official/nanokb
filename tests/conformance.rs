@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use nanokb::AppConfig;
 use nanokb::postgres::{connect, create_kb, initialize};
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{AssertSqlSafe, PgPool};
 
 const KB_NAME: &str = "config_conformance";
 const KB_TABLE: &str = "kb_config_conformance";
@@ -53,7 +53,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
 }
 
 async fn reset_test_kb(pool: &PgPool) -> Result<()> {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {KB_TABLE}"))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {KB_TABLE}")))
         .execute(pool)
         .await
         .context("failed to drop the conformance KB table")?;

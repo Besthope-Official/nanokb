@@ -1,2 +1,8 @@
 database:
   url: "postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb"
+
+model:
+  embedding:
+    model_name: "BAAI/bge-m3"
+    api_base: "{BGE_M3_EMBED_API_BASE}"
+    api_key: "{BGE_M3_EMBED_API_KEY}"

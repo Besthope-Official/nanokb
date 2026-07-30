@@ -33,12 +33,12 @@ fn loads_placeholders_from_adjacent_dotenv() {
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\n",
+        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"{BGE_M3_EMBED_API_BASE}\"\n    api_key: \"{BGE_M3_EMBED_API_KEY}\"\n",
     )
     .unwrap();
     fs::write(
         directory.path().join(".env"),
-        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\n",
+        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\nBGE_M3_EMBED_API_BASE=https://api.siliconflow.cn/v1\nBGE_M3_EMBED_API_KEY=sk-test-key\n",
     )
     .unwrap();
 
@@ -48,13 +48,15 @@ fn loads_placeholders_from_adjacent_dotenv() {
         config.database.url,
         "postgres://nanokb:secret@postgres:5432/nanokb"
     );
+    assert_eq!(config.model.embedding.api_base, "https://api.siliconflow.cn/v1");
+    assert_eq!(config.model.embedding.api_key, "sk-test-key");
 }
 
 #[test]
 fn process_environment_overrides_dotenv() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
-    fs::write(&config_path, "database:\n  url: \"{DATABASE_URL}\"\n").unwrap();
+    fs::write(&config_path, "database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n").unwrap();
     fs::write(
         directory.path().join(".env"),
         "DATABASE_URL=postgres://from-dotenv\n",
@@ -74,7 +76,7 @@ fn process_environment_overrides_dotenv() {
 fn rejects_unresolved_placeholders() {
     let variables = HashMap::from([("DB_USER".to_string(), "nanokb".to_string())]);
     let error = parse_config(
-        "database:\n  url: \"postgres://{DB_USER}@{DB_HOST}/nanokb\"\n",
+        "database:\n  url: \"postgres://{DB_USER}@{DB_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
         &variables,
     )
     .err()
@@ -89,7 +91,7 @@ fn rejects_unresolved_placeholders() {
 #[test]
 fn rejects_placeholders_introduced_by_environment_values() {
     let variables = HashMap::from([("DATABASE_URL".to_string(), "{OTHER_URL}".to_string())]);
-    let error = parse_config("database:\n  url: \"{DATABASE_URL}\"\n", &variables)
+    let error = parse_config("database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n", &variables)
         .err()
         .unwrap();
 
@@ -102,7 +104,7 @@ fn rejects_placeholders_introduced_by_environment_values() {
 #[test]
 fn rejects_unknown_configuration_fields() {
     let error = parse_config(
-        "database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\n",
+        "database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: https://api.siliconflow.cn/v1\n    api_key: sk-test-key\n",
         &HashMap::new(),
     )
     .err()
@@ -121,7 +123,7 @@ fn load_from_panics_when_a_placeholder_is_unresolved() {
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{NANOKB_TEST_MISSING_DATABASE_HOST}/nanokb\"\n",
+        "database:\n  url: \"postgres://{NANOKB_TEST_MISSING_DATABASE_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
     )
     .unwrap();
 
