@@ -7,14 +7,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_serde::Value;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
     pub model: ModelConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    #[serde(default = "default_kb_name")]
+    pub kb_name: String,
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            kb_name: default_kb_name(),
+            worker_count: default_worker_count(),
+        }
+    }
+}
+
+fn default_kb_name() -> String {
+    "test".to_string()
+}
+
+fn default_worker_count() -> usize {
+    2
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
@@ -22,13 +50,13 @@ pub struct DatabaseConfig {
     pub index: IndexConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub embedding: EmbeddingConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingConfig {
     pub model_name: String,
@@ -36,7 +64,7 @@ pub struct EmbeddingConfig {
     pub api_key: String,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Clone, Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[serde(tag = "type")]
 pub enum IndexConfig {

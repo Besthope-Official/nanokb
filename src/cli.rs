@@ -1,8 +1,10 @@
 use anyhow::Result;
 use crate::{
-    postgres, AppConfig, ChunkStrategy, Document, EmbedClient, Filter, IntoEmbeddings,
+    postgres, task, AppConfig, ChunkStrategy, Document, EmbedClient, Filter, IntoEmbeddings,
 };
+use std::sync::Arc;
 use std::{env, path::PathBuf};
+use tokio::sync::watch;
 
 trait Tap: Sized {
     fn tap(self, f: impl FnOnce(&Self)) -> Self {
@@ -27,6 +29,13 @@ pub async fn run() -> Result<()> {
                 .map(|s| s.into_string().unwrap_or_default())
                 .unwrap_or_default();
             run_query(&config, &pool, &query_text).await
+        }
+        Some(first) if first == "import-dir" => {
+            let dir_path = args
+                .next()
+                .map(|s| s.into_string().unwrap_or_default())
+                .unwrap_or_else(|| "examples".to_string());
+            run_import_dir(&config, &pool, &dir_path).await
         }
         other => {
             let source_path = other
@@ -75,5 +84,53 @@ async fn run_import(
         .await?;
 
     println!("imported {}", source_path.display());
+    Ok(())
+}
+
+async fn run_import_dir(
+    config: &AppConfig,
+    pool: &sqlx::PgPool,
+    dir_path: &str,
+) -> Result<()> {
+    let kb_name = &config.pipeline.kb_name;
+    let worker_count = config.pipeline.worker_count;
+
+    let task_ids = task::import_dir(pool, dir_path, kb_name).await?;
+    if task_ids.is_empty() {
+        println!("no markdown files found in {}", dir_path);
+        return Ok(());
+    }
+    println!("created {} tasks for kb '{}'", task_ids.len(), kb_name);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let config_arc = Arc::new(config.clone());
+    let mut handles = Vec::with_capacity(worker_count);
+    for i in 0..worker_count {
+        let pool = pool.clone();
+        let config = config_arc.clone();
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            task::run_worker(pool, config, rx).await;
+            println!("worker {} stopped", i);
+        }));
+    }
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        eprintln!("\nshutting down...");
+        let _ = shutdown_tx.send(true);
+    });
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let canceled = postgres::cancel_all_running(pool).await?;
+    if canceled > 0 {
+        eprintln!("canceled {canceled} running tasks");
+    }
+
+    println!("import-dir complete");
     Ok(())
 }

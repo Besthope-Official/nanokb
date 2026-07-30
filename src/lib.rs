@@ -16,4 +16,6 @@ pub use parser::{Document, DocumentMetadata, Node, NodeId, NodeKind, StructuredD
 pub mod postgres;
 pub use postgres::{query_chunks, QueryResult};
 
+pub mod task;
+
 pub mod cli;

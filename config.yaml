@@ -11,3 +11,7 @@ model:
     model_name: "BAAI/bge-m3"
     api_base: "{BGE_M3_EMBED_API_BASE}"
     api_key: "{BGE_M3_EMBED_API_KEY}"
+
+pipeline:
+  kb_name: "test"
+  worker_count: 2

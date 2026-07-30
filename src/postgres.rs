@@ -2,6 +2,7 @@ use crate::config::IndexConfig;
 use anyhow::{Context, Result};
 use pgvector::Vector;
 use serde_json::Value;
+use sqlx::postgres::PgListener;
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
 
@@ -22,6 +23,7 @@ pub async fn initialize(pool: &PgPool) -> Result<()> {
 
     ensure_pgvector(&mut transaction).await?;
     ensure_meta_table(&mut transaction).await?;
+    ensure_task_table(&mut transaction).await?;
 
     transaction
         .commit()
@@ -52,6 +54,24 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
     Ok(())
 }
 
+async fn ensure_task_table(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS tasks (
+            id            BIGSERIAL PRIMARY KEY,
+            doc_path      TEXT NOT NULL,
+            kb_name       TEXT NOT NULL,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            error_message TEXT,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        )"#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create tasks table")?;
+    Ok(())
+}
+
 fn kb_table(name: &str) -> Result<String> {
     validate_kb_name(name)?;
     Ok(format!("{KB_TABLE_PREFIX}{name}"))
@@ -75,7 +95,7 @@ pub async fn create_kb(
         .with_context(|| format!("failed to begin transaction for kb {name}"))?;
 
     let create_table = format!(
-        r#"CREATE TABLE {table_name} (
+        r#"CREATE TABLE IF NOT EXISTS {table_name} (
             chunk_id       TEXT PRIMARY KEY,
             text           TEXT NOT NULL,
             embedding_text TEXT NOT NULL,
@@ -89,13 +109,15 @@ pub async fn create_kb(
         .await
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
-    sqlx::query("INSERT INTO kb_meta (name, chunk_config, embed_config) VALUES ($1, $2, $3)")
-        .bind(name)
-        .bind(Json(chunk_config))
-        .bind(Json(embed_config))
-        .execute(&mut *transaction)
-        .await
-        .with_context(|| format!("failed to insert metadata for kb {name}"))?;
+    sqlx::query(
+        "INSERT INTO kb_meta (name, chunk_config, embed_config) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+    )
+    .bind(name)
+    .bind(Json(chunk_config))
+    .bind(Json(embed_config))
+    .execute(&mut *transaction)
+    .await
+    .with_context(|| format!("failed to insert metadata for kb {name}"))?;
 
     transaction
         .commit()
@@ -217,6 +239,115 @@ pub async fn query_chunks(
             distance: row.get("distance"),
         })
         .collect())
+}
+
+#[derive(Debug)]
+pub struct TaskRow {
+    pub id: i64,
+    pub doc_path: String,
+    pub kb_name: String,
+    pub status: String,
+    pub error_message: Option<String>,
+}
+
+pub async fn insert_task(pool: &PgPool, doc_path: &str, kb_name: &str) -> Result<i64> {
+    let row = sqlx::query("INSERT INTO tasks (doc_path, kb_name) VALUES ($1, $2) RETURNING id")
+        .bind(doc_path)
+        .bind(kb_name)
+        .fetch_one(pool)
+        .await
+        .context("failed to insert task")?;
+    Ok(row.get("id"))
+}
+
+pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("failed to begin transaction")?;
+
+    let row = sqlx::query(
+        "SELECT id, doc_path, kb_name, status, error_message
+         FROM tasks
+         WHERE status = 'pending'
+         ORDER BY created_at
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .context("failed to fetch pending task")?;
+
+    match row {
+        Some(row) => {
+            let task = TaskRow {
+                id: row.get("id"),
+                doc_path: row.get("doc_path"),
+                kb_name: row.get("kb_name"),
+                status: row.get("status"),
+                error_message: row.get("error_message"),
+            };
+            sqlx::query("UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1")
+                .bind(task.id)
+                .execute(&mut *tx)
+                .await
+                .context("failed to lock task")?;
+            tx.commit().await.context("failed to commit transaction")?;
+            Ok(Some(task))
+        }
+        None => {
+            tx.commit().await.context("failed to commit transaction")?;
+            Ok(None)
+        }
+    }
+}
+
+pub async fn mark_task_success(pool: &PgPool, task_id: i64) -> Result<()> {
+    sqlx::query("UPDATE tasks SET status = 'success', updated_at = now() WHERE id = $1")
+        .bind(task_id)
+        .execute(pool)
+        .await
+        .context("failed to mark task success")?;
+    Ok(())
+}
+
+pub async fn mark_task_failed(pool: &PgPool, task_id: i64, error_message: &str) -> Result<()> {
+    sqlx::query("UPDATE tasks SET status = 'failed', error_message = $2, updated_at = now() WHERE id = $1")
+        .bind(task_id)
+        .bind(error_message)
+        .execute(pool)
+        .await
+        .context("failed to mark task failed")?;
+    Ok(())
+}
+
+pub async fn cancel_all_running(pool: &PgPool) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE tasks SET status = 'canceled', updated_at = now() WHERE status = 'running'",
+    )
+    .execute(pool)
+    .await
+    .context("failed to cancel running tasks")?;
+    Ok(result.rows_affected())
+}
+
+pub async fn listen_for_tasks(pool: &PgPool) -> Result<PgListener> {
+    let mut listener = PgListener::connect_with(pool)
+        .await
+        .context("failed to create task listener")?;
+    listener
+        .listen("task_added")
+        .await
+        .context("failed to listen on task_added channel")?;
+    Ok(listener)
+}
+
+pub async fn notify_task_added(pool: &PgPool) -> Result<()> {
+    sqlx::query("SELECT pg_notify('task_added', '')")
+        .execute(pool)
+        .await
+        .context("failed to notify task_added")?;
+    Ok(())
 }
 
 #[cfg(test)]
