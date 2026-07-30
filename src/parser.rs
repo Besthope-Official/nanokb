@@ -123,130 +123,129 @@ impl Document {
     pub fn from_pdf(_path: &Path) -> Result<Self> {
         todo!()
     }
-}
 
-pub fn parse_markdown(document: &Document) -> StructuredDocument {
-    let content = document.content.clone();
+    pub fn into_parsed(self) -> StructuredDocument {
+        let Self { content, metadata } = self;
+        let mut tree: Vec<Node> = Vec::new();
+        let root = NodeId(0);
+        let mut node_path: Vec<NodeId> = Vec::new();
+        let mut node_text = String::new();
 
-    let mut tree: Vec<Node> = Vec::new();
-    let root = NodeId(0);
-    let mut node_path: Vec<NodeId> = Vec::new();
-    let mut node_text = String::new();
+        tree.push(Node {
+            kind: NodeKind::Root,
+            children: Vec::new(),
+        });
+        node_path.push(root);
 
-    tree.push(Node {
-        kind: NodeKind::Root,
-        children: Vec::new(),
-    });
-    node_path.push(root);
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_MATH);
+        options.insert(Options::ENABLE_TABLES);
 
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_MATH);
-    options.insert(Options::ENABLE_TABLES);
+        let parser = Parser::new_ext(content.as_str(), options);
 
-    let parser = Parser::new_ext(content.as_str(), options);
-
-    for event in parser {
-        match event {
-            // Structured Blocks
-            Event::Start(tag) => {
-                let kind = match tag {
-                    Tag::Heading { level, .. } => {
-                        let h_level = level as usize;
-                        while let Some(&top) = node_path.last() {
-                            match &tree[top.0].kind {
-                                NodeKind::Root => break,
-                                NodeKind::Heading { level: l, .. } if *l < h_level => break,
-                                _ => {
-                                    node_path.pop();
+        for event in parser {
+            match event {
+                // Structured Blocks
+                Event::Start(tag) => {
+                    let kind = match tag {
+                        Tag::Heading { level, .. } => {
+                            let h_level = level as usize;
+                            while let Some(&top) = node_path.last() {
+                                match &tree[top.0].kind {
+                                    NodeKind::Root => break,
+                                    NodeKind::Heading { level: l, .. } if *l < h_level => break,
+                                    _ => {
+                                        node_path.pop();
+                                    }
                                 }
                             }
-                        }
-                        NodeKind::Heading {
-                            level: h_level,
-                            title: String::new(),
-                        }
-                    }
-                    Tag::Paragraph | Tag::Item => NodeKind::Paragraph {
-                        text: String::new(),
-                    },
-                    Tag::CodeBlock(_) => NodeKind::CodeBlock {
-                        text: String::new(),
-                    },
-                    Tag::Table(_) => NodeKind::Table {
-                        text: String::new(),
-                    },
-                    _ => continue,
-                };
-                let node = Node {
-                    kind,
-                    children: Vec::new(),
-                };
-                node_text.clear();
-                let node_id = NodeId(tree.len());
-                tree.push(node);
-
-                if let Some(parent_idx) = node_path.last() {
-                    tree[parent_idx.0].children.push(node_id);
-                }
-                node_path.push(node_id);
-            }
-
-            Event::Text(text)
-            | Event::Code(text)
-            | Event::InlineMath(text)
-            | Event::Html(text)
-            | Event::InlineHtml(text) => {
-                node_text.push_str(&text);
-            }
-            Event::SoftBreak => node_text.push(' '),
-            Event::HardBreak => node_text.push('\n'),
-
-            Event::End(tag_end) => match tag_end {
-                TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Table => {
-                    if let Some(node_id) = node_path.pop() {
-                        match &mut tree[node_id.0].kind {
-                            NodeKind::Paragraph { text }
-                            | NodeKind::CodeBlock { text }
-                            | NodeKind::Table { text } => {
-                                *text = std::mem::take(&mut node_text);
+                            NodeKind::Heading {
+                                level: h_level,
+                                title: String::new(),
                             }
-                            _ => {}
+                        }
+                        Tag::Paragraph | Tag::Item => NodeKind::Paragraph {
+                            text: String::new(),
+                        },
+                        Tag::CodeBlock(_) => NodeKind::CodeBlock {
+                            text: String::new(),
+                        },
+                        Tag::Table(_) => NodeKind::Table {
+                            text: String::new(),
+                        },
+                        _ => continue,
+                    };
+                    let node = Node {
+                        kind,
+                        children: Vec::new(),
+                    };
+                    node_text.clear();
+                    let node_id = NodeId(tree.len());
+                    tree.push(node);
+
+                    if let Some(parent_idx) = node_path.last() {
+                        tree[parent_idx.0].children.push(node_id);
+                    }
+                    node_path.push(node_id);
+                }
+
+                Event::Text(text)
+                | Event::Code(text)
+                | Event::InlineMath(text)
+                | Event::Html(text)
+                | Event::InlineHtml(text) => {
+                    node_text.push_str(&text);
+                }
+                Event::SoftBreak => node_text.push(' '),
+                Event::HardBreak => node_text.push('\n'),
+
+                Event::End(tag_end) => match tag_end {
+                    TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Table => {
+                        if let Some(node_id) = node_path.pop() {
+                            match &mut tree[node_id.0].kind {
+                                NodeKind::Paragraph { text }
+                                | NodeKind::CodeBlock { text }
+                                | NodeKind::Table { text } => {
+                                    *text = std::mem::take(&mut node_text);
+                                }
+                                _ => {}
+                            }
                         }
                     }
-                }
-                TagEnd::Heading(_) => {
-                    if let Some(&node_id) = node_path.last()
-                        && let NodeKind::Heading { title, .. } = &mut tree[node_id.0].kind
-                    {
-                        *title = std::mem::take(&mut node_text);
+                    TagEnd::Heading(_) => {
+                        if let Some(&node_id) = node_path.last()
+                            && let NodeKind::Heading { title, .. } = &mut tree[node_id.0].kind
+                        {
+                            *title = std::mem::take(&mut node_text);
+                        }
+                    }
+                    _ => {}
+                },
+
+                Event::DisplayMath(text) => {
+                    node_text.clear();
+                    let node = Node {
+                        kind: NodeKind::MathBlock {
+                            text: text.to_string(),
+                        },
+                        children: Vec::new(),
+                    };
+                    let node_id = NodeId(tree.len());
+                    tree.push(node);
+                    if let Some(&parent_id) = node_path.last() {
+                        tree[parent_id.0].children.push(node_id);
                     }
                 }
+
                 _ => {}
-            },
-
-            Event::DisplayMath(text) => {
-                node_text.clear();
-                let node = Node {
-                    kind: NodeKind::MathBlock {
-                        text: text.to_string(),
-                    },
-                    children: Vec::new(),
-                };
-                let node_id = NodeId(tree.len());
-                tree.push(node);
-                if let Some(&parent_id) = node_path.last() {
-                    tree[parent_id.0].children.push(node_id);
-                }
             }
-
-            _ => {}
         }
-    }
 
-    StructuredDocument {
-        metadata: document.metadata.clone(),
-        tree,
-        root,
+        StructuredDocument {
+            metadata,
+            tree,
+            root,
+        }
     }
 }
 
