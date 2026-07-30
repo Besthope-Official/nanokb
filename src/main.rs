@@ -19,22 +19,23 @@ fn main() -> Result<()> {
 
     let document = Document::from_markdown(&source_path)?;
     let structured_document = parse_markdown(&document);
-    let structured_document = apply_filters(structured_document, &filters);
-    let chunks = chunk_document(&structured_document, &chunk_strategy);
+    println!("{}", structured_document);
+    // let structured_document = apply_filters(structured_document, &filters);
+    // let chunks = chunk_document(&structured_document, &chunk_strategy);
 
-    println!(
-        "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
-        document.metadata.filename,
-        source_path.display(),
-        document.metadata,
-        structured_document.tree.len(),
-        chunks.len()
-    );
-    for (idx, chunk) in chunks.iter().enumerate() {
-        println!(
-            "chunk_idx: {}\nchunk_id: {}\nembedding_text: {}\n-----",
-            idx, chunk.chunk_id, chunk.embedding_text
-        );
-    }
+    // println!(
+    //     "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",
+    //     document.metadata.filename,
+    //     source_path.display(),
+    //     document.metadata,
+    //     structured_document.tree.len(),
+    //     chunks.len()
+    // );
+    // for (idx, chunk) in chunks.iter().enumerate() {
+    //     println!(
+    //         "chunk_idx: {}\nchunk_id: {}\nembedding_text: {}\n-----",
+    //         idx, chunk.chunk_id, chunk.embedding_text
+    //     );
+    // }
     Ok(())
 }

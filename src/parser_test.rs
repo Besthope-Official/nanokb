@@ -108,39 +108,42 @@ fn frontmatter_parses_metadata_and_preserves_body(
     #[case] expected_metadata: &[(&str, &str)],
     #[case] expected_body: &str,
 ) {
-    let (frontmatter, body) = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input);
 
     match frontmatter {
         Some(metadata) => {
             assert_eq!(metadata.len(), expected_metadata.len());
             for (key, value) in expected_metadata {
-                assert_eq!(
-                    metadata.get(*key).and_then(|v| v.as_str()),
-                    Some(*value)
-                );
+                assert_eq!(metadata.get(*key).and_then(|v| v.as_str()), Some(*value));
             }
         }
         None => assert!(expected_metadata.is_empty()),
     }
-    assert_eq!(body, expected_body);
+    assert_eq!(strip_frontmatter(input), Some(expected_body));
 }
 
 #[test]
 fn frontmatter_accepts_yaml_comments_and_blank_lines() {
-    let (frontmatter, body) = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+    let frontmatter = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
 
     let metadata = frontmatter.unwrap();
     assert_eq!(metadata.len(), 1);
     assert_eq!(metadata.get("title").and_then(|v| v.as_str()), Some("kept"));
-    assert_eq!(body, "body");
+    assert_eq!(
+        strip_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody"),
+        Some("body")
+    );
 }
 
 #[test]
 fn frontmatter_discards_invalid_yaml_metadata() {
-    let (frontmatter, body) = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
+    let frontmatter = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
 
     assert!(frontmatter.is_none());
-    assert_eq!(body, "body");
+    assert_eq!(
+        strip_frontmatter("---\ntitle: [unterminated\n---\nbody"),
+        Some("body")
+    );
 }
 
 #[rstest]
@@ -150,8 +153,8 @@ fn frontmatter_discards_invalid_yaml_metadata() {
 #[case::leading_blank_line("\n---\ntitle: x\n---\nbody")]
 #[case::near_miss_delimiter("----\ntitle: x\n---\nbody")]
 fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
-    let (frontmatter, body) = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input);
 
     assert!(frontmatter.is_none());
-    assert_eq!(body, input);
+    assert_eq!(strip_frontmatter(input), None);
 }
