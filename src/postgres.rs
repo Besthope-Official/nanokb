@@ -190,8 +190,8 @@ pub async fn create_index(
                 .await
                 .with_context(|| format!("failed to create HNSW index for kb {kb_name}"))?;
 
-            sqlx::query("SET hnsw.ef_search = $1")
-                .bind(*ef_search as i32)
+            let set_sql = format!("SET hnsw.ef_search = {ef_search}");
+            sqlx::query(AssertSqlSafe(set_sql))
                 .execute(pool)
                 .await
                 .with_context(|| format!("failed to set hnsw.ef_search for kb {kb_name}"))?;
@@ -347,6 +347,28 @@ pub async fn notify_task_added(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to notify task_added")?;
+    Ok(())
+}
+
+pub async fn flush_db(pool: &PgPool) -> Result<()> {
+    sqlx::query(
+        r#"DO $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            FOR r IN (SELECT tablename FROM pg_tables WHERE tablename LIKE 'kb\_%') LOOP
+                EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
+            END LOOP;
+            DROP TABLE IF EXISTS kb_meta CASCADE;
+            DROP TABLE IF EXISTS tasks CASCADE;
+        END
+        $$"#,
+    )
+    .execute(pool)
+    .await
+    .context("failed to flush database")?;
+
+    println!("flushed all nanoKB tables");
     Ok(())
 }
 

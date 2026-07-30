@@ -1,2 +1,8 @@
 database:
   url: "postgres://nanokb:nanokb@127.0.0.1:5432/nanokb"
+
+model:
+  embedding:
+    model_name: "conformance-test"
+    api_base: "http://localhost:8080"
+    api_key: "test-key"

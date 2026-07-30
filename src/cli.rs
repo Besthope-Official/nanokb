@@ -37,6 +37,9 @@ pub async fn run() -> Result<()> {
                 .unwrap_or_else(|| "examples".to_string());
             run_import_dir(&config, &pool, &dir_path).await
         }
+        Some(first) if first == "flush-db" => {
+            postgres::flush_db(&pool).await
+        }
         other => {
             let source_path = other
                 .map(PathBuf::from)
