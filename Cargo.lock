@@ -1057,6 +1057,7 @@ dependencies = [
  "annotate-snippets",
  "anstream",
  "anyhow",
+ "dotenvy",
  "pgvector",
  "pulldown-cmark",
  "rstest",

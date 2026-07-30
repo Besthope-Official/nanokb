@@ -1,0 +1,174 @@
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use yaml_serde::Value;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppConfig {
+    pub database: DatabaseConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DatabaseConfig {
+    pub url: String,
+}
+
+impl AppConfig {
+    pub fn load_from(path: impl AsRef<Path>) -> Self {
+        Self::try_load_from(path).unwrap_or_else(|error| {
+            eprintln!("failed to load application configuration: {error:#}");
+            panic!("failed to load application configuration");
+        })
+    }
+
+    pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {
+        let process_environment = env::vars_os()
+            .map(unicode_environment_variable)
+            .collect::<Result<HashMap<_, _>>>()?;
+        load_from_sources(path.as_ref(), process_environment)
+    }
+}
+
+fn unicode_environment_variable(variable: (OsString, OsString)) -> Result<(String, String)> {
+    let (key, value) = variable;
+    let key = key
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("environment contains a non-Unicode variable name"))?;
+    let value = value
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("environment variable {key} contains a non-Unicode value"))?;
+    Ok((key, value))
+}
+
+fn load_from_sources(
+    config_path: &Path,
+    process_environment: HashMap<String, String>,
+) -> Result<AppConfig> {
+    let yaml = fs::read_to_string(config_path).with_context(|| {
+        format!(
+            "failed to read configuration file {}",
+            config_path.display()
+        )
+    })?;
+    let dotenv_path = dotenv_path(config_path);
+    let mut variables = if dotenv_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect {}", dotenv_path.display()))?
+    {
+        read_dotenv(&dotenv_path)?
+    } else {
+        HashMap::new()
+    };
+    variables.extend(process_environment);
+    parse_config(&yaml, &variables)
+}
+
+fn dotenv_path(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".env")
+}
+
+fn read_dotenv(path: &Path) -> Result<HashMap<String, String>> {
+    let mut variables: HashMap<String, String> = HashMap::new();
+    let entries = dotenvy::from_path_iter(path)
+        .with_context(|| format!("failed to read environment file {}", path.display()))?;
+    for entry in entries {
+        let (key, value) = entry
+            .with_context(|| format!("failed to parse environment file {}", path.display()))?;
+        variables.entry(key).or_insert(value);
+    }
+    Ok(variables)
+}
+
+fn parse_config(yaml: &str, variables: &HashMap<String, String>) -> Result<AppConfig> {
+    let mut value: Value =
+        yaml_serde::from_str(yaml).context("failed to parse application configuration YAML")?;
+    interpolate_value(&mut value, variables);
+    if let Some(name) = unresolved_placeholder(&value) {
+        bail!("unresolved configuration placeholder: {name}");
+    }
+    yaml_serde::from_value(value)
+        .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))
+}
+
+fn interpolate_value(value: &mut Value, variables: &HashMap<String, String>) {
+    match value {
+        Value::String(text) => *text = interpolate_string(text, variables),
+        Value::Sequence(sequence) => {
+            for item in sequence {
+                interpolate_value(item, variables);
+            }
+        }
+        Value::Mapping(mapping) => {
+            for item in mapping.values_mut() {
+                interpolate_value(item, variables);
+            }
+        }
+        Value::Tagged(tagged) => interpolate_value(&mut tagged.value, variables),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn interpolate_string(text: &str, variables: &HashMap<String, String>) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some((start, end, name)) = next_placeholder(&text[cursor..]) {
+        let start = cursor + start;
+        let end = cursor + end;
+        output.push_str(&text[cursor..start]);
+        if let Some(value) = variables.get(name) {
+            output.push_str(value);
+        } else {
+            output.push_str(&text[start..end]);
+        }
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn unresolved_placeholder(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => next_placeholder(text).map(|(_, _, name)| name.to_string()),
+        Value::Sequence(sequence) => sequence.iter().find_map(unresolved_placeholder),
+        Value::Mapping(mapping) => mapping.iter().find_map(|(key, value)| {
+            unresolved_placeholder(key).or_else(|| unresolved_placeholder(value))
+        }),
+        Value::Tagged(tagged) => unresolved_placeholder(&tagged.value),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
+}
+
+fn next_placeholder(text: &str) -> Option<(usize, usize, &str)> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' {
+            continue;
+        }
+        let relative_end = bytes[start + 1..].iter().position(|byte| *byte == b'}')?;
+        let end = start + relative_end + 1;
+        let name = &text[start + 1..end];
+        if valid_placeholder_name(name) {
+            return Some((start, end + 1, name));
+        }
+    }
+    None
+}
+
+fn valid_placeholder_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| matches!(byte, b'A'..=b'Z' | b'0'..=b'9' | b'_'))
+}
+
+#[cfg(test)]
+#[path = "config_test.rs"]
+mod tests;

@@ -1,6 +1,9 @@
 pub mod chunker;
 pub use chunker::{Chunk, ChunkStrategy, MetadataMode};
 
+pub mod config;
+pub use config::{AppConfig, DatabaseConfig};
+
 pub mod filter;
 pub use filter::Filter;
 
