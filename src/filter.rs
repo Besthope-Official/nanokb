@@ -5,14 +5,16 @@ pub enum Filter {
     DropReference,
 }
 
-pub fn apply_filters(mut document: StructuredDocument, filters: &[Filter]) -> StructuredDocument {
-    let root = document.root;
-    for filter in filters {
-        match filter {
-            Filter::DropReference => prune_references(&mut document, root),
+impl StructuredDocument {
+    pub fn filter(mut self, filters: &[Filter]) -> Self {
+        let root = self.root;
+        for filter in filters {
+            match filter {
+                Filter::DropReference => prune_references(&mut self, root),
+            }
         }
+        self
     }
-    document
 }
 
 fn prune_references(document: &mut StructuredDocument, node_id: crate::NodeId) {

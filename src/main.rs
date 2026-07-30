@@ -1,26 +1,27 @@
 use anyhow::Result;
-use nanokb::{
-    ChunkStrategy, Document, Filter, MetadataMode, apply_filters, chunk_document, parse_markdown,
-};
+use nanokb::{ChunkStrategy, Document, Filter};
 use std::{env, path::PathBuf};
 
-fn main() -> Result<()> {
-    let source_path = env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("examples/example.md"));
-    let _filters = [Filter::DropReference];
-    let chunk_strategy = ChunkStrategy::Layered {
-        max_chunk_tokens: 256,
-        overlap_ratio: 0.1,
-        metadata_mode: MetadataMode::Path,
-    };
+trait Tap: Sized {
+    fn tap(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
 
-    let document = Document::from_markdown(&source_path)?;
-    let structured_document = parse_markdown(&document);
-    let structured_document = apply_filters(structured_document, &_filters);
-    println!("{}", structured_document);
-    let _chunks = chunk_document(&structured_document, &chunk_strategy);
+impl<T> Tap for T {}
+
+fn main() -> Result<()> {
+    let _chunks = Document::from_markdown(
+        &env::args_os()
+            .nth(1)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("examples/example.md")),
+    )?
+    .into_parsed()
+    .filter(&[Filter::DropReference])
+    .tap(|document| println!("{document}"))
+    .into_chunks(&ChunkStrategy::default());
 
     // println!(
     //     "document: {}\nsource: {}\nmetadata: {:?}\nnodes: {}\nchunks: {}\n",

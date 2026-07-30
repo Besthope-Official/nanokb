@@ -30,14 +30,26 @@ pub enum ChunkStrategy {
     },
 }
 
-pub fn chunk_document(document: &StructuredDocument, strategy: &ChunkStrategy) -> Vec<Chunk> {
-    let ChunkStrategy::Layered {
-        max_chunk_tokens,
-        overlap_ratio,
-        metadata_mode,
-    } = strategy;
+impl Default for ChunkStrategy {
+    fn default() -> Self {
+        Self::Layered {
+            max_chunk_tokens: 256,
+            overlap_ratio: 0.1,
+            metadata_mode: MetadataMode::Path,
+        }
+    }
+}
 
-    layered_chunks(document, *max_chunk_tokens, *overlap_ratio, *metadata_mode)
+impl StructuredDocument {
+    pub fn into_chunks(self, strategy: &ChunkStrategy) -> Vec<Chunk> {
+        let ChunkStrategy::Layered {
+            max_chunk_tokens,
+            overlap_ratio,
+            metadata_mode,
+        } = strategy;
+
+        layered_chunks(&self, *max_chunk_tokens, *overlap_ratio, *metadata_mode)
+    }
 }
 
 fn layered_chunks(
