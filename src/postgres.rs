@@ -332,13 +332,17 @@ pub async fn cancel_all_running(pool: &PgPool) -> Result<u64> {
 }
 
 pub async fn listen_for_tasks(pool: &PgPool) -> Result<PgListener> {
+    listen_on(pool, "task_added").await
+}
+
+pub async fn listen_on(pool: &PgPool, channel: &str) -> Result<PgListener> {
     let mut listener = PgListener::connect_with(pool)
         .await
-        .context("failed to create task listener")?;
+        .context("failed to create listener")?;
     listener
-        .listen("task_added")
+        .listen(channel)
         .await
-        .context("failed to listen on task_added channel")?;
+        .with_context(|| format!("failed to listen on {channel} channel"))?;
     Ok(listener)
 }
 
@@ -347,6 +351,14 @@ pub async fn notify_task_added(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to notify task_added")?;
+    Ok(())
+}
+
+pub async fn notify_task_completed(pool: &PgPool) -> Result<()> {
+    sqlx::query("SELECT pg_notify('task_completed', '')")
+        .execute(pool)
+        .await
+        .context("failed to notify task_completed")?;
     Ok(())
 }
 

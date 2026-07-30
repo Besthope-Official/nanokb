@@ -1,3 +1,4 @@
+use crate::chunker::{ChunkStrategy, MetadataMode};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -23,6 +24,18 @@ pub struct PipelineConfig {
     pub kb_name: String,
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
+    #[serde(default = "default_embed_batch_size")]
+    pub embed_batch_size: usize,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_max_chunk_tokens")]
+    pub max_chunk_tokens: usize,
+    #[serde(default = "default_chunk_overlap_ratio")]
+    pub chunk_overlap_ratio: f32,
+    #[serde(default = "default_worker_poll_timeout_secs")]
+    pub worker_poll_timeout_secs: u64,
+    #[serde(default = "default_worker_error_retry_secs")]
+    pub worker_error_retry_secs: u64,
 }
 
 impl Default for PipelineConfig {
@@ -30,6 +43,22 @@ impl Default for PipelineConfig {
         Self {
             kb_name: default_kb_name(),
             worker_count: default_worker_count(),
+            embed_batch_size: default_embed_batch_size(),
+            top_k: default_top_k(),
+            max_chunk_tokens: default_max_chunk_tokens(),
+            chunk_overlap_ratio: default_chunk_overlap_ratio(),
+            worker_poll_timeout_secs: default_worker_poll_timeout_secs(),
+            worker_error_retry_secs: default_worker_error_retry_secs(),
+        }
+    }
+}
+
+impl PipelineConfig {
+    pub fn chunk_strategy(&self) -> ChunkStrategy {
+        ChunkStrategy::Layered {
+            max_chunk_tokens: self.max_chunk_tokens,
+            overlap_ratio: self.chunk_overlap_ratio,
+            metadata_mode: MetadataMode::Path,
         }
     }
 }
@@ -40,6 +69,30 @@ fn default_kb_name() -> String {
 
 fn default_worker_count() -> usize {
     2
+}
+
+fn default_embed_batch_size() -> usize {
+    32
+}
+
+fn default_top_k() -> usize {
+    5
+}
+
+fn default_max_chunk_tokens() -> usize {
+    256
+}
+
+fn default_chunk_overlap_ratio() -> f32 {
+    0.1
+}
+
+fn default_worker_poll_timeout_secs() -> u64 {
+    30
+}
+
+fn default_worker_error_retry_secs() -> u64 {
+    5
 }
 
 #[derive(Clone, Deserialize)]

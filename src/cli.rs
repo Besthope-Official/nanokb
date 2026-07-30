@@ -1,19 +1,13 @@
-use anyhow::Result;
+use crate::pipeline::Pipeline;
 use crate::{
-    postgres, task, AppConfig, ChunkStrategy, Document, EmbedClient, Filter, IntoEmbeddings,
+    postgres, task, AppConfig, EmbedClient,
 };
+use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::{env, path::PathBuf};
+use std::time::Duration;
+use std::{env};
 use tokio::sync::watch;
-
-trait Tap: Sized {
-    fn tap(self, f: impl FnOnce(&Self)) -> Self {
-        f(&self);
-        self
-    }
-}
-
-impl<T> Tap for T {}
 
 pub async fn run() -> Result<()> {
     let mut args = env::args_os().skip(1);
@@ -22,29 +16,24 @@ pub async fn run() -> Result<()> {
     let pool = postgres::connect(&config.database.url).await?;
     postgres::initialize(&pool).await?;
 
-    match args.next() {
-        Some(first) if first == "query" => {
+    match args.next().as_deref().and_then(|s| s.to_str()) {
+        Some("query") => {
             let query_text = args
                 .next()
                 .map(|s| s.into_string().unwrap_or_default())
                 .unwrap_or_default();
             run_query(&config, &pool, &query_text).await
         }
-        Some(first) if first == "import-dir" => {
-            let dir_path = args
+        Some("flush-db") => postgres::flush_db(&pool).await,
+        Some("build") | None => {
+            let source_path = args
                 .next()
                 .map(|s| s.into_string().unwrap_or_default())
                 .unwrap_or_else(|| "examples".to_string());
-            run_import_dir(&config, &pool, &dir_path).await
+            run_build(&config, &pool, &source_path).await
         }
-        Some(first) if first == "flush-db" => {
-            postgres::flush_db(&pool).await
-        }
-        other => {
-            let source_path = other
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("examples/example.md"));
-            run_import(&config, &pool, &source_path).await
+        _ => {
+            anyhow::bail!("unknown command; expected one of: query, flush-db, build [path]")
         }
     }
 }
@@ -54,7 +43,9 @@ async fn run_query(config: &AppConfig, pool: &sqlx::PgPool, query_text: &str) ->
         .dimension()
         .await?;
     let embedding = model.embed_query(query_text).await?;
-    let results = postgres::query_chunks(pool, "test", &embedding, 5).await?;
+    let kb_name = &config.pipeline.kb_name;
+    let top_k = config.pipeline.top_k;
+    let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
 
     for result in &results {
         println!("[{:.4}] {}", result.distance, result.text);
@@ -62,98 +53,96 @@ async fn run_query(config: &AppConfig, pool: &sqlx::PgPool, query_text: &str) ->
     Ok(())
 }
 
-async fn run_import(
-    config: &AppConfig,
-    pool: &sqlx::PgPool,
-    source_path: &PathBuf,
-) -> Result<()> {
-    let chunk_config = serde_json::json!({"strategy": "layered"});
-    let embed_config = serde_json::json!({"model": &config.model.embedding.model_name});
+async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Result<()> {
+    let path = PathBuf::from(path);
 
-    Document::from_markdown(source_path)?
-        .into_parsed()
-        .filter(&[Filter::DropReference])
-        .tap(|document| println!("{document}"))
-        .into_chunks(&ChunkStrategy::default())
-        .into_embeddings(EmbedClient::from_config(&config.model.embedding)?)
-        .await?
-        .store(
-            pool,
-            "test",
-            &chunk_config,
-            &embed_config,
-            &config.database.index,
-        )
-        .await?;
+    if path.is_file() {
+        let pipeline = Pipeline::from_config(config).await?;
+        pipeline
+            .run(pool, &path.to_string_lossy(), &config.pipeline.kb_name)
+            .await?;
+        println!("built {}", path.display());
+    } else if path.is_dir() {
+        let kb_name = &config.pipeline.kb_name;
+        let worker_count = config.pipeline.worker_count;
 
-    println!("imported {}", source_path.display());
+        let task_ids = task::import_dir(pool, &path.to_string_lossy(), kb_name).await?;
+        if task_ids.is_empty() {
+            println!("no markdown files found in {}", path.display());
+            return Ok(());
+        }
+        println!("created {} tasks for kb '{}'", task_ids.len(), kb_name);
+
+        let pipeline = Arc::new(Pipeline::from_config(config).await?);
+        let config_arc = Arc::new(config.clone());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let mut handles = Vec::with_capacity(worker_count);
+        for _ in 0..worker_count {
+            let pool = pool.clone();
+            let config = config_arc.clone();
+            let pipeline = pipeline.clone();
+            let rx = shutdown_rx.clone();
+            handles.push(tokio::spawn(async move {
+                task::run_worker(pool, config, pipeline, rx).await;
+            }));
+        }
+
+        let completed_normally = wait_all_done(pool).await;
+
+        let _ = shutdown_tx.send(true);
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        if !completed_normally {
+            let canceled = postgres::cancel_all_running(pool).await?;
+            if canceled > 0 {
+                eprintln!("canceled {canceled} running tasks");
+            }
+        }
+
+        println!("build complete");
+    } else {
+        anyhow::bail!("path does not exist: {}", path.display());
+    }
     Ok(())
 }
 
-async fn run_import_dir(
-    config: &AppConfig,
-    pool: &sqlx::PgPool,
-    dir_path: &str,
-) -> Result<()> {
-    let kb_name = &config.pipeline.kb_name;
-    let worker_count = config.pipeline.worker_count;
-
-    let task_ids = task::import_dir(pool, dir_path, kb_name).await?;
-    if task_ids.is_empty() {
-        println!("no markdown files found in {}", dir_path);
-        return Ok(());
-    }
-    println!("created {} tasks for kb '{}'", task_ids.len(), kb_name);
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    let config_arc = Arc::new(config.clone());
-    let mut handles = Vec::with_capacity(worker_count);
-    for _ in 0..worker_count {
-        let pool = pool.clone();
-        let config = config_arc.clone();
-        let rx = shutdown_rx.clone();
-        handles.push(tokio::spawn(async move {
-            task::run_worker(pool, config, rx).await;
-        }));
-    }
-
-    let completed_normally = tokio::select! {
-        _ = wait_all_done(pool) => true,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\nshutting down...");
-            false
+/// Returns true if all tasks completed, false if interrupted by ctrl_c.
+async fn wait_all_done(pool: &sqlx::PgPool) -> bool {
+    let mut listener = match postgres::listen_on(pool, "task_completed").await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("failed to listen for task completion: {e:#}");
+            return false;
         }
     };
 
-    let _ = shutdown_tx.send(true);
-
-    for handle in handles {
-        let _ = handle.await;
+    // Check in case all tasks finished before the listener was set up.
+    match postgres::count_active_tasks(pool).await {
+        Ok((0, 0)) => return true,
+        Err(e) => eprintln!("failed to check task status: {e:#}"),
+        _ => {}
     }
 
-    if !completed_normally {
-        let canceled = postgres::cancel_all_running(pool).await?;
-        if canceled > 0 {
-            eprintln!("canceled {canceled} running tasks");
-        }
-    }
-
-    println!("import-dir complete");
-    Ok(())
-}
-
-async fn wait_all_done(pool: &sqlx::PgPool) {
     loop {
+        let notified = tokio::select! {
+            result = listener.recv() => result.is_ok(),
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nshutting down...");
+                return false;
+            }
+        };
+
+        if !notified {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
         match postgres::count_active_tasks(pool).await {
-            Ok((0, 0)) => break,
-            Err(e) => {
-                eprintln!("failed to check task status: {e:#}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            _ => {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
+            Ok((0, 0)) => return true,
+            Err(e) => eprintln!("failed to check task status: {e:#}"),
+            _ => {}
         }
     }
 }

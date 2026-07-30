@@ -53,7 +53,7 @@ pub struct EmbedModel {
     http: reqwest::Client,
     api_base: String,
     api_key: String,
-    model_name: String,
+    pub(crate) model_name: String,
     pub dimension: usize,
 }
 

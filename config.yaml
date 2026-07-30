@@ -15,3 +15,9 @@ model:
 pipeline:
   kb_name: "test"
   worker_count: 2
+  embed_batch_size: 32
+  top_k: 5
+  max_chunk_tokens: 256
+  chunk_overlap_ratio: 0.1
+  worker_poll_timeout_secs: 30
+  worker_error_retry_secs: 5

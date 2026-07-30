@@ -1,8 +1,6 @@
 use crate::config::AppConfig;
+use crate::pipeline::Pipeline;
 use crate::postgres::{self, TaskRow};
-use crate::{
-    ChunkStrategy, Document, EmbedClient, EmbeddedChunk, EmbeddedChunks, Filter,
-};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::path::Path;
@@ -56,9 +54,13 @@ impl From<TaskRow> for Task {
 pub async fn run_worker(
     pool: PgPool,
     config: Arc<AppConfig>,
+    pipeline: Arc<Pipeline>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut listener = match postgres::listen_for_tasks(&pool).await {
+    let poll_timeout = Duration::from_secs(config.pipeline.worker_poll_timeout_secs);
+    let error_retry = Duration::from_secs(config.pipeline.worker_error_retry_secs);
+
+    let mut listener = match postgres::listen_on(&pool, "task_added").await {
         Ok(l) => l,
         Err(e) => {
             eprintln!("failed to setup task listener: {e:#}");
@@ -74,19 +76,19 @@ pub async fn run_worker(
         match postgres::fetch_and_lock_pending(&pool).await {
             Ok(Some(row)) => {
                 let task = Task::from(row);
-                process_task(&task, &config, &pool).await;
+                process_task(&task, &pipeline, &pool).await;
             }
             Ok(None) => {
                 tokio::select! {
                     _ = listener.recv() => {},
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                    _ = tokio::time::sleep(poll_timeout) => {},
                     _ = shutdown_rx.changed() => { break; }
                 }
             }
             Err(e) => {
                 eprintln!("worker failed to fetch task: {e:#}");
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = tokio::time::sleep(error_retry) => {},
                     _ = shutdown_rx.changed() => { break; }
                 }
             }
@@ -94,8 +96,8 @@ pub async fn run_worker(
     }
 }
 
-async fn process_task(task: &Task, config: &AppConfig, pool: &PgPool) {
-    let result = run_pipeline(&task.doc_path, &task.kb_name, config, pool).await;
+async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
+    let result = pipeline.run(pool, &task.doc_path, &task.kb_name).await;
     match result {
         Ok(()) => {
             if let Err(e) = postgres::mark_task_success(pool, task.id).await {
@@ -110,82 +112,9 @@ async fn process_task(task: &Task, config: &AppConfig, pool: &PgPool) {
             }
         }
     }
-}
-
-async fn run_pipeline(
-    doc_path: &str,
-    kb_name: &str,
-    config: &AppConfig,
-    pool: &PgPool,
-) -> Result<()> {
-    let chunk_config = serde_json::json!({"strategy": "layered"});
-    let embed_config = serde_json::json!({"model": &config.model.embedding.model_name});
-
-    let filename = Path::new(doc_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(doc_path);
-
-    // Stage 1: Parse
-    eprintln!("[{filename}] parsing...");
-    let document = Document::from_markdown(Path::new(doc_path))?
-        .into_parsed()
-        .filter(&[Filter::DropReference]);
-    eprintln!("[{filename}] parsed, {} AST nodes", document.tree.len());
-
-    // Stage 2: Chunk
-    eprintln!("[{filename}] chunking...");
-    let chunks = document.into_chunks(&ChunkStrategy::default());
-    let total = chunks.len();
-    eprintln!("[{filename}] chunked into {total} chunks");
-
-    // Stage 3: Embed (batched with progress)
-    let model = EmbedClient::from_config(&config.model.embedding)?
-        .dimension()
-        .await?;
-
-    let mut embedded = Vec::with_capacity(total);
-    const EMBED_BATCH: usize = 32;
-
-    for batch in chunks.chunks(EMBED_BATCH) {
-        let current = embedded.len();
-        eprintln!(
-            "[{filename}] embedding {}-{}/{}...",
-            current + 1,
-            current + batch.len(),
-            total
-        );
-
-        let texts: Vec<String> = batch.iter().map(|c| c.embedding_text.clone()).collect();
-        let embeddings = model.embed_batch(&texts).await?;
-
-        for (chunk, embedding) in batch.iter().zip(embeddings) {
-            embedded.push(EmbeddedChunk {
-                chunk_id: chunk.chunk_id.clone(),
-                text: chunk.text.clone(),
-                embedding_text: chunk.embedding_text.clone(),
-                embedding,
-            });
-        }
+    if let Err(e) = postgres::notify_task_completed(pool).await {
+        eprintln!("failed to notify task completion: {e:#}");
     }
-
-    // Stage 4: Store
-    eprintln!("[{filename}] storing {total} chunks...");
-    EmbeddedChunks {
-        chunks: embedded,
-        dimension: model.dimension,
-    }
-    .store(
-        pool,
-        kb_name,
-        &chunk_config,
-        &embed_config,
-        &config.database.index,
-    )
-    .await?;
-
-    eprintln!("[{filename}] done ✓");
-    Ok(())
 }
 
 pub async fn import_dir(

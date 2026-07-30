@@ -18,4 +18,7 @@ pub use postgres::{query_chunks, QueryResult};
 
 pub mod task;
 
+pub mod pipeline;
+pub use pipeline::Pipeline;
+
 pub mod cli;
