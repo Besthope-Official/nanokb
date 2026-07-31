@@ -23,6 +23,7 @@ pub async fn initialize(pool: &PgPool) -> Result<()> {
 
     ensure_pgvector(&mut transaction).await?;
     ensure_meta_table(&mut transaction).await?;
+    ensure_document_table(&mut transaction).await?;
     ensure_task_table(&mut transaction).await?;
 
     transaction
@@ -56,11 +57,12 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
 
 async fn ensure_task_table(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query(
-        r#"CREATE TABLE IF NOT EXISTS tasks (
-            id            BIGSERIAL PRIMARY KEY,
-            doc_path      TEXT NOT NULL,
-            kb_name       TEXT NOT NULL,
-            status        TEXT NOT NULL DEFAULT 'pending',
+        r#"CREATE TABLE IF NOT EXISTS task (
+            id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            document_id   BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            status        TEXT NOT NULL DEFAULT 'pending'
+                          CONSTRAINT task_status_check
+                          CHECK (status IN ('pending', 'running', 'success', 'failed', 'canceled')),
             error_message TEXT,
             created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -69,6 +71,36 @@ async fn ensure_task_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
     .execute(&mut **transaction)
     .await
     .context("failed to create tasks table")?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS task_document_id_idx ON task (document_id)")
+        .execute(&mut **transaction)
+        .await
+        .context("failed to create task document index")?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS task_pending_idx ON task (created_at) WHERE status = 'pending'",
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create pending task index")?;
+    Ok(())
+}
+
+async fn ensure_document_table(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS document (
+            id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            kb_name     TEXT NOT NULL REFERENCES kb_meta(name) ON DELETE CASCADE,
+            source_path TEXT NOT NULL,
+            filename    TEXT NOT NULL,
+            frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
+            parsed_at   TIMESTAMPTZ,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CONSTRAINT document_kb_source_unique UNIQUE (kb_name, source_path)
+        )"#,
+    )
+    .execute(&mut **transaction)
+    .await
+    .context("failed to create document table")?;
     Ok(())
 }
 
@@ -96,11 +128,13 @@ pub async fn create_kb(
 
     let create_table = format!(
         r#"CREATE TABLE IF NOT EXISTS {table_name} (
-            chunk_id       TEXT PRIMARY KEY,
+            document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            chunk_id       TEXT NOT NULL,
             text           TEXT NOT NULL,
             embedding_text TEXT NOT NULL,
             embedding      vector({dimension}) NOT NULL,
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (document_id, chunk_id)
         )"#
     );
 
@@ -144,34 +178,54 @@ pub struct ChunkRow {
     pub embedding: Vec<f32>,
 }
 
-pub async fn insert_chunks(
+pub async fn replace_document_chunks(
     pool: &PgPool,
     kb_name: &str,
+    document_id: i64,
     chunks: &[ChunkRow],
 ) -> Result<()> {
     let table_name = kb_table(kb_name)?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .with_context(|| format!("failed to begin chunk replacement for document {document_id}"))?;
+    let document_kb: String = sqlx::query_scalar("SELECT kb_name FROM document WHERE id = $1")
+        .bind(document_id)
+        .fetch_one(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to load document {document_id}"))?;
+    anyhow::ensure!(
+        document_kb == kb_name,
+        "document {document_id} belongs to kb {document_kb}, not {kb_name}"
+    );
+    let delete_sql = format!("DELETE FROM {table_name} WHERE document_id = $1");
+    sqlx::query(AssertSqlSafe(delete_sql))
+        .bind(document_id)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to delete chunks for document {document_id}"))?;
     for chunk in chunks {
         let vector = Vector::from(chunk.embedding.clone());
         let sql = format!(
-            "INSERT INTO {table_name} (chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4) ON CONFLICT (chunk_id) DO NOTHING"
+            "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4, $5)"
         );
         sqlx::query(AssertSqlSafe(sql))
+            .bind(document_id)
             .bind(&chunk.chunk_id)
             .bind(&chunk.text)
             .bind(&chunk.embedding_text)
             .bind(vector)
-            .execute(pool)
+            .execute(&mut *transaction)
             .await
             .with_context(|| format!("failed to insert chunk {}", chunk.chunk_id))?;
     }
-    Ok(())
+    transaction
+        .commit()
+        .await
+        .with_context(|| format!("failed to replace chunks for document {document_id}"))
 }
 
-pub async fn create_index(
-    pool: &PgPool,
-    kb_name: &str,
-    index_config: &IndexConfig,
-) -> Result<()> {
+pub async fn create_index(pool: &PgPool, kb_name: &str, index_config: &IndexConfig) -> Result<()> {
     let table_name = kb_table(kb_name)?;
     match index_config {
         IndexConfig::Hnsw {
@@ -202,6 +256,10 @@ pub async fn create_index(
 
 #[derive(Debug)]
 pub struct QueryResult {
+    pub document_id: i64,
+    pub source_path: String,
+    pub filename: String,
+    pub frontmatter: Value,
     pub chunk_id: String,
     pub text: String,
     pub embedding_text: String,
@@ -217,10 +275,12 @@ pub async fn query_chunks(
     let table_name = kb_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
     let sql = format!(
-        "SELECT chunk_id, text, embedding_text, \
-                embedding <=> $1::vector AS distance \
-         FROM {table_name} \
-         ORDER BY embedding <=> $1::vector \
+        "SELECT chunk.document_id, document.source_path, document.filename, document.frontmatter, \
+                chunk.chunk_id, chunk.text, chunk.embedding_text, \
+                chunk.embedding <=> $1::vector AS distance \
+         FROM {table_name} AS chunk \
+         JOIN document ON document.id = chunk.document_id \
+         ORDER BY chunk.embedding <=> $1::vector \
          LIMIT $2"
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
@@ -233,6 +293,10 @@ pub async fn query_chunks(
     Ok(rows
         .iter()
         .map(|row| QueryResult {
+            document_id: row.get("document_id"),
+            source_path: row.get("source_path"),
+            filename: row.get("filename"),
+            frontmatter: row.get("frontmatter"),
             chunk_id: row.get("chunk_id"),
             text: row.get("text"),
             embedding_text: row.get("embedding_text"),
@@ -244,16 +308,57 @@ pub async fn query_chunks(
 #[derive(Debug)]
 pub struct TaskRow {
     pub id: i64,
+    pub document_id: i64,
     pub doc_path: String,
     pub kb_name: String,
     pub status: String,
     pub error_message: Option<String>,
 }
 
-pub async fn insert_task(pool: &PgPool, doc_path: &str, kb_name: &str) -> Result<i64> {
-    let row = sqlx::query("INSERT INTO tasks (doc_path, kb_name) VALUES ($1, $2) RETURNING id")
-        .bind(doc_path)
-        .bind(kb_name)
+pub async fn register_document(
+    pool: &PgPool,
+    kb_name: &str,
+    source_path: &str,
+    filename: &str,
+) -> Result<i64> {
+    let row = sqlx::query(
+        "INSERT INTO document (kb_name, source_path, filename) VALUES ($1, $2, $3) \
+         ON CONFLICT (kb_name, source_path) DO UPDATE \
+         SET filename = EXCLUDED.filename, updated_at = now() \
+         RETURNING id",
+    )
+    .bind(kb_name)
+    .bind(source_path)
+    .bind(filename)
+    .fetch_one(pool)
+    .await
+    .context("failed to register document")?;
+    Ok(row.get("id"))
+}
+
+pub async fn mark_document_parsed(
+    pool: &PgPool,
+    document_id: i64,
+    frontmatter: &Value,
+) -> Result<()> {
+    let result = sqlx::query(
+        "UPDATE document SET frontmatter = $2, parsed_at = now(), updated_at = now() WHERE id = $1",
+    )
+    .bind(document_id)
+    .bind(Json(frontmatter))
+    .execute(pool)
+    .await
+    .context("failed to persist parsed document metadata")?;
+    anyhow::ensure!(
+        result.rows_affected() == 1,
+        "document {document_id} does not exist"
+    );
+    Ok(())
+}
+
+pub async fn insert_task(pool: &PgPool, document_id: i64) -> Result<i64> {
+    let row = sqlx::query("INSERT INTO task (document_id) VALUES ($1) RETURNING id")
+        .bind(document_id)
         .fetch_one(pool)
         .await
         .context("failed to insert task")?;
@@ -261,16 +366,15 @@ pub async fn insert_task(pool: &PgPool, doc_path: &str, kb_name: &str) -> Result
 }
 
 pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
-    let mut tx = pool
-        .begin()
-        .await
-        .context("failed to begin transaction")?;
+    let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
     let row = sqlx::query(
-        "SELECT id, doc_path, kb_name, status, error_message
-         FROM tasks
-         WHERE status = 'pending'
-         ORDER BY created_at
+        "SELECT task.id, task.document_id, document.source_path AS doc_path, document.kb_name,
+                task.status, task.error_message
+         FROM task
+         JOIN document ON document.id = task.document_id
+         WHERE task.status = 'pending'
+         ORDER BY task.created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED",
     )
@@ -282,12 +386,13 @@ pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
         Some(row) => {
             let task = TaskRow {
                 id: row.get("id"),
+                document_id: row.get("document_id"),
                 doc_path: row.get("doc_path"),
                 kb_name: row.get("kb_name"),
                 status: row.get("status"),
                 error_message: row.get("error_message"),
             };
-            sqlx::query("UPDATE tasks SET status = 'running', updated_at = now() WHERE id = $1")
+            sqlx::query("UPDATE task SET status = 'running', updated_at = now() WHERE id = $1")
                 .bind(task.id)
                 .execute(&mut *tx)
                 .await
@@ -303,7 +408,7 @@ pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
 }
 
 pub async fn mark_task_success(pool: &PgPool, task_id: i64) -> Result<()> {
-    sqlx::query("UPDATE tasks SET status = 'success', updated_at = now() WHERE id = $1")
+    sqlx::query("UPDATE task SET status = 'success', updated_at = now() WHERE id = $1")
         .bind(task_id)
         .execute(pool)
         .await
@@ -312,18 +417,20 @@ pub async fn mark_task_success(pool: &PgPool, task_id: i64) -> Result<()> {
 }
 
 pub async fn mark_task_failed(pool: &PgPool, task_id: i64, error_message: &str) -> Result<()> {
-    sqlx::query("UPDATE tasks SET status = 'failed', error_message = $2, updated_at = now() WHERE id = $1")
-        .bind(task_id)
-        .bind(error_message)
-        .execute(pool)
-        .await
-        .context("failed to mark task failed")?;
+    sqlx::query(
+        "UPDATE task SET status = 'failed', error_message = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(task_id)
+    .bind(error_message)
+    .execute(pool)
+    .await
+    .context("failed to mark task failed")?;
     Ok(())
 }
 
 pub async fn cancel_all_running(pool: &PgPool) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE tasks SET status = 'canceled', updated_at = now() WHERE status = 'running'",
+        "UPDATE task SET status = 'canceled', updated_at = now() WHERE status = 'running'",
     )
     .execute(pool)
     .await
@@ -363,18 +470,14 @@ pub async fn notify_task_completed(pool: &PgPool) -> Result<()> {
 }
 
 pub async fn count_active_tasks(pool: &PgPool) -> Result<(i64, i64)> {
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tasks WHERE status = 'pending'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("failed to count pending tasks")?;
-    let running: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM tasks WHERE status = 'running'",
-    )
-    .fetch_one(pool)
-    .await
-    .context("failed to count running tasks")?;
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE status = 'pending'")
+        .fetch_one(pool)
+        .await
+        .context("failed to count pending tasks")?;
+    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE status = 'running'")
+        .fetch_one(pool)
+        .await
+        .context("failed to count running tasks")?;
     Ok((pending, running))
 }
 
@@ -388,6 +491,8 @@ pub async fn flush_db(pool: &PgPool) -> Result<()> {
                 EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
             END LOOP;
             DROP TABLE IF EXISTS kb_meta CASCADE;
+            DROP TABLE IF EXISTS document CASCADE;
+            DROP TABLE IF EXISTS task CASCADE;
             DROP TABLE IF EXISTS tasks CASCADE;
         END
         $$"#,

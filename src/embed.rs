@@ -99,6 +99,7 @@ impl EmbeddedChunks {
         self,
         pool: &PgPool,
         kb_name: &str,
+        document_id: i64,
         chunk_config: &Value,
         embed_config: &Value,
         index_config: &IndexConfig,
@@ -114,7 +115,7 @@ impl EmbeddedChunks {
                 embedding: c.embedding,
             })
             .collect();
-        postgres::insert_chunks(pool, kb_name, &rows).await?;
+        postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await?;
         postgres::create_index(pool, kb_name, index_config).await
     }
 }

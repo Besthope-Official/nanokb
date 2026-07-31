@@ -1,10 +1,10 @@
+use crate::IndexConfig;
 use crate::chunker::ChunkStrategy;
 use crate::config::AppConfig;
 use crate::embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
 use crate::filter::Filter;
 use crate::parser::Document;
-use crate::IndexConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::json;
 use sqlx::PgPool;
 use std::path::Path;
@@ -29,7 +29,26 @@ impl Pipeline {
         })
     }
 
-    pub async fn run(&self, pool: &PgPool, doc_path: &str, kb_name: &str) -> Result<()> {
+    pub async fn prepare_kb(&self, pool: &PgPool, kb_name: &str) -> Result<()> {
+        let chunk_config = self.chunk_config_json();
+        let embed_config = json!({"model": &self.model.model_name});
+        crate::postgres::create_kb(
+            pool,
+            kb_name,
+            self.model.dimension,
+            &chunk_config,
+            &embed_config,
+        )
+        .await
+    }
+
+    pub async fn run(
+        &self,
+        pool: &PgPool,
+        document_id: i64,
+        doc_path: &str,
+        kb_name: &str,
+    ) -> Result<()> {
         let path = Path::new(doc_path);
         let filename = path
             .file_name()
@@ -38,9 +57,11 @@ impl Pipeline {
 
         // Stage 1: Parse
         eprintln!("[{filename}] parsing...");
-        let document = Document::from_markdown(path)?
-            .into_parsed()
-            .filter(&[Filter::DropReference]);
+        let document = Document::from_markdown(path)?;
+        let frontmatter = serde_json::to_value(&document.metadata.frontmatter)
+            .context("failed to serialize document frontmatter")?;
+        let document = document.into_parsed().filter(&[Filter::DropReference]);
+        crate::postgres::mark_document_parsed(pool, document_id, &frontmatter).await?;
         eprintln!("[{filename}] parsed, {} AST nodes", document.tree.len());
 
         // Stage 2: Chunk
@@ -82,7 +103,14 @@ impl Pipeline {
             chunks: embedded,
             dimension: self.model.dimension,
         }
-        .store(pool, kb_name, &chunk_config, &embed_config, &self.index_config)
+        .store(
+            pool,
+            kb_name,
+            document_id,
+            &chunk_config,
+            &embed_config,
+            &self.index_config,
+        )
         .await?;
 
         eprintln!("[{filename}] done ✓");

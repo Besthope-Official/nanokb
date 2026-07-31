@@ -1,12 +1,10 @@
 use crate::pipeline::Pipeline;
-use crate::{
-    postgres, task, AppConfig, EmbedClient,
-};
+use crate::{AppConfig, EmbedClient, postgres, task};
 use anyhow::Result;
+use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env};
 use tokio::sync::watch;
 
 pub async fn run() -> Result<()> {
@@ -58,13 +56,25 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
 
     if path.is_file() {
         let pipeline = Pipeline::from_config(config).await?;
+        let kb_name = &config.pipeline.kb_name;
+        pipeline.prepare_kb(pool, kb_name).await?;
+        let source_path = path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", path.display()))?;
+        let document_id = postgres::register_document(pool, kb_name, source_path, filename).await?;
         pipeline
-            .run(pool, &path.to_string_lossy(), &config.pipeline.kb_name)
+            .run(pool, document_id, source_path, kb_name)
             .await?;
         println!("built {}", path.display());
     } else if path.is_dir() {
         let kb_name = &config.pipeline.kb_name;
         let worker_count = config.pipeline.worker_count;
+        let pipeline = Arc::new(Pipeline::from_config(config).await?);
+        pipeline.prepare_kb(pool, kb_name).await?;
 
         let task_ids = task::import_dir(pool, &path.to_string_lossy(), kb_name).await?;
         if task_ids.is_empty() {
@@ -73,7 +83,6 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
         }
         println!("created {} tasks for kb '{}'", task_ids.len(), kb_name);
 
-        let pipeline = Arc::new(Pipeline::from_config(config).await?);
         let config_arc = Arc::new(config.clone());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 

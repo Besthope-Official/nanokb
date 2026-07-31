@@ -33,6 +33,7 @@ impl From<&str> for TaskStatus {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: i64,
+    pub document_id: i64,
     pub doc_path: String,
     pub kb_name: String,
     pub status: TaskStatus,
@@ -43,6 +44,7 @@ impl From<TaskRow> for Task {
     fn from(row: TaskRow) -> Self {
         Task {
             id: row.id,
+            document_id: row.document_id,
             doc_path: row.doc_path,
             kb_name: row.kb_name,
             status: TaskStatus::from(row.status.as_str()),
@@ -97,7 +99,9 @@ pub async fn run_worker(
 }
 
 async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
-    let result = pipeline.run(pool, &task.doc_path, &task.kb_name).await;
+    let result = pipeline
+        .run(pool, task.document_id, &task.doc_path, &task.kb_name)
+        .await;
     match result {
         Ok(()) => {
             if let Err(e) = postgres::mark_task_success(pool, task.id).await {
@@ -106,7 +110,10 @@ async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
         }
         Err(e) => {
             let error_message = format!("{e:#}");
-            eprintln!("task {} ({}) failed: {error_message}", task.id, task.doc_path);
+            eprintln!(
+                "task {} ({}) failed: {error_message}",
+                task.id, task.doc_path
+            );
             if let Err(e) = postgres::mark_task_failed(pool, task.id, &error_message).await {
                 eprintln!("failed to mark task {} failed: {e:#}", task.id);
             }
@@ -117,18 +124,10 @@ async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
     }
 }
 
-pub async fn import_dir(
-    pool: &PgPool,
-    dir_path: &str,
-    kb_name: &str,
-) -> Result<Vec<i64>> {
+pub async fn import_dir(pool: &PgPool, dir_path: &str, kb_name: &str) -> Result<Vec<i64>> {
     let mut task_ids = Vec::new();
     let dir = Path::new(dir_path);
-    anyhow::ensure!(
-        dir.is_dir(),
-        "not a directory: {}",
-        dir.display()
-    );
+    anyhow::ensure!(dir.is_dir(), "not a directory: {}", dir.display());
 
     for entry in std::fs::read_dir(dir)
         .with_context(|| format!("failed to read directory: {}", dir.display()))?
@@ -139,7 +138,13 @@ pub async fn import_dir(
             let doc_path = path
                 .to_str()
                 .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?;
-            let task_id = postgres::insert_task(pool, doc_path, kb_name).await?;
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", path.display()))?;
+            let document_id =
+                postgres::register_document(pool, kb_name, doc_path, filename).await?;
+            let task_id = postgres::insert_task(pool, document_id).await?;
             task_ids.push(task_id);
         }
     }
