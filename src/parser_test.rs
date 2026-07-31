@@ -1,49 +1,13 @@
 use crate::parser::*;
 use rstest::*;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
-
-struct TempMarkdown {
-    path: PathBuf,
-}
-
-impl TempMarkdown {
-    fn new(file_name: &str, content: &str) -> Self {
-        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("nanokb-parser-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join(file_name);
-        fs::write(&path, content).unwrap();
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempMarkdown {
-    fn drop(&mut self) {
-        if let Some(dir) = self.path.parent() {
-            let _ = fs::remove_dir_all(dir);
-        }
-    }
-}
 
 #[test]
-fn from_markdown_loads_frontmatter_and_body() {
-    let source = TempMarkdown::new(
-        "guide.md",
+fn from_content_loads_frontmatter_and_body() {
+    let document = Document::from_content(
         "---\ntitle: Guide\nauthor: NanoKB\n---\n\n# Intro\nBody",
-    );
-
-    let document = Document::from_markdown(source.path()).unwrap();
+        "guide.md",
+    )
+    .unwrap();
 
     assert_eq!(document.metadata.filename, "guide.md");
     assert_eq!(document.content, "\n# Intro\nBody");
@@ -55,24 +19,10 @@ fn from_markdown_loads_frontmatter_and_body() {
 #[rstest]
 #[case::plain_body("plain body")]
 #[case::with_frontmatter("---\ntitle: \"hello\"\n---\nbody")]
-fn from_markdown_uses_file_name_as_title(#[case] content: &str) {
-    let source = TempMarkdown::new("fallback-title.md", content);
-
-    let document = Document::from_markdown(source.path()).unwrap();
+fn from_content_uses_file_name_as_title(#[case] content: &str) {
+    let document = Document::from_content(content, "fallback-title.md").unwrap();
 
     assert_eq!(document.metadata.filename, "fallback-title.md");
-}
-
-#[test]
-fn from_markdown_reports_source_path_when_read_fails() {
-    let missing = std::env::temp_dir().join("nanokb-missing-document.md");
-
-    let error = match Document::from_markdown(&missing) {
-        Ok(_) => panic!("reading a missing document should fail"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains(&missing.display().to_string()));
 }
 
 #[rstest]

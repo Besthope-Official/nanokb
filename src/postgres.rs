@@ -60,6 +60,7 @@ async fn ensure_task_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
         r#"CREATE TABLE IF NOT EXISTS task (
             id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             document_id   BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            priority      INTEGER NOT NULL DEFAULT 0,
             status        TEXT NOT NULL DEFAULT 'pending'
                           CONSTRAINT task_status_check
                           CHECK (status IN ('pending', 'running', 'success', 'failed', 'canceled')),
@@ -76,7 +77,7 @@ async fn ensure_task_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
         .await
         .context("failed to create task document index")?;
     sqlx::query(
-        "CREATE INDEX IF NOT EXISTS task_pending_idx ON task (created_at) WHERE status = 'pending'",
+        "CREATE INDEX IF NOT EXISTS task_pending_idx ON task (priority DESC, created_at) WHERE status = 'pending'",
     )
     .execute(&mut **transaction)
     .await
@@ -89,13 +90,12 @@ async fn ensure_document_table(transaction: &mut Transaction<'_, Postgres>) -> R
         r#"CREATE TABLE IF NOT EXISTS document (
             id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             kb_name     TEXT NOT NULL REFERENCES kb_meta(name) ON DELETE CASCADE,
-            source_path TEXT NOT NULL,
             filename    TEXT NOT NULL,
+            content     TEXT NOT NULL,
             frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
-            parsed_at   TIMESTAMPTZ,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-            CONSTRAINT document_kb_source_unique UNIQUE (kb_name, source_path)
+            CONSTRAINT document_kb_filename_unique UNIQUE (kb_name, filename)
         )"#,
     )
     .execute(&mut **transaction)
@@ -257,7 +257,6 @@ pub async fn create_index(pool: &PgPool, kb_name: &str, index_config: &IndexConf
 #[derive(Debug)]
 pub struct QueryResult {
     pub document_id: i64,
-    pub source_path: String,
     pub filename: String,
     pub frontmatter: Value,
     pub chunk_id: String,
@@ -275,7 +274,7 @@ pub async fn query_chunks(
     let table_name = kb_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
     let sql = format!(
-        "SELECT chunk.document_id, document.source_path, document.filename, document.frontmatter, \
+        "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.chunk_id, chunk.text, chunk.embedding_text, \
                 chunk.embedding <=> $1::vector AS distance \
          FROM {table_name} AS chunk \
@@ -294,7 +293,6 @@ pub async fn query_chunks(
         .iter()
         .map(|row| QueryResult {
             document_id: row.get("document_id"),
-            source_path: row.get("source_path"),
             filename: row.get("filename"),
             frontmatter: row.get("frontmatter"),
             chunk_id: row.get("chunk_id"),
@@ -309,7 +307,8 @@ pub async fn query_chunks(
 pub struct TaskRow {
     pub id: i64,
     pub document_id: i64,
-    pub doc_path: String,
+    pub filename: String,
+    pub content: String,
     pub kb_name: String,
     pub status: String,
     pub error_message: Option<String>,
@@ -318,18 +317,18 @@ pub struct TaskRow {
 pub async fn register_document(
     pool: &PgPool,
     kb_name: &str,
-    source_path: &str,
+    content: &str,
     filename: &str,
 ) -> Result<i64> {
     let row = sqlx::query(
-        "INSERT INTO document (kb_name, source_path, filename) VALUES ($1, $2, $3) \
-         ON CONFLICT (kb_name, source_path) DO UPDATE \
-         SET filename = EXCLUDED.filename, updated_at = now() \
+        "INSERT INTO document (kb_name, filename, content) VALUES ($1, $2, $3) \
+         ON CONFLICT (kb_name, filename) DO UPDATE \
+         SET content = EXCLUDED.content, updated_at = now() \
          RETURNING id",
     )
     .bind(kb_name)
-    .bind(source_path)
     .bind(filename)
+    .bind(content)
     .fetch_one(pool)
     .await
     .context("failed to register document")?;
@@ -342,7 +341,7 @@ pub async fn mark_document_parsed(
     frontmatter: &Value,
 ) -> Result<()> {
     let result = sqlx::query(
-        "UPDATE document SET frontmatter = $2, parsed_at = now(), updated_at = now() WHERE id = $1",
+        "UPDATE document SET frontmatter = $2, updated_at = now() WHERE id = $1",
     )
     .bind(document_id)
     .bind(Json(frontmatter))
@@ -356,9 +355,10 @@ pub async fn mark_document_parsed(
     Ok(())
 }
 
-pub async fn insert_task(pool: &PgPool, document_id: i64) -> Result<i64> {
-    let row = sqlx::query("INSERT INTO task (document_id) VALUES ($1) RETURNING id")
+pub async fn insert_task(pool: &PgPool, document_id: i64, priority: i32) -> Result<i64> {
+    let row = sqlx::query("INSERT INTO task (document_id, priority) VALUES ($1, $2) RETURNING id")
         .bind(document_id)
+        .bind(priority)
         .fetch_one(pool)
         .await
         .context("failed to insert task")?;
@@ -369,12 +369,12 @@ pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
     let row = sqlx::query(
-        "SELECT task.id, task.document_id, document.source_path AS doc_path, document.kb_name,
+        "SELECT task.id, task.document_id, document.filename, document.content, document.kb_name,
                 task.status, task.error_message
          FROM task
          JOIN document ON document.id = task.document_id
          WHERE task.status = 'pending'
-         ORDER BY task.created_at
+         ORDER BY task.priority DESC, task.created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED",
     )
@@ -387,7 +387,8 @@ pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
             let task = TaskRow {
                 id: row.get("id"),
                 document_id: row.get("document_id"),
-                doc_path: row.get("doc_path"),
+                filename: row.get("filename"),
+                content: row.get("content"),
                 kb_name: row.get("kb_name"),
                 status: row.get("status"),
                 error_message: row.get("error_message"),

@@ -1,6 +1,6 @@
 use crate::pipeline::Pipeline;
 use crate::{AppConfig, EmbedClient, postgres, task};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,17 +58,18 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
         let pipeline = Pipeline::from_config(config).await?;
         let kb_name = &config.pipeline.kb_name;
         pipeline.prepare_kb(pool, kb_name).await?;
-        let source_path = path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 path: {}", path.display()))?;
         let filename = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", path.display()))?;
-        let document_id = postgres::register_document(pool, kb_name, source_path, filename).await?;
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read: {}", path.display()))?;
+        let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
+        let task_id = postgres::insert_task(pool, document_id, 0).await?;
         pipeline
-            .run(pool, document_id, source_path, kb_name)
+            .run(pool, document_id, &content, filename, kb_name)
             .await?;
+        postgres::mark_task_success(pool, task_id).await?;
         println!("built {}", path.display());
     } else if path.is_dir() {
         let kb_name = &config.pipeline.kb_name;
@@ -76,7 +77,7 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
         let pipeline = Arc::new(Pipeline::from_config(config).await?);
         pipeline.prepare_kb(pool, kb_name).await?;
 
-        let task_ids = task::import_dir(pool, &path.to_string_lossy(), kb_name).await?;
+        let task_ids = task::import_dir(pool, &path.to_string_lossy(), kb_name, 0).await?;
         if task_ids.is_empty() {
             println!("no markdown files found in {}", path.display());
             return Ok(());

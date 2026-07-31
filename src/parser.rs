@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use std::{collections::BTreeMap, fmt, fs, path::Path};
+use std::{collections::BTreeMap, fmt, path::Path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentMetadata {
@@ -99,23 +99,17 @@ impl fmt::Display for NodeKind {
 }
 
 impl Document {
-    /// Read a markdown file and convert it to a Document.
-    pub fn from_markdown(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read markdown document: {}", path.display()))?;
-        let frontmatter = parse_frontmatter(&raw);
-        let content = strip_frontmatter(&raw).unwrap_or(&raw);
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    /// Parse markdown content into a Document.
+    pub fn from_content(content: &str, filename: &str) -> Result<Self> {
+        let frontmatter = parse_frontmatter(content);
+        let body = strip_frontmatter(content).unwrap_or(content);
         let metadata = DocumentMetadata {
-            filename,
+            filename: filename.to_owned(),
             frontmatter,
         };
 
         Ok(Self {
-            content: content.to_owned(),
+            content: body.to_owned(),
             metadata,
         })
     }

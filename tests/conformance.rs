@@ -51,19 +51,21 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
             .context("failed to load persisted conformance KB configuration")?;
     assert_eq!(stored_config, (chunk_config, embed_config));
 
-    let document_id = register_document(&pool, KB_NAME, "/fixtures/guide.md", "guide.md").await?;
+    let content = "# Test Guide\n\nThis is a conformance test document.\n";
+    let document_id = register_document(&pool, KB_NAME, content, "guide.md").await?;
     mark_document_parsed(
         &pool,
         document_id,
         &json!({"title": "Guide", "author": "NanoKB"}),
     )
     .await?;
-    let task_id = insert_task(&pool, document_id).await?;
+    let task_id = insert_task(&pool, document_id, 0).await?;
 
     let task = fetch_and_lock_pending(&pool).await?.expect("pending task");
     assert_eq!(task.id, task_id);
     assert_eq!(task.document_id, document_id);
-    assert_eq!(task.doc_path, "/fixtures/guide.md");
+    assert_eq!(task.filename, "guide.md");
+    assert_eq!(task.content, content);
     assert_eq!(task.kb_name, KB_NAME);
 
     replace_document_chunks(
@@ -79,8 +81,8 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     )
     .await?;
 
-    let document: (String, String, serde_json::Value, bool) = sqlx::query_as(
-        "SELECT kb_name, filename, frontmatter, parsed_at IS NOT NULL FROM document WHERE id = $1",
+    let document: (String, String, String, serde_json::Value) = sqlx::query_as(
+        "SELECT kb_name, filename, content, frontmatter FROM document WHERE id = $1",
     )
     .bind(document_id)
     .fetch_one(&pool)
@@ -90,8 +92,8 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         (
             KB_NAME.into(),
             "guide.md".into(),
+            content.into(),
             json!({"title": "Guide", "author": "NanoKB"}),
-            true,
         )
     );
 

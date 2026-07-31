@@ -7,7 +7,6 @@ use crate::parser::Document;
 use anyhow::{Context, Result};
 use serde_json::json;
 use sqlx::PgPool;
-use std::path::Path;
 
 pub struct Pipeline {
     model: EmbedModel,
@@ -46,18 +45,13 @@ impl Pipeline {
         &self,
         pool: &PgPool,
         document_id: i64,
-        doc_path: &str,
+        content: &str,
+        filename: &str,
         kb_name: &str,
     ) -> Result<()> {
-        let path = Path::new(doc_path);
-        let filename = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(doc_path);
-
         // Stage 1: Parse
         eprintln!("[{filename}] parsing...");
-        let document = Document::from_markdown(path)?;
+        let document = Document::from_content(content, filename)?;
         let frontmatter = serde_json::to_value(&document.metadata.frontmatter)
             .context("failed to serialize document frontmatter")?;
         let document = document.into_parsed().filter(&[Filter::DropReference]);
