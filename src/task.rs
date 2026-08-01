@@ -157,6 +157,20 @@ async fn notify_completed(pool: &PgPool) {
     }
 }
 
+/// Register a single markdown file and queue it for a worker.
+pub async fn import_file(pool: &PgPool, file_path: &Path, kb_name: &str, priority: i32) -> Result<i64> {
+    let filename = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", file_path.display()))?;
+    let content = std::fs::read_to_string(file_path)
+        .with_context(|| format!("failed to read markdown document: {}", file_path.display()))?;
+    let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
+    let task_id = postgres::insert_task(pool, document_id, priority).await?;
+    postgres::notify_task_added(pool).await?;
+    Ok(task_id)
+}
+
 pub async fn import_dir(pool: &PgPool, dir_path: &str, kb_name: &str, priority: i32) -> Result<Vec<i64>> {
     let mut task_ids = Vec::new();
     let dir = Path::new(dir_path);

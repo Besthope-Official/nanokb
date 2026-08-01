@@ -29,6 +29,7 @@ impl Pipeline {
     }
 
     pub async fn prepare_kb(&self, pool: &PgPool, kb_name: &str) -> Result<()> {
+        let chunk_config = self.chunk_config_json();
         crate::postgres::assert_kb_compatible(
             pool,
             kb_name,
@@ -36,7 +37,7 @@ impl Pipeline {
             self.model.dimension,
         )
         .await?;
-        let chunk_config = self.chunk_config_json();
+        crate::postgres::assert_chunking_compatible(pool, kb_name, &chunk_config).await?;
         let embed_config = json!({"model": &self.model.model_name});
         crate::postgres::create_kb(
             pool,

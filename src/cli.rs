@@ -190,90 +190,67 @@ async fn run_query(config: &AppConfig, pool: &sqlx::PgPool, query_text: &str) ->
 async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Result<()> {
     let path = PathBuf::from(path);
 
-    if path.is_file() {
-        let pipeline = Pipeline::from_config(config).await?;
-        let kb_name = &config.pipeline.kb_name;
-        pipeline.prepare_kb(pool, kb_name).await?;
-        let filename = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", path.display()))?;
-        let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read: {}", path.display()))?;
-        let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
-        let task_id = postgres::insert_task(pool, document_id, 0).await?;
-        let progress = Progress::new(1, 1);
-        let slot = progress.start(filename);
-        let result = pipeline
-            .run(
-                pool,
-                document_id,
-                &content,
-                filename,
-                kb_name,
-                &|stage| progress.stage(slot, stage),
-                &|info| progress.log(info),
-            )
-            .await;
-        progress.finish(slot, result.is_ok());
-        progress.teardown();
-        result?;
-        postgres::mark_task_success(pool, task_id).await?;
-        eprintln!("built {}", path.display());
-    } else if path.is_dir() {
-        let kb_name = &config.pipeline.kb_name;
-        let worker_count = config.pipeline.worker_count;
-        let pipeline = Arc::new(Pipeline::from_config(config).await?);
-        pipeline.prepare_kb(pool, kb_name).await?;
-
-        let task_ids = task::import_dir(pool, &path.to_string_lossy(), kb_name, 0).await?;
-        if task_ids.is_empty() {
-            println!("no markdown files found in {}", path.display());
-            return Ok(());
-        }
-        eprintln!(
-            "kb '{}' · {} files · {} workers",
-            kb_name,
-            task_ids.len(),
-            worker_count
-        );
-
-        let progress = Arc::new(Progress::new(worker_count, task_ids.len()));
-        let config_arc = Arc::new(config.clone());
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        let mut handles = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
-            let pool = pool.clone();
-            let config = config_arc.clone();
-            let pipeline = pipeline.clone();
-            let progress = progress.clone();
-            let rx = shutdown_rx.clone();
-            handles.push(tokio::spawn(async move {
-                task::run_worker(pool, config, pipeline, progress, rx).await;
-            }));
-        }
-
-        let completed_normally = wait_all_done(pool, &progress).await;
-
-        let _ = shutdown_tx.send(true);
-        for handle in handles {
-            let _ = handle.await;
-        }
-
-        progress.teardown();
-
-        if !completed_normally {
-            let canceled = postgres::cancel_all_running(pool).await?;
-            if canceled > 0 {
-                eprintln!("canceled {canceled} running tasks");
-            }
-        }
-
-        eprintln!("build complete");
-    } else {
+    if !path.exists() {
         anyhow::bail!("path does not exist: {}", path.display());
     }
+
+    let kb_name = &config.pipeline.kb_name;
+    let pipeline = Arc::new(Pipeline::from_config(config).await?);
+    pipeline.prepare_kb(pool, kb_name).await?;
+
+    // A single file jumps the queue: it is an explicit, interactive request.
+    let task_ids = if path.is_file() {
+        vec![task::import_file(pool, &path, kb_name, 100).await?]
+    } else {
+        task::import_dir(pool, &path.to_string_lossy(), kb_name, 0).await?
+    };
+
+    if task_ids.is_empty() {
+        println!("no markdown files found in {}", path.display());
+        return Ok(());
+    }
+
+    let worker_count = config.pipeline.worker_count.min(task_ids.len());
+    eprintln!(
+        "kb '{}' · {} files · {} workers",
+        kb_name,
+        task_ids.len(),
+        worker_count
+    );
+
+    let progress = Arc::new(Progress::new(worker_count, task_ids.len()));
+    let config_arc = Arc::new(config.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let pool = pool.clone();
+        let config = config_arc.clone();
+        let pipeline = pipeline.clone();
+        let progress = progress.clone();
+        let rx = shutdown_rx.clone();
+        handles.push(tokio::spawn(async move {
+            task::run_worker(pool, config, pipeline, progress, rx).await;
+        }));
+    }
+
+    let completed_normally = wait_all_done(pool, &progress).await;
+
+    let _ = shutdown_tx.send(true);
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    progress.teardown();
+
+    if !completed_normally {
+        let canceled = postgres::cancel_all_running(pool).await?;
+        if canceled > 0 {
+            eprintln!("canceled {canceled} running tasks");
+        }
+    }
+
+    eprintln!("build complete");
     Ok(())
 }
 
