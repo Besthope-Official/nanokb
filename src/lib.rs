@@ -5,7 +5,7 @@ pub mod config;
 pub use config::{AppConfig, DatabaseConfig, IndexConfig};
 
 pub mod embed;
-pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks, IntoEmbeddings};
+pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
 
 pub mod filter;
 pub use filter::Filter;

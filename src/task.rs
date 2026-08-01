@@ -4,6 +4,7 @@ use crate::postgres::{self, TaskRow};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 use std::path::Path;
+
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -17,15 +18,17 @@ pub enum TaskStatus {
     Canceled,
 }
 
-impl From<&str> for TaskStatus {
-    fn from(s: &str) -> Self {
+impl TryFrom<&str> for TaskStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(s: &str) -> Result<Self> {
         match s {
-            "pending" => TaskStatus::Pending,
-            "running" => TaskStatus::Running,
-            "success" => TaskStatus::Success,
-            "failed" => TaskStatus::Failed,
-            "canceled" => TaskStatus::Canceled,
-            _ => panic!("unknown task status: {s}"),
+            "pending" => Ok(TaskStatus::Pending),
+            "running" => Ok(TaskStatus::Running),
+            "success" => Ok(TaskStatus::Success),
+            "failed" => Ok(TaskStatus::Failed),
+            "canceled" => Ok(TaskStatus::Canceled),
+            _ => anyhow::bail!("unknown task status: {s}"),
         }
     }
 }
@@ -41,17 +44,21 @@ pub struct Task {
     pub error_message: Option<String>,
 }
 
-impl From<TaskRow> for Task {
-    fn from(row: TaskRow) -> Self {
-        Task {
+impl TryFrom<TaskRow> for Task {
+    type Error = anyhow::Error;
+
+    fn try_from(row: TaskRow) -> Result<Self> {
+        let status = TaskStatus::try_from(row.status.as_str())
+            .with_context(|| format!("task {} has an unusable status", row.id))?;
+        Ok(Task {
             id: row.id,
             document_id: row.document_id,
             filename: row.filename,
             content: row.content,
             kb_name: row.kb_name,
-            status: TaskStatus::from(row.status.as_str()),
+            status,
             error_message: row.error_message,
-        }
+        })
     }
 }
 
@@ -79,8 +86,13 @@ pub async fn run_worker(
 
         match postgres::fetch_and_lock_pending(&pool).await {
             Ok(Some(row)) => {
-                let task = Task::from(row);
-                process_task(&task, &pipeline, &pool).await;
+                let task_id = row.id;
+                match Task::try_from(row) {
+                    Ok(task) => process_task(&task, &pipeline, &pool).await,
+                    // The row is already marked running, so release it instead of
+                    // leaving it locked forever.
+                    Err(e) => fail_task(&pool, task_id, &format!("{e:#}")).await,
+                }
             }
             Ok(None) => {
                 tokio::select! {
@@ -109,18 +121,25 @@ async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
             if let Err(e) = postgres::mark_task_success(pool, task.id).await {
                 eprintln!("failed to mark task {} success: {e:#}", task.id);
             }
+            notify_completed(pool).await;
         }
         Err(e) => {
-            let error_message = format!("{e:#}");
-            eprintln!(
-                "task {} ({}) failed: {error_message}",
-                task.id, task.filename
-            );
-            if let Err(e) = postgres::mark_task_failed(pool, task.id, &error_message).await {
-                eprintln!("failed to mark task {} failed: {e:#}", task.id);
-            }
+            eprintln!("task {} ({}) failed", task.id, task.filename);
+            fail_task(pool, task.id, &format!("{e:#}")).await;
         }
     }
+}
+
+/// Record a terminal failure and wake the build loop waiting on task completion.
+async fn fail_task(pool: &PgPool, task_id: i64, error_message: &str) {
+    eprintln!("task {task_id}: {error_message}");
+    if let Err(e) = postgres::mark_task_failed(pool, task_id, error_message).await {
+        eprintln!("failed to mark task {task_id} failed: {e:#}");
+    }
+    notify_completed(pool).await;
+}
+
+async fn notify_completed(pool: &PgPool) {
     if let Err(e) = postgres::notify_task_completed(pool).await {
         eprintln!("failed to notify task completion: {e:#}");
     }

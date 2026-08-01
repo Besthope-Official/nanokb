@@ -1,4 +1,3 @@
-use crate::chunker::Chunk;
 use crate::config::{EmbeddingConfig, IndexConfig};
 use crate::postgres::{self, ChunkRow};
 use anyhow::{Context, Result};
@@ -117,38 +116,6 @@ impl EmbeddedChunks {
             .collect();
         postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await?;
         postgres::create_index(pool, kb_name, index_config).await
-    }
-}
-
-pub trait IntoEmbeddings {
-    /// Consume chunks, probe dimension, and produce embeddings in one async step.
-    fn into_embeddings(
-        self,
-        embed: EmbedClient,
-    ) -> impl std::future::Future<Output = Result<EmbeddedChunks>> + Send;
-}
-
-impl IntoEmbeddings for Vec<Chunk> {
-    async fn into_embeddings(self, embed: EmbedClient) -> Result<EmbeddedChunks> {
-        let model = embed.dimension().await?;
-        let texts: Vec<String> = self.iter().map(|c| c.embedding_text.clone()).collect();
-        let embeddings = model.embed_batch(&texts).await?;
-
-        let chunks: Vec<EmbeddedChunk> = self
-            .into_iter()
-            .zip(embeddings)
-            .map(|(chunk, embedding)| EmbeddedChunk {
-                chunk_id: chunk.chunk_id,
-                text: chunk.text,
-                embedding_text: chunk.embedding_text,
-                embedding,
-            })
-            .collect();
-
-        Ok(EmbeddedChunks {
-            chunks,
-            dimension: model.dimension,
-        })
     }
 }
 

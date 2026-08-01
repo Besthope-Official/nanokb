@@ -117,8 +117,7 @@ fn rejects_unknown_configuration_fields() {
 }
 
 #[test]
-#[should_panic(expected = "failed to load application configuration")]
-fn load_from_panics_when_a_placeholder_is_unresolved() {
+fn load_from_errors_when_a_placeholder_is_unresolved() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
     fs::write(
@@ -127,7 +126,16 @@ fn load_from_panics_when_a_placeholder_is_unresolved() {
     )
     .unwrap();
 
-    AppConfig::load_from(config_path);
+    let Err(error) = AppConfig::try_load_from(config_path) else {
+        panic!("expected an unresolved placeholder to be rejected");
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("NANOKB_TEST_MISSING_DATABASE_HOST"),
+        "{error:#}"
+    );
 }
 
 #[test]

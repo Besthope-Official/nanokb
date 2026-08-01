@@ -155,13 +155,6 @@ impl Default for IndexConfig {
 }
 
 impl AppConfig {
-    pub fn load_from(path: impl AsRef<Path>) -> Self {
-        Self::try_load_from(path).unwrap_or_else(|error| {
-            eprintln!("failed to load application configuration: {error:#}");
-            panic!("failed to load application configuration");
-        })
-    }
-
     pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)

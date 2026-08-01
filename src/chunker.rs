@@ -254,23 +254,27 @@ fn flush_content_blocks(
     }
 }
 
+/// The tokenizer is embedded at compile time, so a failure here is a build defect
+/// rather than a runtime condition.
 fn bpe_tokenizer() -> &'static Tokenizer {
     BPE_TOKENIZER.get_or_init(|| {
-        Tokenizer::from_bytes(include_bytes!("../assets/tokenizer.json")).unwrap_or_else(|error| {
-            eprintln!("failed to load the embedded BPE tokenizer: {error}");
-            panic!("embedded BPE tokenizer is invalid");
-        })
+        Tokenizer::from_bytes(include_bytes!("../assets/tokenizer.json"))
+            .unwrap_or_else(|error| panic!("embedded BPE tokenizer is invalid: {error}"))
     })
 }
 
+/// Counting skips offset tracking; use [`bpe_encode`] when spans are needed.
 fn bpe_token_count(text: &str) -> usize {
     bpe_tokenizer()
         .encode_fast(text, false)
-        .unwrap_or_else(|error| {
-            eprintln!("failed to count chunk tokens: {error}");
-            panic!("BPE token counting failed");
-        })
+        .unwrap_or_else(|error| panic!("BPE token counting failed: {error}"))
         .len()
+}
+
+fn bpe_encode(text: &str) -> tokenizers::Encoding {
+    bpe_tokenizer()
+        .encode(text, false)
+        .unwrap_or_else(|error| panic!("BPE token encoding failed: {error}"))
 }
 
 fn make_breadcrumb(heading_path: &[String]) -> String {
@@ -307,12 +311,7 @@ fn make_chunk(
 }
 
 fn warn_oversized_chunk(chunk: &Chunk, max_chunk_tokens: usize) {
-    let encoding = bpe_tokenizer()
-        .encode(chunk.text.as_str(), false)
-        .unwrap_or_else(|error| {
-            eprintln!("failed to count chunk tokens: {error}");
-            panic!("BPE token counting failed");
-        });
+    let encoding = bpe_encode(chunk.text.as_str());
     let chunk_tokens = encoding.len();
     if chunk_tokens > max_chunk_tokens {
         let split_span = encoding.get_offsets()[max_chunk_tokens];

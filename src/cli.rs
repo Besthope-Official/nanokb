@@ -10,7 +10,8 @@ use tokio::sync::watch;
 pub async fn run() -> Result<()> {
     let mut args = env::args_os().skip(1);
 
-    let config = AppConfig::load_from("config.yaml");
+    let config = AppConfig::try_load_from("config.yaml")
+        .context("failed to load application configuration")?;
     let pool = postgres::connect(&config.database.url).await?;
     postgres::initialize(&pool).await?;
 
