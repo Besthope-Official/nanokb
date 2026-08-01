@@ -53,6 +53,7 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
             name         TEXT PRIMARY KEY,
             chunk_config JSONB NOT NULL,
             embed_config JSONB NOT NULL,
+            dimension    INTEGER NOT NULL,
             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         )"#,
     )
@@ -151,11 +152,12 @@ pub async fn create_kb(
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
     sqlx::query(
-        "INSERT INTO kb_meta (name, chunk_config, embed_config) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+        "INSERT INTO kb_meta (name, chunk_config, embed_config, dimension) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
     .bind(Json(chunk_config))
     .bind(Json(embed_config))
+    .bind(dimension as i32)
     .execute(&mut *transaction)
     .await
     .with_context(|| format!("failed to insert metadata for kb {name}"))?;
@@ -164,6 +166,76 @@ pub async fn create_kb(
         .commit()
         .await
         .with_context(|| format!("failed to commit kb {name}"))
+}
+
+/// Reject a configuration that differs from the one the kb was built with.
+///
+/// A kb's metadata is immutable once created: its vectors come from one embedding
+/// model, and its chunks from one chunking strategy. Mixing either within a kb
+/// makes the stored distances meaningless. To change a setting, build a new kb
+/// rather than reusing this one. Returns `Ok(())` for a kb that does not exist yet.
+pub async fn assert_kb_compatible(
+    pool: &PgPool,
+    kb_name: &str,
+    model_name: &str,
+    dimension: usize,
+) -> Result<()> {
+    validate_kb_name(kb_name)?;
+    let Some(row) = sqlx::query("SELECT embed_config, dimension FROM kb_meta WHERE name = $1")
+        .bind(kb_name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("failed to read metadata for kb {kb_name}"))?
+    else {
+        return Ok(());
+    };
+
+    let embed_config: Value = row.get("embed_config");
+    let stored_model = embed_config
+        .get("model")
+        .and_then(Value::as_str)
+        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
+    let stored_dimension: i32 = row.get("dimension");
+
+    anyhow::ensure!(
+        stored_model == model_name && stored_dimension as usize == dimension,
+        "kb {kb_name} was built with embedding model {stored_model} ({stored_dimension}d) \
+         but the configured model is {model_name} ({dimension}d); \
+         vectors from different models are not comparable — \
+         point pipeline.embedding back at {stored_model}, \
+         or set pipeline.kb_name to a new kb"
+    );
+    Ok(())
+}
+
+/// Reject a chunking strategy that differs from the one the kb was built with.
+///
+/// Only the build path chunks documents, so this sits beside
+/// [`assert_kb_compatible`] rather than inside it.
+pub async fn assert_chunking_compatible(
+    pool: &PgPool,
+    kb_name: &str,
+    chunk_config: &Value,
+) -> Result<()> {
+    validate_kb_name(kb_name)?;
+    let Some(stored): Option<Json<Value>> =
+        sqlx::query_scalar("SELECT chunk_config FROM kb_meta WHERE name = $1")
+            .bind(kb_name)
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("failed to read chunking config for kb {kb_name}"))?
+    else {
+        return Ok(());
+    };
+
+    anyhow::ensure!(
+        &stored.0 == chunk_config,
+        "kb {kb_name} was built with chunking config {} but the configured chunking is {chunk_config}; \
+         a kb's chunking strategy is fixed once built — \
+         restore the original settings, or set pipeline.kb_name to a new kb",
+        stored.0
+    );
+    Ok(())
 }
 
 fn validate_kb_name(name: &str) -> Result<()> {
@@ -211,20 +283,35 @@ pub async fn replace_document_chunks(
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to delete chunks for document {document_id}"))?;
-    for chunk in chunks {
-        let vector = Vector::from(chunk.embedding.clone());
-        let sql = format!(
-            "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding) VALUES ($1, $2, $3, $4, $5)"
+    if !chunks.is_empty() {
+        let chunk_ids: Vec<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embedding_texts: Vec<&str> = chunks.iter().map(|c| c.embedding_text.as_str()).collect();
+        let embeddings: Vec<Vector> = chunks
+            .iter()
+            .map(|c| Vector::from(c.embedding.clone()))
+            .collect();
+
+        let insert_sql = format!(
+            "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding) \
+             SELECT $1, chunk_id, text, embedding_text, embedding \
+             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[]) \
+             AS batch(chunk_id, text, embedding_text, embedding)"
         );
-        sqlx::query(AssertSqlSafe(sql))
+        sqlx::query(AssertSqlSafe(insert_sql))
             .bind(document_id)
-            .bind(&chunk.chunk_id)
-            .bind(&chunk.text)
-            .bind(&chunk.embedding_text)
-            .bind(vector)
+            .bind(&chunk_ids)
+            .bind(&texts)
+            .bind(&embedding_texts)
+            .bind(&embeddings)
             .execute(&mut *transaction)
             .await
-            .with_context(|| format!("failed to insert chunk {}", chunk.chunk_id))?;
+            .with_context(|| {
+                format!(
+                    "failed to insert {} chunks for document {document_id}",
+                    chunks.len()
+                )
+            })?;
     }
     transaction
         .commit()

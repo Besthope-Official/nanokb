@@ -7,15 +7,22 @@ database:
     ef_search: 40
 
 model:
-  embedding:
-    model_name: "BAAI/bge-m3"
-    api_base: "{BGE_M3_EMBED_API_BASE}"
-    api_key: "{BGE_M3_EMBED_API_KEY}"
+  embeddings:
+    bge_m3:
+      model_name: "BAAI/bge-m3"
+      api_base: "{BGE_M3_EMBED_API_BASE}"
+      api_key: "{BGE_M3_EMBED_API_KEY}"
+      batch_size: 32
+    qwen3:
+      model_name: "qwen3.7-text-embedding"
+      api_base: "{QWEN_EMBED_API_BASE}"
+      api_key: "{QWEN_EMBED_API_KEY}"
+      batch_size: 20
 
 pipeline:
   kb_name: "test"
-  worker_count: 2
-  embed_batch_size: 32
+  embedding: bge_m3
+  worker_count: 4
   top_k: 5
   max_chunk_tokens: 256
   chunk_overlap_ratio: 0.1

@@ -1,8 +1,7 @@
-use crate::config::{EmbeddingConfig, IndexConfig};
+use crate::config::EmbeddingConfig;
 use crate::postgres::{self, ChunkRow};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sqlx::PgPool;
 
 pub struct EmbedClient {
@@ -89,21 +88,14 @@ pub struct EmbeddedChunk {
 
 pub struct EmbeddedChunks {
     pub chunks: Vec<EmbeddedChunk>,
-    pub dimension: usize,
 }
 
 impl EmbeddedChunks {
-    /// Create the knowledge base table and insert all chunks.
-    pub async fn store(
-        self,
-        pool: &PgPool,
-        kb_name: &str,
-        document_id: i64,
-        chunk_config: &Value,
-        embed_config: &Value,
-        index_config: &IndexConfig,
-    ) -> Result<()> {
-        postgres::create_kb(pool, kb_name, self.dimension, chunk_config, embed_config).await?;
+    /// Replace this document's chunks in an existing knowledge base.
+    ///
+    /// The table, its metadata, and the vector index are created once per build
+    /// by `Pipeline::prepare_kb`.
+    pub async fn store(self, pool: &PgPool, kb_name: &str, document_id: i64) -> Result<()> {
         let rows: Vec<ChunkRow> = self
             .chunks
             .into_iter()
@@ -114,8 +106,7 @@ impl EmbeddedChunks {
                 embedding: c.embedding,
             })
             .collect();
-        postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await?;
-        postgres::create_index(pool, kb_name, index_config).await
+        postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await
     }
 }
 

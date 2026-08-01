@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+const MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: BAAI/bge-m3\n      api_base: \"https://api.siliconflow.cn/v1\"\n      api_key: \"sk-test-key\"\n";
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -33,7 +35,7 @@ fn loads_placeholders_from_adjacent_dotenv() {
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"{BGE_M3_EMBED_API_BASE}\"\n    api_key: \"{BGE_M3_EMBED_API_KEY}\"\n",
+        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embeddings:\n    bge_m3:\n      model_name: BAAI/bge-m3\n      api_base: \"{BGE_M3_EMBED_API_BASE}\"\n      api_key: \"{BGE_M3_EMBED_API_KEY}\"\npipeline:\n  embedding: bge_m3\n",
     )
     .unwrap();
     fs::write(
@@ -48,15 +50,20 @@ fn loads_placeholders_from_adjacent_dotenv() {
         config.database.url,
         "postgres://nanokb:secret@postgres:5432/nanokb"
     );
-    assert_eq!(config.model.embedding.api_base, "https://api.siliconflow.cn/v1");
-    assert_eq!(config.model.embedding.api_key, "sk-test-key");
+    let embedding = config.embedding().unwrap();
+    assert_eq!(embedding.api_base, "https://api.siliconflow.cn/v1");
+    assert_eq!(embedding.api_key, "sk-test-key");
 }
 
 #[test]
 fn process_environment_overrides_dotenv() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
-    fs::write(&config_path, "database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n").unwrap();
+    fs::write(
+        &config_path,
+        format!("database:\n  url: \"{{DATABASE_URL}}\"\n{MODEL_BLOCK}"),
+    )
+    .unwrap();
     fs::write(
         directory.path().join(".env"),
         "DATABASE_URL=postgres://from-dotenv\n",
@@ -76,7 +83,7 @@ fn process_environment_overrides_dotenv() {
 fn rejects_unresolved_placeholders() {
     let variables = HashMap::from([("DB_USER".to_string(), "nanokb".to_string())]);
     let error = parse_config(
-        "database:\n  url: \"postgres://{DB_USER}@{DB_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
+        &format!("database:\n  url: \"postgres://{{DB_USER}}@{{DB_HOST}}/nanokb\"\n{MODEL_BLOCK}"),
         &variables,
     )
     .err()
@@ -91,9 +98,12 @@ fn rejects_unresolved_placeholders() {
 #[test]
 fn rejects_placeholders_introduced_by_environment_values() {
     let variables = HashMap::from([("DATABASE_URL".to_string(), "{OTHER_URL}".to_string())]);
-    let error = parse_config("database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n", &variables)
-        .err()
-        .unwrap();
+    let error = parse_config(
+        &format!("database:\n  url: \"{{DATABASE_URL}}\"\n{MODEL_BLOCK}"),
+        &variables,
+    )
+    .err()
+    .unwrap();
 
     assert_eq!(
         error.to_string(),
@@ -104,7 +114,7 @@ fn rejects_placeholders_introduced_by_environment_values() {
 #[test]
 fn rejects_unknown_configuration_fields() {
     let error = parse_config(
-        "database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: https://api.siliconflow.cn/v1\n    api_key: sk-test-key\n",
+        &format!("database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\n{MODEL_BLOCK}"),
         &HashMap::new(),
     )
     .err()
@@ -117,12 +127,33 @@ fn rejects_unknown_configuration_fields() {
 }
 
 #[test]
+fn rejects_pipeline_reference_to_undefined_embedding_provider() {
+    let config = parse_config(
+        &format!(
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  embedding: qwen3\n"
+        ),
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    let error = config.embedding().err().unwrap();
+
+    assert_eq!(
+        error.to_string(),
+        "pipeline.embedding refers to unknown provider \"qwen3\"; \
+         model.embeddings defines: default"
+    );
+}
+
+#[test]
 fn load_from_errors_when_a_placeholder_is_unresolved() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{NANOKB_TEST_MISSING_DATABASE_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
+        format!(
+            "database:\n  url: \"postgres://{{NANOKB_TEST_MISSING_DATABASE_HOST}}/nanokb\"\n{MODEL_BLOCK}"
+        ),
     )
     .unwrap();
 

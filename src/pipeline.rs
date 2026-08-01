@@ -17,12 +17,12 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub async fn from_config(config: &AppConfig) -> Result<Self> {
-        let model = EmbedClient::from_config(&config.model.embedding)?
+        let model = EmbedClient::from_config(config.embedding()?)?
             .dimension()
             .await?;
         Ok(Self {
             strategy: config.pipeline.chunk_strategy(),
-            embed_batch_size: config.pipeline.embed_batch_size,
+            embed_batch_size: config.embedding()?.batch_size,
             index_config: config.database.index.clone(),
             model,
         })
@@ -30,6 +30,14 @@ impl Pipeline {
 
     pub async fn prepare_kb(&self, pool: &PgPool, kb_name: &str) -> Result<()> {
         let chunk_config = self.chunk_config_json();
+        crate::postgres::assert_kb_compatible(
+            pool,
+            kb_name,
+            &self.model.model_name,
+            self.model.dimension,
+        )
+        .await?;
+        crate::postgres::assert_chunking_compatible(pool, kb_name, &chunk_config).await?;
         let embed_config = json!({"model": &self.model.model_name});
         crate::postgres::create_kb(
             pool,
@@ -38,7 +46,8 @@ impl Pipeline {
             &chunk_config,
             &embed_config,
         )
-        .await
+        .await?;
+        crate::postgres::create_index(pool, kb_name, &self.index_config).await
     }
 
     pub async fn run(
@@ -72,9 +81,6 @@ impl Pipeline {
         let total = chunks.len();
 
         // Stage 3: Embed (batched with progress)
-        let chunk_config = self.chunk_config_json();
-        let embed_config = json!({"model": &self.model.model_name});
-
         let mut embedded = Vec::with_capacity(total);
         for batch in chunks.chunks(self.embed_batch_size) {
             let current = embedded.len();
@@ -99,19 +105,9 @@ impl Pipeline {
 
         // Stage 4: Store
         on_stage(format!("storing {total} chunks"));
-        EmbeddedChunks {
-            chunks: embedded,
-            dimension: self.model.dimension,
-        }
-        .store(
-            pool,
-            kb_name,
-            document_id,
-            &chunk_config,
-            &embed_config,
-            &self.index_config,
-        )
-        .await?;
+        EmbeddedChunks { chunks: embedded }
+            .store(pool, kb_name, document_id)
+            .await?;
 
         Ok(())
     }
