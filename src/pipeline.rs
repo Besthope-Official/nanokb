@@ -45,7 +45,8 @@ impl Pipeline {
             &chunk_config,
             &embed_config,
         )
-        .await
+        .await?;
+        crate::postgres::create_index(pool, kb_name, &self.index_config).await
     }
 
     pub async fn run(
@@ -79,9 +80,6 @@ impl Pipeline {
         let total = chunks.len();
 
         // Stage 3: Embed (batched with progress)
-        let chunk_config = self.chunk_config_json();
-        let embed_config = json!({"model": &self.model.model_name});
-
         let mut embedded = Vec::with_capacity(total);
         for batch in chunks.chunks(self.embed_batch_size) {
             let current = embedded.len();
@@ -106,19 +104,9 @@ impl Pipeline {
 
         // Stage 4: Store
         on_stage(format!("storing {total} chunks"));
-        EmbeddedChunks {
-            chunks: embedded,
-            dimension: self.model.dimension,
-        }
-        .store(
-            pool,
-            kb_name,
-            document_id,
-            &chunk_config,
-            &embed_config,
-            &self.index_config,
-        )
-        .await?;
+        EmbeddedChunks { chunks: embedded }
+            .store(pool, kb_name, document_id)
+            .await?;
 
         Ok(())
     }
