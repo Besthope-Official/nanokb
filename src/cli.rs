@@ -150,6 +150,10 @@ pub async fn run() -> Result<()> {
                 .next()
                 .map(|s| s.into_string().unwrap_or_default())
                 .unwrap_or_default();
+            anyhow::ensure!(
+                !query_text.trim().is_empty(),
+                "query text must not be empty; usage: query <text>"
+            );
             run_query(&config, &pool, &query_text).await
         }
         Some("flush-db") => postgres::flush_db(&pool).await,

@@ -46,6 +46,10 @@ fn prune_references(
     }
 }
 
+#[cfg(test)]
+#[path = "filter_test.rs"]
+mod tests;
+
 fn is_reference_title(title: &str) -> bool {
     let t = title.trim().to_lowercase();
     matches!(

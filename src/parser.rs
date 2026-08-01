@@ -137,6 +137,7 @@ impl Document {
         let mut options = Options::empty();
         options.insert(Options::ENABLE_MATH);
         options.insert(Options::ENABLE_TABLES);
+        options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
         let parser = Parser::new_ext(content.as_str(), options);
 

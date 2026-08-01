@@ -124,6 +124,23 @@ fn kinds(document: &StructuredDocument) -> Vec<NodeKind> {
         .collect()
 }
 
+/// An explicit `{#id}` is heading metadata, not heading text: it must not reach
+/// the title, which feeds the chunk heading path and the embedded breadcrumb.
+#[rstest]
+#[case("## Legislation {#sec_future_legislation}", "Legislation")]
+#[case("## Plain Heading", "Plain Heading")]
+fn explicit_heading_id_is_excluded_from_the_title(#[case] input: &str, #[case] expected: &str) {
+    let document = parse(input);
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Heading {
+            level: 2,
+            title: expected.into()
+        }]
+    );
+}
+
 /// A display formula inline with prose must not discard the surrounding text.
 #[test]
 fn display_math_inside_a_paragraph_keeps_surrounding_prose() {
@@ -215,3 +232,4 @@ fn structured_document_returns_node_by_id() {
         }
     );
 }
+
