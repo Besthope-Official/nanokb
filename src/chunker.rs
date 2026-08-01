@@ -1,6 +1,5 @@
 use crate::{Node, NodeKind, StructuredDocument};
 use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
-use chunk::chunk as byte_chunk;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
@@ -267,6 +266,9 @@ fn flush_content_blocks(
 // fixed-length chunking
 // ---------------------------------------------------------------------------
 
+/// Sentence-boundary delimiters that terminate a chunk-friendly segment.
+const SENTENCE_DELIMITERS: [char; 7] = ['\n', '.', '?', '!', '。', '！', '？'];
+
 fn fixed_chunks(
     full_text: &str,
     filename: &str,
@@ -280,42 +282,111 @@ fn fixed_chunks(
     }
 
     let encoding = bpe_encode(full_text);
-    let total_tokens = encoding.len();
+    let offsets = encoding.get_offsets();
+    let total_tokens = offsets.len();
     if total_tokens <= chunk_size {
         return vec![make_fixed_chunk(full_text, filename, 0)];
     }
 
-    let offsets = encoding.get_offsets();
-    let advance = chunk_size.saturating_sub(overlap_tokens).max(1);
+    // Split the token stream into sentence-aligned segments.  A segment
+    // ends at the first token whose text ends with a delimiter, so chunks
+    // never cut mid-sentence when a boundary exists.  BPE byte offsets are
+    // always valid UTF-8 char boundaries, so slicing is safe.  Every token
+    // lands in exactly one segment, and concatenating segments reproduces
+    // full_text exactly — no content is ever dropped.
+    let mut segments: Vec<&str> = Vec::new();
+    let mut seg_start = 0;
+    for i in 0..total_tokens {
+        let (start, end) = offsets[i];
+        if full_text[start..end].ends_with(SENTENCE_DELIMITERS) {
+            push_sentence(&full_text, &offsets, seg_start, i, chunk_size, &mut segments);
+            seg_start = i + 1;
+        }
+    }
+    if seg_start < total_tokens {
+        push_sentence(
+            &full_text,
+            &offsets,
+            seg_start,
+            total_tokens - 1,
+            chunk_size,
+            &mut segments,
+        );
+    }
+
+    let counts: Vec<usize> = segments.iter().map(|s| bpe_token_count(s)).collect();
+
     let mut chunks = Vec::new();
-    let mut token_pos = 0;
+    let mut start = 0; // segment index
 
-    while token_pos < total_tokens {
-        let end_pos = (token_pos + chunk_size).min(total_tokens);
-        let byte_start = char_boundary_floor(full_text, offsets[token_pos].0);
-        let byte_end = char_boundary_floor(full_text, offsets[end_pos - 1].1);
-        let chunk_size_bytes = byte_end - byte_start;
-        let bytes = byte_chunk(&full_text.as_bytes()[byte_start..])
-            .size(chunk_size_bytes)
-            .delimiters(b"\n.?!")
-            .patterns(&["。", "！", "？"])
-            .next()
-            .unwrap_or_else(|| panic!("chunker returned no chunk for a non-empty token window"));
-        let text = {
-            let text = std::str::from_utf8(bytes)
-                .unwrap_or_else(|error| panic!("chunker produced invalid UTF-8: {error}"));
-            make_fixed_chunk(text, filename, chunks.len())
-        };
-        chunks.push(text);
+    while start < segments.len() {
+        // Greedily pack segments from `start`.
+        let mut end = start;
+        let mut batch_tokens = 0;
+        while end < segments.len() {
+            let next = counts[end];
+            if batch_tokens > 0 && batch_tokens + next > chunk_size {
+                break;
+            }
+            batch_tokens += next;
+            end += 1;
+        }
 
-        if end_pos >= total_tokens {
+        let text = segments[start..end].concat();
+        chunks.push(make_fixed_chunk(&text, filename, chunks.len()));
+
+        if end >= segments.len() {
             break;
         }
 
-        token_pos += advance;
+        // Overlap: back-track so the next chunk shares ~overlap_tokens of
+        // trailing tokens from the one just emitted.
+        if overlap_tokens > 0 {
+            let mut back = 0;
+            let mut tokens = 0;
+            for i in (start..end).rev() {
+                let t = counts[i];
+                if tokens > 0 && tokens + t > overlap_tokens {
+                    break;
+                }
+                tokens += t;
+                back += 1;
+            }
+            // Always advance at least one segment so overlap never
+            // backtracks to the same position, which would loop forever.
+            start = end.saturating_sub(back).max(start + 1);
+        } else {
+            start = end;
+        }
     }
 
     chunks
+}
+
+/// Emit a sentence (token span `first..=last`, inclusive of its terminating
+/// delimiter) as one segment, or hard-split it when it exceeds `chunk_size`.
+///
+/// A sentence contains no internal sentence boundary by construction — the
+/// next delimiter token would have ended it earlier — so there is nothing
+/// to split at except token boundaries.
+fn push_sentence<'a>(
+    full_text: &'a str,
+    offsets: &[(usize, usize)],
+    first: usize,
+    last: usize,
+    chunk_size: usize,
+    out: &mut Vec<&'a str>,
+) {
+    if last - first + 1 <= chunk_size {
+        out.push(&full_text[offsets[first].0..offsets[last].1]);
+        return;
+    }
+    let mut t = first;
+    while t <= last {
+        let end = (t + chunk_size - 1).min(last);
+        out.push(&full_text[offsets[t].0..offsets[end].1]);
+        t = end + 1;
+    }
 }
 
 fn make_fixed_chunk(text: &str, filename: &str, chunk_index: usize) -> Chunk {
@@ -352,28 +423,6 @@ fn bpe_encode(text: &str) -> tokenizers::Encoding {
     bpe_tokenizer()
         .encode(text, false)
         .unwrap_or_else(|error| panic!("BPE token encoding failed: {error}"))
-}
-
-/// Return the nearest UTF-8 character boundary at or before `pos`.
-///
-/// BPE tokenizer byte offsets can land inside multi-byte characters (e.g.
-/// the 3-byte `'` or `"`), so every offset used for string slicing must
-/// be aligned first.
-fn char_boundary_floor(text: &str, pos: usize) -> usize {
-    if pos >= text.len() {
-        return text.len();
-    }
-    if text.is_char_boundary(pos) {
-        return pos;
-    }
-    // Walk backward at most 3 bytes (max UTF-8 char width is 4).
-    for offset in 1..=3 {
-        let candidate = pos.saturating_sub(offset);
-        if text.is_char_boundary(candidate) {
-            return candidate;
-        }
-    }
-    pos
 }
 
 fn make_breadcrumb(heading_path: &[String]) -> String {

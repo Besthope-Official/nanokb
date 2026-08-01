@@ -66,11 +66,12 @@ impl PipelineConfig {
                 chunk_size: self.chunk_size,
                 overlap_tokens: self.chunk_overlap,
             },
-            _ => ChunkStrategy::Layered {
+            "layered" => ChunkStrategy::Layered {
                 max_chunk_tokens: self.max_chunk_tokens,
                 overlap_ratio: self.chunk_overlap_ratio,
                 metadata_mode: MetadataMode::Path,
             },
+            other => panic!("unknown pipeline.chunk_strategy {other:?}; expected \"fixed\" or \"layered\""),
         }
     }
 }

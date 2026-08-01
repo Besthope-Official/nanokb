@@ -115,7 +115,8 @@ fn collect_content_texts(
     for &child_id in &node.children {
         let child = document.node(child_id);
         match &child.kind {
-            NodeKind::Heading { .. } => {
+            NodeKind::Heading { title, .. } => {
+                texts.push(title.clone());
                 collect_content_texts(document, child, texts);
             }
             _ => {

@@ -258,16 +258,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chunk"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45b9676eb73ad3ebff08c750261a0d6a423f225883f30164600db57ba885e834"
-dependencies = [
- "daggrs",
- "memchr",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -434,12 +424,6 @@ name = "daachorse"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6f55d7153ba3b507595872a3874803f07a8a81d1e888abed8e5db7da0597d6e2"
-
-[[package]]
-name = "daggrs"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d1092288af9ecfd5378565a17df11a13dbe172d4a71abe9b55a9689f1336b8e"
 
 [[package]]
 name = "darling"
@@ -1254,7 +1238,6 @@ dependencies = [
  "annotate-snippets",
  "anstream 0.6.21",
  "anyhow",
- "chunk",
  "clap",
  "dotenvy",
  "pgvector",

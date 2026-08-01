@@ -479,7 +479,9 @@ fn fixed_uses_token_window_for_cjk_sentence_boundaries() {
 
     let chunks = fixed_chunks(&full, &doc.metadata.filename, chunk_size, 0);
 
+    assert_eq!(chunks.len(), 2);
     assert_eq!(chunks[0].text, "alpha。bravo。");
+    assert_eq!(chunks[1].text, "charlie。");
 }
 
 #[test]
@@ -527,18 +529,32 @@ fn fixed_hard_splits_when_no_boundary_exists() {
 
 #[test]
 fn fixed_starts_next_window_at_configured_token_overlap() {
-    let text = "A ".repeat(300);
+    // Short sentences so many fit in one chunk; overlap can then
+    // include several trailing sentences for context continuity.
+    let sentence = "A sentence. ";
+    let text = sentence.repeat(200);
     let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph(&text)]);
-    let chunk_size = 128;
-    let overlap_tokens = 32;
     let full = doc.full_text();
+    let chunk_size = 128;
+    let overlap = 32;
 
-    let chunks = fixed_chunks(&full, &doc.metadata.filename, chunk_size, overlap_tokens);
-    let offsets = bpe_encode(&text).get_offsets().to_vec();
-    let start = char_boundary_floor(&text, offsets[chunk_size - overlap_tokens].0);
-    let end = char_boundary_floor(&text, offsets[chunk_size * 2 - overlap_tokens - 1].1);
+    let with_overlap = fixed_chunks(&full, &doc.metadata.filename, chunk_size, overlap);
+    let without = fixed_chunks(&full, &doc.metadata.filename, chunk_size, 0);
 
-    assert_eq!(chunks[1].text, text[start..end]);
+    assert!(without.len() >= 2);
+    assert!(with_overlap.len() >= 2);
+
+    // No-overlap chunks reconstruct the full text without loss.
+    let reconstructed: String = without.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!(reconstructed, full);
+
+    // Overlap duplicates content → strictly more chunks.
+    assert!(
+        with_overlap.len() > without.len(),
+        "overlap should produce more chunks: with={}, without={}",
+        with_overlap.len(),
+        without.len()
+    );
 }
 
 #[test]
@@ -577,12 +593,13 @@ fn fixed_chunk_ids_distinct_across_indices() {
 
 #[test]
 fn fixed_ignores_heading_structure() {
-    // 0: Root -> [1]
+    // 0: Root -> [1, 3]
     // 1: H2 "Section A" -> [2]
     // 2: Paragraph "content a"
     // 3: H2 "Section B" -> [4]
     // 4: Paragraph "content b"
-    // Fixed strategy should merge everything into one chunk (fits under 256).
+    // Fixed strategy merges everything into one flat chunk; heading titles
+    // are included as plain text (no breadcrumb injection).
     let doc = make_doc(vec![
         root(vec![NodeId(1), NodeId(3)]),
         heading(2, "Section A", vec![NodeId(2)]),
@@ -593,10 +610,12 @@ fn fixed_ignores_heading_structure() {
     let full = doc.full_text();
     let chunks = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
     assert_eq!(chunks.len(), 1);
+    assert!(chunks[0].text.contains("Section A"));
     assert!(chunks[0].text.contains("content a"));
+    assert!(chunks[0].text.contains("Section B"));
     assert!(chunks[0].text.contains("content b"));
-    // No heading path in embedding_text.
-    assert!(!chunks[0].embedding_text.contains("Section"));
+    // embedding_text equals text (no breadcrumb injection).
+    assert_eq!(chunks[0].embedding_text, chunks[0].text);
 }
 
 #[test]
