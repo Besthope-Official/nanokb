@@ -22,7 +22,7 @@ impl Pipeline {
             .await?;
         Ok(Self {
             strategy: config.pipeline.chunk_strategy(),
-            embed_batch_size: config.pipeline.embed_batch_size,
+            embed_batch_size: config.embedding()?.batch_size,
             index_config: config.database.index.clone(),
             model,
         })

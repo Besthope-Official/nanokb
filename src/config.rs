@@ -26,8 +26,6 @@ pub struct PipelineConfig {
     pub embedding: String,
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
-    #[serde(default = "default_embed_batch_size")]
-    pub embed_batch_size: usize,
     #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default = "default_max_chunk_tokens")]
@@ -46,7 +44,6 @@ impl Default for PipelineConfig {
             kb_name: default_kb_name(),
             embedding: default_embedding(),
             worker_count: default_worker_count(),
-            embed_batch_size: default_embed_batch_size(),
             top_k: default_top_k(),
             max_chunk_tokens: default_max_chunk_tokens(),
             chunk_overlap_ratio: default_chunk_overlap_ratio(),
@@ -122,6 +119,9 @@ pub struct EmbeddingConfig {
     pub model_name: String,
     pub api_base: String,
     pub api_key: String,
+    /// Maximum inputs per embedding request, capped by the provider's API limit.
+    #[serde(default = "default_embed_batch_size")]
+    pub batch_size: usize,
 }
 
 #[derive(Clone, Deserialize, Debug)]
