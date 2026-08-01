@@ -7,6 +7,13 @@ use anyhow::{Context, Result};
 use serde_json::json;
 use sqlx::PgPool;
 
+pub struct DocumentInput<'a> {
+    pub document_id: i64,
+    pub content: &'a str,
+    pub filename: &'a str,
+    pub kb_name: &'a str,
+}
+
 pub struct Pipeline {
     model: EmbedModel,
     strategy: ChunkStrategy,
@@ -67,27 +74,25 @@ impl Pipeline {
     pub async fn run(
         &self,
         pool: &PgPool,
-        document_id: i64,
-        content: &str,
-        filename: &str,
-        kb_name: &str,
+        input: &DocumentInput<'_>,
         on_stage: &(dyn Fn(String) + Sync),
         on_info: &(dyn Fn(String) + Sync),
     ) -> Result<()> {
         // Stage 1: Parse
         on_stage("parsing".to_string());
-        let document = Document::from_content(content, filename)?;
+        let document = Document::from_content(input.content, input.filename)?;
         let frontmatter = serde_json::to_value(&document.metadata.frontmatter)
             .context("failed to serialize document frontmatter")?;
         let (document, dropped) = document.into_parsed().filter(&[Filter::DropReference]);
         if !dropped.is_empty() {
             on_info(format!(
-                "[{filename}] dropped {} reference section(s): {}",
+                "[{}] dropped {} reference section(s): {}",
+                input.filename,
                 dropped.len(),
                 dropped.join(", ")
             ));
         }
-        crate::postgres::mark_document_parsed(pool, document_id, &frontmatter).await?;
+        crate::postgres::mark_document_parsed(pool, input.document_id, &frontmatter).await?;
 
         // Stage 2: Chunk
         on_stage("chunking".to_string());
@@ -120,7 +125,7 @@ impl Pipeline {
         // Stage 4: Store
         on_stage(format!("storing {total} chunks"));
         EmbeddedChunks { chunks: embedded }
-            .store(pool, kb_name, document_id)
+            .store(pool, input.kb_name, input.document_id)
             .await?;
 
         Ok(())

@@ -254,7 +254,7 @@ async fn run_kb_list(pool: &sqlx::PgPool) -> Result<()> {
         println!("no kbs; create one with `nanokb kb create <name>`");
         return Ok(());
     }
-    println!("{:<24} {:>6} {:>8}  {}", "NAME", "DOCS", "CHUNKS", "CREATED");
+    println!("{:<24} {:>6} {:>8}  CREATED", "NAME", "DOCS", "CHUNKS");
     for kb in &summaries {
         println!(
             "{:<24} {:>6} {:>8}  {}",
@@ -289,8 +289,8 @@ async fn run_doc_list(pool: &sqlx::PgPool, kb_name: &str) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:>6} {:<40} {:>8} {:<10} {}",
-        "ID", "FILENAME", "CHUNKS", "TASK", "UPDATED"
+        "{:>6} {:<40} {:>8} {:<10} UPDATED",
+        "ID", "FILENAME", "CHUNKS", "TASK"
     );
     for doc in &documents {
         println!(

@@ -1,5 +1,6 @@
 use crate::{Node, NodeKind, StructuredDocument};
 use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+use chunk::chunk as byte_chunk;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
@@ -29,6 +30,10 @@ pub enum ChunkStrategy {
         overlap_ratio: f32,
         metadata_mode: MetadataMode,
     },
+    Fixed {
+        chunk_size: usize,
+        overlap_tokens: usize,
+    },
 }
 
 impl Default for ChunkStrategy {
@@ -43,13 +48,17 @@ impl Default for ChunkStrategy {
 
 impl StructuredDocument {
     pub fn into_chunks(self, strategy: &ChunkStrategy) -> Vec<Chunk> {
-        let ChunkStrategy::Layered {
-            max_chunk_tokens,
-            overlap_ratio,
-            metadata_mode,
-        } = strategy;
-
-        layered_chunks(&self, *max_chunk_tokens, *overlap_ratio, *metadata_mode)
+        match strategy {
+            ChunkStrategy::Layered {
+                max_chunk_tokens,
+                overlap_ratio,
+                metadata_mode,
+            } => layered_chunks(&self, *max_chunk_tokens, *overlap_ratio, *metadata_mode),
+            ChunkStrategy::Fixed {
+                chunk_size,
+                overlap_tokens,
+            } => fixed_chunks(&self, *chunk_size, *overlap_tokens),
+        }
     }
 }
 
@@ -254,6 +263,96 @@ fn flush_content_blocks(
     }
 }
 
+// ---------------------------------------------------------------------------
+// fixed-length chunking
+// ---------------------------------------------------------------------------
+
+/// Walk the document tree collecting content blocks in depth-first order,
+/// ignoring heading structure.
+fn collect_content_texts(document: &StructuredDocument, node: &Node) -> Vec<String> {
+    let mut texts = Vec::new();
+    for &child_id in &node.children {
+        let child = document.node(child_id);
+        match &child.kind {
+            NodeKind::Heading { .. } => {
+                texts.extend(collect_content_texts(document, child));
+            }
+            _ => {
+                let text = content_block_text(&child.kind);
+                if !text.is_empty() {
+                    texts.push(text);
+                }
+            }
+        }
+    }
+    texts
+}
+
+fn fixed_chunks(
+    document: &StructuredDocument,
+    chunk_size: usize,
+    overlap_tokens: usize,
+) -> Vec<Chunk> {
+    assert!(chunk_size > 0, "fixed chunk size must be greater than zero");
+
+    let texts = collect_content_texts(document, document.node(document.root));
+    if texts.is_empty() {
+        return vec![];
+    }
+
+    let full_text = texts.join("\n\n");
+    let encoding = bpe_encode(&full_text);
+    let total_tokens = encoding.len();
+    if total_tokens <= chunk_size {
+        return vec![make_fixed_chunk(&full_text, &document.metadata.filename, 0)];
+    }
+
+    let offsets = encoding.get_offsets();
+    let advance = chunk_size.saturating_sub(overlap_tokens).max(1);
+    let mut chunks = Vec::new();
+    let mut token_pos = 0;
+
+    while token_pos < total_tokens {
+        let end_pos = (token_pos + chunk_size).min(total_tokens);
+        let byte_start = char_boundary_floor(&full_text, offsets[token_pos].0);
+        let byte_end = char_boundary_floor(&full_text, offsets[end_pos - 1].1);
+        let chunk_size_bytes = byte_end - byte_start;
+        let bytes = byte_chunk(&full_text.as_bytes()[byte_start..])
+            .size(chunk_size_bytes)
+            .delimiters(b"\n.?!")
+            .patterns(&["。", "！", "？"])
+            .next()
+            .unwrap_or_else(|| panic!("chunker returned no chunk for a non-empty token window"));
+        let text = {
+            let text = std::str::from_utf8(bytes)
+                .unwrap_or_else(|error| panic!("chunker produced invalid UTF-8: {error}"));
+            make_fixed_chunk(text, &document.metadata.filename, chunks.len())
+        };
+        chunks.push(text);
+
+        if end_pos >= total_tokens {
+            break;
+        }
+
+        token_pos += advance;
+    }
+
+    chunks
+}
+
+fn make_fixed_chunk(text: &str, filename: &str, chunk_index: usize) -> Chunk {
+    let mut hasher = DefaultHasher::new();
+    filename.hash(&mut hasher);
+    chunk_index.hash(&mut hasher);
+    let chunk_id = format!("{:016x}", hasher.finish());
+
+    Chunk {
+        chunk_id,
+        text: text.to_string(),
+        embedding_text: text.to_string(),
+    }
+}
+
 /// The tokenizer is embedded at compile time, so a failure here is a build defect
 /// rather than a runtime condition.
 fn bpe_tokenizer() -> &'static Tokenizer {
@@ -275,6 +374,28 @@ fn bpe_encode(text: &str) -> tokenizers::Encoding {
     bpe_tokenizer()
         .encode(text, false)
         .unwrap_or_else(|error| panic!("BPE token encoding failed: {error}"))
+}
+
+/// Return the nearest UTF-8 character boundary at or before `pos`.
+///
+/// BPE tokenizer byte offsets can land inside multi-byte characters (e.g.
+/// the 3-byte `'` or `"`), so every offset used for string slicing must
+/// be aligned first.
+fn char_boundary_floor(text: &str, pos: usize) -> usize {
+    if pos >= text.len() {
+        return text.len();
+    }
+    if text.is_char_boundary(pos) {
+        return pos;
+    }
+    // Walk backward at most 3 bytes (max UTF-8 char width is 4).
+    for offset in 1..=3 {
+        let candidate = pos.saturating_sub(offset);
+        if text.is_char_boundary(candidate) {
+            return candidate;
+        }
+    }
+    pos
 }
 
 fn make_breadcrumb(heading_path: &[String]) -> String {
