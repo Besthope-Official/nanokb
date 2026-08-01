@@ -206,6 +206,7 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
                 filename,
                 kb_name,
                 &|stage| progress.stage(slot, stage),
+                &|info| progress.log(info),
             )
             .await;
         progress.finish(slot, result.is_ok());

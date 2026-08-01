@@ -124,6 +124,7 @@ async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool, progress:
             &task.filename,
             &task.kb_name,
             &|stage| progress.stage(slot, stage),
+            &|info| progress.log(info),
         )
         .await;
     match result {

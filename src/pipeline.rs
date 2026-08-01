@@ -49,13 +49,21 @@ impl Pipeline {
         filename: &str,
         kb_name: &str,
         on_stage: &(dyn Fn(String) + Sync),
+        on_info: &(dyn Fn(String) + Sync),
     ) -> Result<()> {
         // Stage 1: Parse
         on_stage("parsing".to_string());
         let document = Document::from_content(content, filename)?;
         let frontmatter = serde_json::to_value(&document.metadata.frontmatter)
             .context("failed to serialize document frontmatter")?;
-        let document = document.into_parsed().filter(&[Filter::DropReference]);
+        let (document, dropped) = document.into_parsed().filter(&[Filter::DropReference]);
+        if !dropped.is_empty() {
+            on_info(format!(
+                "[{filename}] dropped {} reference section(s): {}",
+                dropped.len(),
+                dropped.join(", ")
+            ));
+        }
         crate::postgres::mark_document_parsed(pool, document_id, &frontmatter).await?;
 
         // Stage 2: Chunk
