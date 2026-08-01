@@ -1,2 +1,23 @@
 database:
-  url: "postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb"
+  url: "postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+  index:
+    type: hnsw
+    m: 16
+    ef_construction: 64
+    ef_search: 40
+
+model:
+  embedding:
+    model_name: "BAAI/bge-m3"
+    api_base: "{BGE_M3_EMBED_API_BASE}"
+    api_key: "{BGE_M3_EMBED_API_KEY}"
+
+pipeline:
+  kb_name: "test"
+  worker_count: 2
+  embed_batch_size: 32
+  top_k: 5
+  max_chunk_tokens: 256
+  chunk_overlap_ratio: 0.1
+  worker_poll_timeout_secs: 30
+  worker_error_retry_secs: 5

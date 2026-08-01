@@ -33,12 +33,12 @@ fn loads_placeholders_from_adjacent_dotenv() {
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\n",
+        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"{BGE_M3_EMBED_API_BASE}\"\n    api_key: \"{BGE_M3_EMBED_API_KEY}\"\n",
     )
     .unwrap();
     fs::write(
         directory.path().join(".env"),
-        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\n",
+        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\nBGE_M3_EMBED_API_BASE=https://api.siliconflow.cn/v1\nBGE_M3_EMBED_API_KEY=sk-test-key\n",
     )
     .unwrap();
 
@@ -48,13 +48,15 @@ fn loads_placeholders_from_adjacent_dotenv() {
         config.database.url,
         "postgres://nanokb:secret@postgres:5432/nanokb"
     );
+    assert_eq!(config.model.embedding.api_base, "https://api.siliconflow.cn/v1");
+    assert_eq!(config.model.embedding.api_key, "sk-test-key");
 }
 
 #[test]
 fn process_environment_overrides_dotenv() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
-    fs::write(&config_path, "database:\n  url: \"{DATABASE_URL}\"\n").unwrap();
+    fs::write(&config_path, "database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n").unwrap();
     fs::write(
         directory.path().join(".env"),
         "DATABASE_URL=postgres://from-dotenv\n",
@@ -74,7 +76,7 @@ fn process_environment_overrides_dotenv() {
 fn rejects_unresolved_placeholders() {
     let variables = HashMap::from([("DB_USER".to_string(), "nanokb".to_string())]);
     let error = parse_config(
-        "database:\n  url: \"postgres://{DB_USER}@{DB_HOST}/nanokb\"\n",
+        "database:\n  url: \"postgres://{DB_USER}@{DB_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
         &variables,
     )
     .err()
@@ -89,7 +91,7 @@ fn rejects_unresolved_placeholders() {
 #[test]
 fn rejects_placeholders_introduced_by_environment_values() {
     let variables = HashMap::from([("DATABASE_URL".to_string(), "{OTHER_URL}".to_string())]);
-    let error = parse_config("database:\n  url: \"{DATABASE_URL}\"\n", &variables)
+    let error = parse_config("database:\n  url: \"{DATABASE_URL}\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n", &variables)
         .err()
         .unwrap();
 
@@ -102,7 +104,7 @@ fn rejects_placeholders_introduced_by_environment_values() {
 #[test]
 fn rejects_unknown_configuration_fields() {
     let error = parse_config(
-        "database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\n",
+        "database:\n  url: postgres://localhost/nanokb\n  pool_szie: 5\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: https://api.siliconflow.cn/v1\n    api_key: sk-test-key\n",
         &HashMap::new(),
     )
     .err()
@@ -115,15 +117,112 @@ fn rejects_unknown_configuration_fields() {
 }
 
 #[test]
-#[should_panic(expected = "failed to load application configuration")]
-fn load_from_panics_when_a_placeholder_is_unresolved() {
+fn load_from_errors_when_a_placeholder_is_unresolved() {
     let directory = TestDirectory::new();
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{NANOKB_TEST_MISSING_DATABASE_HOST}/nanokb\"\n",
+        "database:\n  url: \"postgres://{NANOKB_TEST_MISSING_DATABASE_HOST}/nanokb\"\nmodel:\n  embedding:\n    model_name: BAAI/bge-m3\n    api_base: \"https://api.siliconflow.cn/v1\"\n    api_key: \"sk-test-key\"\n",
     )
     .unwrap();
 
-    AppConfig::load_from(config_path);
+    let Err(error) = AppConfig::try_load_from(config_path) else {
+        panic!("expected an unresolved placeholder to be rejected");
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("NANOKB_TEST_MISSING_DATABASE_HOST"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn index_config_default() {
+    let config = IndexConfig::default();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
+}
+
+#[test]
+fn index_config_deserialize_all_fields() {
+    let config: IndexConfig =
+        serde_json::from_str(r#"{"type":"hnsw","m":32,"ef_construction":128,"ef_search":100}"#)
+            .unwrap();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 32);
+            assert_eq!(ef_construction, 128);
+            assert_eq!(ef_search, 100);
+        }
+    }
+}
+
+#[test]
+fn index_config_deserialize_type_only_uses_defaults() {
+    let config: IndexConfig = serde_json::from_str(r#"{"type":"hnsw"}"#).unwrap();
+    match config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
+}
+
+#[test]
+fn index_config_rejects_unknown_variant() {
+    let error = serde_json::from_str::<IndexConfig>(r#"{"type":"bm25"}"#).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn index_config_rejects_unknown_field() {
+    let error = serde_json::from_str::<IndexConfig>(
+        r#"{"type":"hnsw","m":16,"ef_construction":64,"wat":999}"#,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn database_config_without_index_defaults() {
+    let config: DatabaseConfig =
+        serde_json::from_str(r#"{"url":"postgres://localhost/nanokb"}"#).unwrap();
+    assert_eq!(config.url, "postgres://localhost/nanokb");
+    match config.index {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            assert_eq!(m, 16);
+            assert_eq!(ef_construction, 64);
+            assert_eq!(ef_search, 40);
+        }
+    }
 }

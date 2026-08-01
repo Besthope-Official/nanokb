@@ -1,3 +1,4 @@
+use crate::chunker::{ChunkStrategy, MetadataMode};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -7,26 +8,153 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use yaml_serde::Value;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub database: DatabaseConfig,
+    pub model: ModelConfig,
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    #[serde(default = "default_kb_name")]
+    pub kb_name: String,
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+    #[serde(default = "default_embed_batch_size")]
+    pub embed_batch_size: usize,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default = "default_max_chunk_tokens")]
+    pub max_chunk_tokens: usize,
+    #[serde(default = "default_chunk_overlap_ratio")]
+    pub chunk_overlap_ratio: f32,
+    #[serde(default = "default_worker_poll_timeout_secs")]
+    pub worker_poll_timeout_secs: u64,
+    #[serde(default = "default_worker_error_retry_secs")]
+    pub worker_error_retry_secs: u64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            kb_name: default_kb_name(),
+            worker_count: default_worker_count(),
+            embed_batch_size: default_embed_batch_size(),
+            top_k: default_top_k(),
+            max_chunk_tokens: default_max_chunk_tokens(),
+            chunk_overlap_ratio: default_chunk_overlap_ratio(),
+            worker_poll_timeout_secs: default_worker_poll_timeout_secs(),
+            worker_error_retry_secs: default_worker_error_retry_secs(),
+        }
+    }
+}
+
+impl PipelineConfig {
+    pub fn chunk_strategy(&self) -> ChunkStrategy {
+        ChunkStrategy::Layered {
+            max_chunk_tokens: self.max_chunk_tokens,
+            overlap_ratio: self.chunk_overlap_ratio,
+            metadata_mode: MetadataMode::Path,
+        }
+    }
+}
+
+fn default_kb_name() -> String {
+    "test".to_string()
+}
+
+fn default_worker_count() -> usize {
+    2
+}
+
+fn default_embed_batch_size() -> usize {
+    32
+}
+
+fn default_top_k() -> usize {
+    5
+}
+
+fn default_max_chunk_tokens() -> usize {
+    256
+}
+
+fn default_chunk_overlap_ratio() -> f32 {
+    0.1
+}
+
+fn default_worker_poll_timeout_secs() -> u64 {
+    30
+}
+
+fn default_worker_error_retry_secs() -> u64 {
+    5
+}
+
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     pub url: String,
+    #[serde(default)]
+    pub index: IndexConfig,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    pub embedding: EmbeddingConfig,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingConfig {
+    pub model_name: String,
+    pub api_base: String,
+    pub api_key: String,
+}
+
+#[derive(Clone, Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+#[serde(tag = "type")]
+pub enum IndexConfig {
+    #[serde(rename = "hnsw")]
+    Hnsw {
+        #[serde(default = "default_m")]
+        m: u16,
+        #[serde(default = "default_ef_construction")]
+        ef_construction: u16,
+        #[serde(default = "default_ef_search")]
+        ef_search: u32,
+    },
+}
+
+fn default_m() -> u16 {
+    16
+}
+
+fn default_ef_construction() -> u16 {
+    64
+}
+
+fn default_ef_search() -> u32 {
+    40
+}
+
+impl Default for IndexConfig {
+    fn default() -> Self {
+        IndexConfig::Hnsw {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 40,
+        }
+    }
 }
 
 impl AppConfig {
-    pub fn load_from(path: impl AsRef<Path>) -> Self {
-        Self::try_load_from(path).unwrap_or_else(|error| {
-            eprintln!("failed to load application configuration: {error:#}");
-            panic!("failed to load application configuration");
-        })
-    }
-
     pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)

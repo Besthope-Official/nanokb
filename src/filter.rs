@@ -6,18 +6,24 @@ pub enum Filter {
 }
 
 impl StructuredDocument {
-    pub fn filter(mut self, filters: &[Filter]) -> Self {
+    /// Applies `filters`, returning the titles of every section that was dropped.
+    pub fn filter(mut self, filters: &[Filter]) -> (Self, Vec<String>) {
         let root = self.root;
+        let mut dropped = Vec::new();
         for filter in filters {
             match filter {
-                Filter::DropReference => prune_references(&mut self, root),
+                Filter::DropReference => prune_references(&mut self, root, &mut dropped),
             }
         }
-        self
+        (self, dropped)
     }
 }
 
-fn prune_references(document: &mut StructuredDocument, node_id: crate::NodeId) {
+fn prune_references(
+    document: &mut StructuredDocument,
+    node_id: crate::NodeId,
+    dropped: &mut Vec<String>,
+) {
     let child_ids = document.node(node_id).children.clone();
 
     let (keep, drop): (Vec<_>, Vec<_>) = child_ids.into_iter().partition(|&cid| {
@@ -26,11 +32,16 @@ fn prune_references(document: &mut StructuredDocument, node_id: crate::NodeId) {
     });
 
     for cid in &keep {
-        prune_references(document, *cid);
+        prune_references(document, *cid, dropped);
     }
 
     // Retain metadata in tree but detach from parent — no reindex needed.
     if !drop.is_empty() {
+        for cid in &drop {
+            if let NodeKind::Heading { title, .. } = &document.node(*cid).kind {
+                dropped.push(title.trim().to_string());
+            }
+        }
         document.tree[node_id.0].children = keep;
     }
 }

@@ -347,6 +347,87 @@ fn chunk_id_is_stable() {
     assert_eq!(a[0].chunk_id, b[0].chunk_id);
 }
 
+/// chunk_id is the PRIMARY KEY together with document_id, so identical content
+/// under an identical heading path must still yield distinct ids.
+#[test]
+fn duplicate_content_in_same_section_yields_distinct_chunk_ids() {
+    let long = "word ".repeat(400);
+    // 0: Root -> [1], 1: Heading -> [2, 3]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2), NodeId(3)]),
+        paragraph(&long),
+        paragraph(&long),
+    ]);
+    let chunks = layered_chunks(&doc, 256, 0.0, MetadataMode::Path);
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].embedding_text, chunks[1].embedding_text);
+    assert_ne!(chunks[0].chunk_id, chunks[1].chunk_id);
+}
+
+/// A section flushed once before a nested heading and once after it must not
+/// restart its block numbering, or the two flushes collide.
+#[test]
+fn chunk_ids_are_distinct_across_successive_flushes_of_one_section() {
+    let long = "word ".repeat(400);
+    // 0: Root -> [1], 1: Heading -> [2, 3, 4], 3: nested Heading -> []
+    let doc = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2), NodeId(3), NodeId(4)]),
+        paragraph(&long),
+        heading(3, "Nested", vec![]),
+        paragraph(&long),
+    ]);
+    let chunks = layered_chunks(&doc, 256, 0.0, MetadataMode::None);
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, chunks[1].text);
+    assert_ne!(chunks[0].chunk_id, chunks[1].chunk_id);
+}
+
+/// Two sections sharing a title but sitting under different parents are
+/// different locations in the document.
+#[test]
+fn same_title_under_different_parents_yields_distinct_chunk_ids() {
+    // 0: Root -> [1, 3], 1: "A" -> [2], 3: "B" -> [4], both children "Shared"
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(3)]),
+        heading(2, "A", vec![NodeId(2)]),
+        heading(3, "Shared", vec![NodeId(5)]),
+        heading(2, "B", vec![NodeId(4)]),
+        heading(3, "Shared", vec![NodeId(6)]),
+        paragraph("body"),
+        paragraph("body"),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None);
+
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].text, chunks[1].text);
+    assert_ne!(chunks[0].chunk_id, chunks[1].chunk_id);
+}
+
+/// Editing a paragraph's wording must not move the chunk's identity, so that
+/// re-indexing updates a row instead of orphaning it.
+#[test]
+fn chunk_id_is_independent_of_content_edits() {
+    let before = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2)]),
+        paragraph("original wording"),
+    ]);
+    let after = make_doc(vec![
+        root(vec![NodeId(1)]),
+        heading(2, "Section", vec![NodeId(2)]),
+        paragraph("revised wording"),
+    ]);
+
+    let a = layered_chunks(&before, 512, 0.0, MetadataMode::Path);
+    let b = layered_chunks(&after, 512, 0.0, MetadataMode::Path);
+    assert_ne!(a[0].text, b[0].text);
+    assert_eq!(a[0].chunk_id, b[0].chunk_id);
+}
+
 // ---------------------------------------------------------------------------
 // mixed content types
 // ---------------------------------------------------------------------------

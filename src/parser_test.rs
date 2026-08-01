@@ -1,49 +1,13 @@
 use crate::parser::*;
 use rstest::*;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
-
-static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
-
-struct TempMarkdown {
-    path: PathBuf,
-}
-
-impl TempMarkdown {
-    fn new(file_name: &str, content: &str) -> Self {
-        let id = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("nanokb-parser-{}-{id}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join(file_name);
-        fs::write(&path, content).unwrap();
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempMarkdown {
-    fn drop(&mut self) {
-        if let Some(dir) = self.path.parent() {
-            let _ = fs::remove_dir_all(dir);
-        }
-    }
-}
 
 #[test]
-fn from_markdown_loads_frontmatter_and_body() {
-    let source = TempMarkdown::new(
-        "guide.md",
+fn from_content_loads_frontmatter_and_body() {
+    let document = Document::from_content(
         "---\ntitle: Guide\nauthor: NanoKB\n---\n\n# Intro\nBody",
-    );
-
-    let document = Document::from_markdown(source.path()).unwrap();
+        "guide.md",
+    )
+    .unwrap();
 
     assert_eq!(document.metadata.filename, "guide.md");
     assert_eq!(document.content, "\n# Intro\nBody");
@@ -55,24 +19,10 @@ fn from_markdown_loads_frontmatter_and_body() {
 #[rstest]
 #[case::plain_body("plain body")]
 #[case::with_frontmatter("---\ntitle: \"hello\"\n---\nbody")]
-fn from_markdown_uses_file_name_as_title(#[case] content: &str) {
-    let source = TempMarkdown::new("fallback-title.md", content);
-
-    let document = Document::from_markdown(source.path()).unwrap();
+fn from_content_uses_file_name_as_title(#[case] content: &str) {
+    let document = Document::from_content(content, "fallback-title.md").unwrap();
 
     assert_eq!(document.metadata.filename, "fallback-title.md");
-}
-
-#[test]
-fn from_markdown_reports_source_path_when_read_fails() {
-    let missing = std::env::temp_dir().join("nanokb-missing-document.md");
-
-    let error = match Document::from_markdown(&missing) {
-        Ok(_) => panic!("reading a missing document should fail"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains(&missing.display().to_string()));
 }
 
 #[rstest]
@@ -157,6 +107,83 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
 
     assert!(frontmatter.is_none());
     assert_eq!(strip_frontmatter(input), None);
+}
+
+fn parse(content: &str) -> StructuredDocument {
+    Document::from_content(content, "math.md")
+        .unwrap()
+        .into_parsed()
+}
+
+fn kinds(document: &StructuredDocument) -> Vec<NodeKind> {
+    document
+        .node(document.root)
+        .children
+        .iter()
+        .map(|&id| document.node(id).kind.clone())
+        .collect()
+}
+
+/// A display formula inline with prose must not discard the surrounding text.
+#[test]
+fn display_math_inside_a_paragraph_keeps_surrounding_prose() {
+    let document = parse("text before $$x=1$$ text after\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "text before $$x=1$$ text after".into()
+        }]
+    );
+}
+
+/// A formula written on its own is a structural block, not prose.
+#[rstest]
+#[case::fenced("para one\n\n$$\nx=1\n$$\n\npara two\n", "$$\nx=1\n$$")]
+#[case::single_line("para one\n\n$$x=1$$\n\npara two\n", "$$x=1$$")]
+fn standalone_display_math_becomes_a_math_block(#[case] input: &str, #[case] expected: &str) {
+    let document = parse(input);
+
+    assert_eq!(
+        kinds(&document),
+        vec![
+            NodeKind::Paragraph {
+                text: "para one".into()
+            },
+            NodeKind::MathBlock {
+                text: expected.into()
+            },
+            NodeKind::Paragraph {
+                text: "para two".into()
+            },
+        ]
+    );
+}
+
+/// Delimiters are dropped by the event stream; the text must stay valid markdown.
+#[test]
+fn inline_math_keeps_its_delimiters() {
+    let document = parse("inline $a=b$ here\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "inline $a=b$ here".into()
+        }]
+    );
+}
+
+/// Two formulas in one paragraph are prose-like, so the paragraph stays a paragraph.
+#[test]
+fn paragraph_with_multiple_display_formulas_stays_a_paragraph() {
+    let document = parse("$$x=1$$\n$$y=2$$\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "$$x=1$$ $$y=2$$".into()
+        }]
+    );
 }
 
 #[test]

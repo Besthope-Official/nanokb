@@ -2,7 +2,10 @@ pub mod chunker;
 pub use chunker::{Chunk, ChunkStrategy, MetadataMode};
 
 pub mod config;
-pub use config::{AppConfig, DatabaseConfig};
+pub use config::{AppConfig, DatabaseConfig, IndexConfig};
+
+pub mod embed;
+pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
 
 pub mod filter;
 pub use filter::Filter;
@@ -11,3 +14,11 @@ pub mod parser;
 pub use parser::{Document, DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument};
 
 pub mod postgres;
+pub use postgres::{query_chunks, QueryResult};
+
+pub mod task;
+
+pub mod pipeline;
+pub use pipeline::Pipeline;
+
+pub mod cli;
