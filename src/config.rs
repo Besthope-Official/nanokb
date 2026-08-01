@@ -20,8 +20,6 @@ pub struct AppConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
-    #[serde(default = "default_kb_name")]
-    pub kb_name: String,
     #[serde(default = "default_embedding")]
     pub embedding: String,
     #[serde(default = "default_worker_count")]
@@ -41,7 +39,6 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            kb_name: default_kb_name(),
             embedding: default_embedding(),
             worker_count: default_worker_count(),
             top_k: default_top_k(),
@@ -63,10 +60,6 @@ impl PipelineConfig {
     }
 }
 
-fn default_kb_name() -> String {
-    "test".to_string()
-}
-
 fn default_embedding() -> String {
     "default".to_string()
 }
@@ -79,16 +72,16 @@ fn default_embed_batch_size() -> usize {
     32
 }
 
-fn default_top_k() -> usize {
-    5
-}
-
 fn default_max_chunk_tokens() -> usize {
     256
 }
 
 fn default_chunk_overlap_ratio() -> f32 {
     0.1
+}
+
+fn default_top_k() -> usize {
+    5
 }
 
 fn default_worker_poll_timeout_secs() -> u64 {
@@ -162,18 +155,47 @@ impl Default for IndexConfig {
 }
 
 impl AppConfig {
+    /// The embedding provider selected by `pipeline.embedding`.
     pub fn embedding(&self) -> Result<&EmbeddingConfig> {
         let name = &self.pipeline.embedding;
         self.model.embeddings.get(name).ok_or_else(|| {
-            let mut available: Vec<&str> =
-                self.model.embeddings.keys().map(String::as_str).collect();
-            available.sort_unstable();
             anyhow::anyhow!(
                 "pipeline.embedding refers to unknown provider {name:?}; \
                  model.embeddings defines: {}",
-                available.join(", ")
+                self.embedding_names().join(", ")
             )
         })
+    }
+
+    /// Look up an embedding provider by the model name it serves.
+    ///
+    /// A kb records the model it was built with, not the provider key, so this
+    /// is how an existing kb finds its transport settings again.
+    pub fn embedding_for_model(&self, model_name: &str) -> Result<&EmbeddingConfig> {
+        let mut matches = self
+            .model
+            .embeddings
+            .values()
+            .filter(|embedding| embedding.model_name == model_name);
+        let embedding = matches.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider in model.embeddings serves model {model_name:?}; \
+                 defined providers: {}",
+                self.embedding_names().join(", ")
+            )
+        })?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "several providers in model.embeddings serve model {model_name:?}; \
+             remove the duplicates so the kb resolves to one endpoint"
+        );
+        Ok(embedding)
+    }
+
+    fn embedding_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.model.embeddings.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {

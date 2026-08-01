@@ -20,7 +20,6 @@ model:
       batch_size: 20
 
 pipeline:
-  kb_name: "test"
   embedding: bge_m3
   worker_count: 4
   top_k: 5

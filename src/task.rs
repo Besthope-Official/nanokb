@@ -68,6 +68,7 @@ pub async fn run_worker(
     config: Arc<AppConfig>,
     pipeline: Arc<Pipeline>,
     progress: Arc<Progress>,
+    kb_name: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let poll_timeout = Duration::from_secs(config.pipeline.worker_poll_timeout_secs);
@@ -86,7 +87,7 @@ pub async fn run_worker(
             break;
         }
 
-        match postgres::fetch_and_lock_pending(&pool).await {
+        match postgres::fetch_and_lock_pending(&pool, &kb_name).await {
             Ok(Some(row)) => {
                 let task_id = row.id;
                 match Task::try_from(row) {
@@ -158,20 +159,40 @@ async fn notify_completed(pool: &PgPool) {
 }
 
 /// Register a single markdown file and queue it for a worker.
-pub async fn import_file(pool: &PgPool, file_path: &Path, kb_name: &str, priority: i32) -> Result<i64> {
-    let filename = file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", file_path.display()))?;
-    let content = std::fs::read_to_string(file_path)
-        .with_context(|| format!("failed to read markdown document: {}", file_path.display()))?;
-    let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
+pub async fn import_file(
+    pool: &PgPool,
+    file_path: &Path,
+    kb_name: &str,
+    priority: i32,
+) -> Result<i64> {
+    let document_id = register_file(pool, file_path, kb_name).await?;
     let task_id = postgres::insert_task(pool, document_id, priority).await?;
     postgres::notify_task_added(pool).await?;
     Ok(task_id)
 }
 
-pub async fn import_dir(pool: &PgPool, dir_path: &str, kb_name: &str, priority: i32) -> Result<Vec<i64>> {
+/// Re-read `file_path` into an existing document and queue a rebuild of its chunks.
+pub async fn update_file(
+    pool: &PgPool,
+    file_path: &Path,
+    kb_name: &str,
+    document_id: i64,
+    priority: i32,
+) -> Result<i64> {
+    let content = read_supported(file_path)?
+        .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
+    postgres::replace_document_content(pool, kb_name, document_id, &content).await?;
+    let task_id = postgres::insert_task(pool, document_id, priority).await?;
+    postgres::notify_task_added(pool).await?;
+    Ok(task_id)
+}
+
+pub async fn import_dir(
+    pool: &PgPool,
+    dir_path: &str,
+    kb_name: &str,
+    priority: i32,
+) -> Result<Vec<i64>> {
     let mut task_ids = Vec::new();
     let dir = Path::new(dir_path);
     anyhow::ensure!(dir.is_dir(), "not a directory: {}", dir.display());
@@ -181,18 +202,20 @@ pub async fn import_dir(pool: &PgPool, dir_path: &str, kb_name: &str, priority: 
     {
         let entry = entry.context("failed to read directory entry")?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "md") {
-            let filename = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", path.display()))?;
-            let content = std::fs::read_to_string(&path)
-                .with_context(|| format!("failed to read markdown document: {}", path.display()))?;
-            let document_id =
-                postgres::register_document(pool, kb_name, &content, filename).await?;
-            let task_id = postgres::insert_task(pool, document_id, priority).await?;
-            task_ids.push(task_id);
+        if path.is_dir() {
+            continue;
         }
+        let Some(content) = read_supported(&path)? else {
+            eprintln!(
+                "skipping {}: only markdown documents are supported so far",
+                path.display()
+            );
+            continue;
+        };
+        let filename = utf8_filename(&path)?;
+        let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
+        let task_id = postgres::insert_task(pool, document_id, priority).await?;
+        task_ids.push(task_id);
     }
 
     if !task_ids.is_empty() {
@@ -200,4 +223,33 @@ pub async fn import_dir(pool: &PgPool, dir_path: &str, kb_name: &str, priority: 
     }
 
     Ok(task_ids)
+}
+
+async fn register_file(pool: &PgPool, file_path: &Path, kb_name: &str) -> Result<i64> {
+    let content = read_supported(file_path)?
+        .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
+    let filename = utf8_filename(file_path)?;
+    postgres::register_document(pool, kb_name, &content, filename).await
+}
+
+fn utf8_filename(file_path: &Path) -> Result<&str> {
+    file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", file_path.display()))
+}
+
+/// Read `file_path` if its detected content type is supported, else `None`.
+fn read_supported(file_path: &Path) -> Result<Option<String>> {
+    let extension = file_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension != "md" {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(file_path)
+        .with_context(|| format!("failed to read markdown document: {}", file_path.display()))?;
+    Ok(Some(content))
 }
