@@ -2,10 +2,133 @@ use crate::pipeline::Pipeline;
 use crate::{AppConfig, EmbedClient, postgres, task};
 use anyhow::{Context, Result};
 use std::env;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// A pinned multi-line progress block: one line per in-flight file plus a summary.
+/// Diagnostics from the parser and chunker go straight to stderr and scroll above it.
+pub struct Progress {
+    state: Mutex<ProgressState>,
+    tty: bool,
+}
+
+struct ProgressState {
+    slots: Vec<Option<(String, String)>>,
+    done: usize,
+    failed: usize,
+    total: usize,
+    drawn: usize,
+}
+
+impl Progress {
+    fn new(worker_count: usize, total: usize) -> Self {
+        Progress {
+            state: Mutex::new(ProgressState {
+                slots: vec![None; worker_count],
+                done: 0,
+                failed: 0,
+                total,
+                drawn: 0,
+            }),
+            tty: std::io::stderr().is_terminal(),
+        }
+    }
+
+    /// Print a line above the pinned block instead of letting it get overwritten.
+    pub fn log(&self, message: String) {
+        let mut state = self.state.lock().unwrap();
+        self.clear(&mut state);
+        let _ = writeln!(std::io::stderr(), "{message}");
+        self.redraw(&mut state);
+    }
+
+    /// Claim a slot for `filename`, returning its index for later `stage` calls.
+    pub fn start(&self, filename: &str) -> usize {
+        let mut state = self.state.lock().unwrap();
+        let slot = state
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                state.slots.push(None);
+                state.slots.len() - 1
+            });
+        state.slots[slot] = Some((filename.to_string(), "starting".to_string()));
+        self.redraw(&mut state);
+        slot
+    }
+
+    pub fn stage(&self, slot: usize, stage: impl Into<String>) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(Some(entry)) = state.slots.get_mut(slot) {
+            entry.1 = stage.into();
+        }
+        self.redraw(&mut state);
+    }
+
+    pub fn finish(&self, slot: usize, ok: bool) {
+        let mut state = self.state.lock().unwrap();
+        let name = match state.slots.get_mut(slot) {
+            Some(entry) => entry.take().map(|(name, _)| name),
+            None => None,
+        };
+        if ok {
+            state.done += 1;
+        } else {
+            state.failed += 1;
+        }
+        if let Some(name) = name {
+            let mark = if ok { "ok" } else { "FAILED" };
+            self.clear(&mut state);
+            let _ = writeln!(std::io::stderr(), "  {mark:>6}  {name}");
+        }
+        self.redraw(&mut state);
+    }
+
+    fn clear(&self, state: &mut ProgressState) {
+        if !self.tty || state.drawn == 0 {
+            return;
+        }
+        let mut err = std::io::stderr();
+        let _ = write!(err, "\r\x1b[K");
+        for _ in 0..state.drawn {
+            let _ = write!(err, "\x1b[A\x1b[K");
+        }
+        let _ = err.flush();
+        state.drawn = 0;
+    }
+
+    fn redraw(&self, state: &mut ProgressState) {
+        if !self.tty {
+            return;
+        }
+        self.clear(state);
+        let mut err = std::io::stderr();
+        let mut lines = 0;
+        for (name, stage) in state.slots.iter().flatten() {
+            let _ = writeln!(err, "  {stage:<22}  {name}");
+            lines += 1;
+        }
+        // Trailing newline keeps the cursor at column 0 on a fresh line, so
+        // diagnostics that bypass Progress (parser, chunker) land cleanly.
+        let _ = writeln!(
+            err,
+            "  {}/{} done, {} failed",
+            state.done, state.total, state.failed
+        );
+        let _ = err.flush();
+        state.drawn = lines + 1;
+    }
+
+    /// Drop the pinned block so trailing output starts on a clean line.
+    fn teardown(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.clear(&mut state);
+    }
+}
 
 pub async fn run() -> Result<()> {
     let mut args = env::args_os().skip(1);
@@ -73,11 +196,23 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
             .with_context(|| format!("failed to read: {}", path.display()))?;
         let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
         let task_id = postgres::insert_task(pool, document_id, 0).await?;
-        pipeline
-            .run(pool, document_id, &content, filename, kb_name)
-            .await?;
+        let progress = Progress::new(1, 1);
+        let slot = progress.start(filename);
+        let result = pipeline
+            .run(
+                pool,
+                document_id,
+                &content,
+                filename,
+                kb_name,
+                &|stage| progress.stage(slot, stage),
+            )
+            .await;
+        progress.finish(slot, result.is_ok());
+        progress.teardown();
+        result?;
         postgres::mark_task_success(pool, task_id).await?;
-        println!("built {}", path.display());
+        eprintln!("built {}", path.display());
     } else if path.is_dir() {
         let kb_name = &config.pipeline.kb_name;
         let worker_count = config.pipeline.worker_count;
@@ -89,8 +224,14 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
             println!("no markdown files found in {}", path.display());
             return Ok(());
         }
-        println!("created {} tasks for kb '{}'", task_ids.len(), kb_name);
+        eprintln!(
+            "kb '{}' · {} files · {} workers",
+            kb_name,
+            task_ids.len(),
+            worker_count
+        );
 
+        let progress = Arc::new(Progress::new(worker_count, task_ids.len()));
         let config_arc = Arc::new(config.clone());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -99,18 +240,21 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
             let pool = pool.clone();
             let config = config_arc.clone();
             let pipeline = pipeline.clone();
+            let progress = progress.clone();
             let rx = shutdown_rx.clone();
             handles.push(tokio::spawn(async move {
-                task::run_worker(pool, config, pipeline, rx).await;
+                task::run_worker(pool, config, pipeline, progress, rx).await;
             }));
         }
 
-        let completed_normally = wait_all_done(pool).await;
+        let completed_normally = wait_all_done(pool, &progress).await;
 
         let _ = shutdown_tx.send(true);
         for handle in handles {
             let _ = handle.await;
         }
+
+        progress.teardown();
 
         if !completed_normally {
             let canceled = postgres::cancel_all_running(pool).await?;
@@ -119,7 +263,7 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
             }
         }
 
-        println!("build complete");
+        eprintln!("build complete");
     } else {
         anyhow::bail!("path does not exist: {}", path.display());
     }
@@ -127,11 +271,11 @@ async fn run_build(config: &AppConfig, pool: &sqlx::PgPool, path: &str) -> Resul
 }
 
 /// Returns true if all tasks completed, false if interrupted by ctrl_c.
-async fn wait_all_done(pool: &sqlx::PgPool) -> bool {
+async fn wait_all_done(pool: &sqlx::PgPool, progress: &Progress) -> bool {
     let mut listener = match postgres::listen_on(pool, "task_completed").await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to listen for task completion: {e:#}");
+            progress.log(format!("failed to listen for task completion: {e:#}"));
             return false;
         }
     };
@@ -139,7 +283,7 @@ async fn wait_all_done(pool: &sqlx::PgPool) -> bool {
     // Check in case all tasks finished before the listener was set up.
     match postgres::count_active_tasks(pool).await {
         Ok((0, 0)) => return true,
-        Err(e) => eprintln!("failed to check task status: {e:#}"),
+        Err(e) => progress.log(format!("failed to check task status: {e:#}")),
         _ => {}
     }
 
@@ -147,7 +291,7 @@ async fn wait_all_done(pool: &sqlx::PgPool) -> bool {
         let notified = tokio::select! {
             result = listener.recv() => result.is_ok(),
             _ = tokio::signal::ctrl_c() => {
-                eprintln!("\nshutting down...");
+                progress.log("shutting down...".to_string());
                 return false;
             }
         };
@@ -158,7 +302,7 @@ async fn wait_all_done(pool: &sqlx::PgPool) -> bool {
 
         match postgres::count_active_tasks(pool).await {
             Ok((0, 0)) => return true,
-            Err(e) => eprintln!("failed to check task status: {e:#}"),
+            Err(e) => progress.log(format!("failed to check task status: {e:#}")),
             _ => {}
         }
     }

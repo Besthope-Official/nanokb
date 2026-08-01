@@ -1,3 +1,4 @@
+use crate::cli::Progress;
 use crate::config::AppConfig;
 use crate::pipeline::Pipeline;
 use crate::postgres::{self, TaskRow};
@@ -66,6 +67,7 @@ pub async fn run_worker(
     pool: PgPool,
     config: Arc<AppConfig>,
     pipeline: Arc<Pipeline>,
+    progress: Arc<Progress>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let poll_timeout = Duration::from_secs(config.pipeline.worker_poll_timeout_secs);
@@ -74,7 +76,7 @@ pub async fn run_worker(
     let mut listener = match postgres::listen_on(&pool, "task_added").await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to setup task listener: {e:#}");
+            progress.log(format!("failed to setup task listener: {e:#}"));
             return;
         }
     };
@@ -88,10 +90,10 @@ pub async fn run_worker(
             Ok(Some(row)) => {
                 let task_id = row.id;
                 match Task::try_from(row) {
-                    Ok(task) => process_task(&task, &pipeline, &pool).await,
+                    Ok(task) => process_task(&task, &pipeline, &pool, &progress).await,
                     // The row is already marked running, so release it instead of
                     // leaving it locked forever.
-                    Err(e) => fail_task(&pool, task_id, &format!("{e:#}")).await,
+                    Err(e) => fail_task(&pool, task_id, &format!("{e:#}"), &progress).await,
                 }
             }
             Ok(None) => {
@@ -102,7 +104,7 @@ pub async fn run_worker(
                 }
             }
             Err(e) => {
-                eprintln!("worker failed to fetch task: {e:#}");
+                progress.log(format!("worker failed to fetch task: {e:#}"));
                 tokio::select! {
                     _ = tokio::time::sleep(error_retry) => {},
                     _ = shutdown_rx.changed() => { break; }
@@ -112,29 +114,38 @@ pub async fn run_worker(
     }
 }
 
-async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool) {
+async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool, progress: &Progress) {
+    let slot = progress.start(&task.filename);
     let result = pipeline
-        .run(pool, task.document_id, &task.content, &task.filename, &task.kb_name)
+        .run(
+            pool,
+            task.document_id,
+            &task.content,
+            &task.filename,
+            &task.kb_name,
+            &|stage| progress.stage(slot, stage),
+        )
         .await;
     match result {
         Ok(()) => {
             if let Err(e) = postgres::mark_task_success(pool, task.id).await {
-                eprintln!("failed to mark task {} success: {e:#}", task.id);
+                progress.log(format!("failed to mark task {} success: {e:#}", task.id));
             }
+            progress.finish(slot, true);
             notify_completed(pool).await;
         }
         Err(e) => {
-            eprintln!("task {} ({}) failed", task.id, task.filename);
-            fail_task(pool, task.id, &format!("{e:#}")).await;
+            progress.finish(slot, false);
+            fail_task(pool, task.id, &format!("{e:#}"), progress).await;
         }
     }
 }
 
 /// Record a terminal failure and wake the build loop waiting on task completion.
-async fn fail_task(pool: &PgPool, task_id: i64, error_message: &str) {
-    eprintln!("task {task_id}: {error_message}");
+async fn fail_task(pool: &PgPool, task_id: i64, error_message: &str, progress: &Progress) {
+    progress.log(format!("task {task_id}: {error_message}"));
     if let Err(e) = postgres::mark_task_failed(pool, task_id, error_message).await {
-        eprintln!("failed to mark task {task_id} failed: {e:#}");
+        progress.log(format!("failed to mark task {task_id} failed: {e:#}"));
     }
     notify_completed(pool).await;
 }

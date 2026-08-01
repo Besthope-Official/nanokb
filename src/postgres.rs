@@ -509,7 +509,7 @@ pub async fn flush_db(pool: &PgPool) -> Result<()> {
     .await
     .context("failed to flush database")?;
 
-    println!("flushed all nanoKB tables");
+    eprintln!("flushed all nanoKB tables");
     Ok(())
 }
 
