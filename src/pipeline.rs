@@ -1,4 +1,3 @@
-use crate::IndexConfig;
 use crate::chunker::ChunkStrategy;
 use crate::config::AppConfig;
 use crate::embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
@@ -12,42 +11,57 @@ pub struct Pipeline {
     model: EmbedModel,
     strategy: ChunkStrategy,
     embed_batch_size: usize,
-    index_config: IndexConfig,
 }
 
 impl Pipeline {
-    pub async fn from_config(config: &AppConfig) -> Result<Self> {
-        let model = EmbedClient::from_config(config.embedding()?)?
-            .dimension()
-            .await?;
+    /// Build a pipeline from a kb's stored, immutable configuration.
+    ///
+    /// Only the embedding provider's transport settings (endpoint, key, batch
+    /// size) come from `config.yaml`; which model to use is dictated by the kb.
+    pub async fn for_kb(pool: &PgPool, config: &AppConfig, kb_name: &str) -> Result<Self> {
+        let meta = crate::postgres::load_kb_meta(pool, kb_name).await?;
+        let strategy: ChunkStrategy = serde_json::from_value(meta.chunk_config.clone())
+            .with_context(|| format!("kb {kb_name} has an unreadable chunk_config"))?;
+        let stored_model = meta
+            .embed_config
+            .get("model")
+            .and_then(|value| value.as_str())
+            .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
+
+        let embedding = config.embedding_for_model(stored_model)?;
+        let model = EmbedClient::from_config(embedding)?.dimension().await?;
+        anyhow::ensure!(
+            model.dimension == meta.dimension,
+            "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
+            meta.dimension,
+            model.dimension
+        );
+
         Ok(Self {
-            strategy: config.pipeline.chunk_strategy(),
-            embed_batch_size: config.embedding()?.batch_size,
-            index_config: config.database.index.clone(),
+            embed_batch_size: embedding.batch_size,
+            strategy,
             model,
         })
     }
 
-    pub async fn prepare_kb(&self, pool: &PgPool, kb_name: &str) -> Result<()> {
-        let chunk_config = self.chunk_config_json();
-        crate::postgres::assert_kb_compatible(
-            pool,
-            kb_name,
-            &self.model.model_name,
-            self.model.dimension,
-        )
-        .await?;
-        crate::postgres::assert_chunking_compatible(pool, kb_name, &chunk_config).await?;
-        let embed_config = json!({"model": &self.model.model_name});
+    /// Create a kb from `config.yaml` and freeze those settings into it.
+    pub async fn create_kb(pool: &PgPool, config: &AppConfig, name: &str) -> Result<()> {
+        let strategy = config.pipeline.chunk_strategy();
+        let model = EmbedClient::from_config(config.embedding()?)?
+            .dimension()
+            .await?;
+        let chunk_config = serde_json::to_value(&strategy)
+            .context("failed to serialize the configured chunking strategy")?;
+        let embed_config = json!({"model": &model.model_name});
         crate::postgres::create_kb(
             pool,
-            kb_name,
-            self.model.dimension,
+            name,
+            model.dimension,
             &chunk_config,
             &embed_config,
         )
         .await?;
-        crate::postgres::create_index(pool, kb_name, &self.index_config).await
+        crate::postgres::create_index(pool, name, &config.database.index).await
     }
 
     pub async fn run(
@@ -110,22 +124,5 @@ impl Pipeline {
             .await?;
 
         Ok(())
-    }
-
-    fn chunk_config_json(&self) -> serde_json::Value {
-        match &self.strategy {
-            ChunkStrategy::Layered {
-                max_chunk_tokens,
-                overlap_ratio,
-                metadata_mode,
-            } => {
-                json!({
-                    "strategy": "layered",
-                    "max_chunk_tokens": max_chunk_tokens,
-                    "overlap_ratio": overlap_ratio,
-                    "metadata_mode": metadata_mode,
-                })
-            }
-        }
     }
 }

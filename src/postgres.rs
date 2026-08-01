@@ -117,6 +117,10 @@ fn kb_table(name: &str) -> Result<String> {
     Ok(format!("{KB_TABLE_PREFIX}{name}"))
 }
 
+/// Create a kb, failing if one already exists under `name`.
+///
+/// A kb's chunking and embedding configuration is immutable, so creation is the
+/// only point at which either is written.
 pub async fn create_kb(
     pool: &PgPool,
     name: &str,
@@ -151,7 +155,7 @@ pub async fn create_kb(
         .await
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO kb_meta (name, chunk_config, embed_config, dimension) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
@@ -162,80 +166,51 @@ pub async fn create_kb(
     .await
     .with_context(|| format!("failed to insert metadata for kb {name}"))?;
 
+    anyhow::ensure!(inserted.rows_affected() == 1, "kb {name} already exists");
+
     transaction
         .commit()
         .await
         .with_context(|| format!("failed to commit kb {name}"))
 }
 
-/// Reject a configuration that differs from the one the kb was built with.
-///
-/// A kb's metadata is immutable once created: its vectors come from one embedding
-/// model, and its chunks from one chunking strategy. Mixing either within a kb
-/// makes the stored distances meaningless. To change a setting, build a new kb
-/// rather than reusing this one. Returns `Ok(())` for a kb that does not exist yet.
-pub async fn assert_kb_compatible(
-    pool: &PgPool,
-    kb_name: &str,
-    model_name: &str,
-    dimension: usize,
-) -> Result<()> {
-    validate_kb_name(kb_name)?;
-    let Some(row) = sqlx::query("SELECT embed_config, dimension FROM kb_meta WHERE name = $1")
-        .bind(kb_name)
-        .fetch_optional(pool)
-        .await
-        .with_context(|| format!("failed to read metadata for kb {kb_name}"))?
-    else {
-        return Ok(());
-    };
-
-    let embed_config: Value = row.get("embed_config");
-    let stored_model = embed_config
-        .get("model")
-        .and_then(Value::as_str)
-        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-    let stored_dimension: i32 = row.get("dimension");
-
-    anyhow::ensure!(
-        stored_model == model_name && stored_dimension as usize == dimension,
-        "kb {kb_name} was built with embedding model {stored_model} ({stored_dimension}d) \
-         but the configured model is {model_name} ({dimension}d); \
-         vectors from different models are not comparable — \
-         point pipeline.embedding back at {stored_model}, \
-         or set pipeline.kb_name to a new kb"
-    );
-    Ok(())
+#[derive(Debug)]
+pub struct KbMeta {
+    pub name: String,
+    pub chunk_config: Value,
+    pub embed_config: Value,
+    pub dimension: usize,
+    pub created_at: String,
 }
 
-/// Reject a chunking strategy that differs from the one the kb was built with.
+/// Load the immutable configuration a kb was created with.
 ///
-/// Only the build path chunks documents, so this sits beside
-/// [`assert_kb_compatible`] rather than inside it.
-pub async fn assert_chunking_compatible(
-    pool: &PgPool,
-    kb_name: &str,
-    chunk_config: &Value,
-) -> Result<()> {
+/// Every operation on a kb reads its chunking and embedding settings from here
+/// rather than from `config.yaml`: vectors from different models are not
+/// comparable, and chunks from different strategies do not align, so the kb's
+/// own record is the only correct source. `config.yaml` supplies defaults for
+/// [`create_kb`] alone.
+pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
     validate_kb_name(kb_name)?;
-    let Some(stored): Option<Json<Value>> =
-        sqlx::query_scalar("SELECT chunk_config FROM kb_meta WHERE name = $1")
-            .bind(kb_name)
-            .fetch_optional(pool)
-            .await
-            .with_context(|| format!("failed to read chunking config for kb {kb_name}"))?
-    else {
-        return Ok(());
-    };
+    let row = sqlx::query(
+        "SELECT name, chunk_config, embed_config, dimension, \
+                to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at \
+         FROM kb_meta WHERE name = $1",
+    )
+    .bind(kb_name)
+    .fetch_optional(pool)
+    .await
+    .with_context(|| format!("failed to read metadata for kb {kb_name}"))?
+    .with_context(|| format!("kb {kb_name} does not exist; create it with `nanokb kb create`"))?;
 
-    anyhow::ensure!(
-        &stored.0 == chunk_config,
-        "kb {kb_name} was built with chunking config {} but the configured chunking is {chunk_config}; \
-         a kb's chunking strategy is fixed once built — \
-         restore the original settings, or set pipeline.kb_name to a new kb",
-        stored.0
-    );
-    Ok(())
+    let dimension: i32 = row.get("dimension");
+    Ok(KbMeta {
+        name: row.get("name"),
+        chunk_config: row.get("chunk_config"),
+        embed_config: row.get("embed_config"),
+        dimension: dimension as usize,
+        created_at: row.get("created_at"),
+    })
 }
 
 fn validate_kb_name(name: &str) -> Result<()> {
@@ -248,6 +223,93 @@ fn validate_kb_name(name: &str) -> Result<()> {
         anyhow::bail!("invalid kb name: {name}");
     }
     Ok(())
+}
+
+#[derive(Debug)]
+pub struct KbSummary {
+    pub name: String,
+    pub document_count: i64,
+    pub chunk_count: i64,
+    pub created_at: String,
+}
+
+pub async fn list_kbs(pool: &PgPool) -> Result<Vec<KbSummary>> {
+    let rows = sqlx::query(
+        "SELECT meta.name, \
+                to_char(meta.created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at, \
+                COUNT(document.id) AS document_count \
+         FROM kb_meta AS meta \
+         LEFT JOIN document ON document.kb_name = meta.name \
+         GROUP BY meta.name, meta.created_at \
+         ORDER BY meta.created_at",
+    )
+    .fetch_all(pool)
+    .await
+    .context("failed to list kbs")?;
+
+    let mut summaries = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.get("name");
+        let chunk_count = count_chunks(pool, &name).await?;
+        summaries.push(KbSummary {
+            document_count: row.get("document_count"),
+            created_at: row.get("created_at"),
+            chunk_count,
+            name,
+        });
+    }
+    Ok(summaries)
+}
+
+/// Chunks live in a per-kb table, so this cannot be folded into [`list_kbs`]'s join.
+pub async fn count_chunks(pool: &PgPool, kb_name: &str) -> Result<i64> {
+    let table_name = kb_table(kb_name)?;
+    sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table_name}")))
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("failed to count chunks in kb {kb_name}"))
+}
+
+/// Drop a kb's chunk table and metadata row; documents and tasks cascade.
+pub async fn delete_kb(pool: &PgPool, kb_name: &str) -> Result<()> {
+    let table_name = kb_table(kb_name)?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .with_context(|| format!("failed to begin deletion of kb {kb_name}"))?;
+
+    let deleted = sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+        .bind(kb_name)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to delete metadata for kb {kb_name}"))?;
+    anyhow::ensure!(deleted.rows_affected() == 1, "kb {kb_name} does not exist");
+
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE {table_name}")))
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to drop chunk table for kb {kb_name}"))?;
+
+    transaction
+        .commit()
+        .await
+        .with_context(|| format!("failed to commit deletion of kb {kb_name}"))
+}
+
+/// Pending, running and failed task counts for one kb.
+pub async fn count_kb_tasks(pool: &PgPool, kb_name: &str) -> Result<(i64, i64, i64)> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) FILTER (WHERE task.status = 'pending')  AS pending, \
+                COUNT(*) FILTER (WHERE task.status = 'running')  AS running, \
+                COUNT(*) FILTER (WHERE task.status = 'failed')   AS failed \
+         FROM task JOIN document ON document.id = task.document_id \
+         WHERE document.kb_name = $1",
+    )
+    .bind(kb_name)
+    .fetch_one(pool)
+    .await
+    .with_context(|| format!("failed to count tasks for kb {kb_name}"))?;
+    Ok((row.get("pending"), row.get("running"), row.get("failed")))
 }
 
 pub struct ChunkRow {
@@ -427,6 +489,99 @@ pub async fn register_document(
     .await
     .context("failed to register document")?;
     Ok(row.get("id"))
+}
+
+#[derive(Debug)]
+pub struct DocumentSummary {
+    pub id: i64,
+    pub filename: String,
+    pub chunk_count: i64,
+    pub task_status: Option<String>,
+    pub updated_at: String,
+}
+
+pub async fn list_documents(pool: &PgPool, kb_name: &str) -> Result<Vec<DocumentSummary>> {
+    let table_name = kb_table(kb_name)?;
+    let rows = sqlx::query(AssertSqlSafe(format!(
+        "SELECT document.id, document.filename, \
+                to_char(document.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at, \
+                COUNT(chunk.chunk_id) AS chunk_count, \
+                (SELECT status FROM task WHERE task.document_id = document.id \
+                 ORDER BY task.created_at DESC LIMIT 1) AS task_status \
+         FROM document \
+         LEFT JOIN {table_name} AS chunk ON chunk.document_id = document.id \
+         WHERE document.kb_name = $1 \
+         GROUP BY document.id, document.filename, document.updated_at \
+         ORDER BY document.id"
+    )))
+    .bind(kb_name)
+    .fetch_all(pool)
+    .await
+    .with_context(|| format!("failed to list documents in kb {kb_name}"))?;
+
+    Ok(rows
+        .iter()
+        .map(|row| DocumentSummary {
+            id: row.get("id"),
+            filename: row.get("filename"),
+            chunk_count: row.get("chunk_count"),
+            task_status: row.get("task_status"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect())
+}
+
+/// Delete one document; its chunks and tasks cascade.
+pub async fn delete_document(pool: &PgPool, kb_name: &str, document_id: i64) -> Result<String> {
+    validate_kb_name(kb_name)?;
+    let filename: Option<String> =
+        sqlx::query_scalar("DELETE FROM document WHERE id = $1 AND kb_name = $2 RETURNING filename")
+            .bind(document_id)
+            .bind(kb_name)
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("failed to delete document {document_id}"))?;
+    filename.with_context(|| format!("document {document_id} does not exist in kb {kb_name}"))
+}
+
+/// Look up a document's filename, confirming it belongs to `kb_name`.
+pub async fn document_filename(pool: &PgPool, kb_name: &str, document_id: i64) -> Result<String> {
+    validate_kb_name(kb_name)?;
+    let filename: Option<String> =
+        sqlx::query_scalar("SELECT filename FROM document WHERE id = $1 AND kb_name = $2")
+            .bind(document_id)
+            .bind(kb_name)
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("failed to load document {document_id}"))?;
+    filename.with_context(|| format!("document {document_id} does not exist in kb {kb_name}"))
+}
+
+/// Overwrite an existing document's content, leaving its id and chunks in place.
+///
+/// The chunks are replaced wholesale by [`replace_document_chunks`] once the
+/// queued task runs.
+pub async fn replace_document_content(
+    pool: &PgPool,
+    kb_name: &str,
+    document_id: i64,
+    content: &str,
+) -> Result<()> {
+    validate_kb_name(kb_name)?;
+    let result = sqlx::query(
+        "UPDATE document SET content = $3, updated_at = now() WHERE id = $1 AND kb_name = $2",
+    )
+    .bind(document_id)
+    .bind(kb_name)
+    .bind(content)
+    .execute(pool)
+    .await
+    .with_context(|| format!("failed to update document {document_id}"))?;
+    anyhow::ensure!(
+        result.rows_affected() == 1,
+        "document {document_id} does not exist in kb {kb_name}"
+    );
+    Ok(())
 }
 
 pub async fn mark_document_parsed(
