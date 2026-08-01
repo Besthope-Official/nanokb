@@ -33,10 +33,17 @@ pub async fn initialize(pool: &PgPool) -> Result<()> {
 }
 
 async fn ensure_pgvector(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
-        .execute(&mut **transaction)
-        .await
-        .context("failed to create pgvector extension")?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+    )
+    .fetch_one(&mut **transaction)
+    .await
+    .context("failed to check pgvector extension")?;
+
+    anyhow::ensure!(
+        exists,
+        "pgvector extension is not installed; run 'CREATE EXTENSION vector;' as superuser first"
+    );
     Ok(())
 }
 
