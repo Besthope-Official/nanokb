@@ -614,7 +614,7 @@ pub async fn insert_task(pool: &PgPool, document_id: i64, priority: i32) -> Resu
     Ok(row.get("id"))
 }
 
-pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
+pub async fn fetch_and_lock_pending(pool: &PgPool, kb_name: &str) -> Result<Option<TaskRow>> {
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
     let row = sqlx::query(
@@ -622,11 +622,12 @@ pub async fn fetch_and_lock_pending(pool: &PgPool) -> Result<Option<TaskRow>> {
                 task.status, task.error_message
          FROM task
          JOIN document ON document.id = task.document_id
-         WHERE task.status = 'pending'
+         WHERE task.status = 'pending' AND document.kb_name = $1
          ORDER BY task.priority DESC, task.created_at
          LIMIT 1
          FOR UPDATE SKIP LOCKED",
     )
+    .bind(kb_name)
     .fetch_optional(&mut *tx)
     .await
     .context("failed to fetch pending task")?;
@@ -678,10 +679,15 @@ pub async fn mark_task_failed(pool: &PgPool, task_id: i64, error_message: &str) 
     Ok(())
 }
 
-pub async fn cancel_all_running(pool: &PgPool) -> Result<u64> {
+pub async fn cancel_all_running(pool: &PgPool, kb_name: &str) -> Result<u64> {
     let result = sqlx::query(
-        "UPDATE task SET status = 'canceled', updated_at = now() WHERE status = 'running'",
+        "UPDATE task SET status = 'canceled', updated_at = now() \
+         FROM document \
+         WHERE task.document_id = document.id \
+           AND task.status = 'running' \
+           AND document.kb_name = $1",
     )
+    .bind(kb_name)
     .execute(pool)
     .await
     .context("failed to cancel running tasks")?;
@@ -719,15 +725,25 @@ pub async fn notify_task_completed(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
-pub async fn count_active_tasks(pool: &PgPool) -> Result<(i64, i64)> {
-    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE status = 'pending'")
-        .fetch_one(pool)
-        .await
-        .context("failed to count pending tasks")?;
-    let running: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE status = 'running'")
-        .fetch_one(pool)
-        .await
-        .context("failed to count running tasks")?;
+pub async fn count_active_tasks(pool: &PgPool, kb_name: &str) -> Result<(i64, i64)> {
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task \
+         JOIN document ON document.id = task.document_id \
+         WHERE task.status = 'pending' AND document.kb_name = $1",
+    )
+    .bind(kb_name)
+    .fetch_one(pool)
+    .await
+    .context("failed to count pending tasks")?;
+    let running: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task \
+         JOIN document ON document.id = task.document_id \
+         WHERE task.status = 'running' AND document.kb_name = $1",
+    )
+    .bind(kb_name)
+    .fetch_one(pool)
+    .await
+    .context("failed to count running tasks")?;
     Ok((pending, running))
 }
 

@@ -130,14 +130,14 @@ impl Progress {
     }
 }
 
-const ABOUT: &str = "nanokb - a tiny local knowledge base";
-
-const EPILOGUE: &str = "\
-A kb's chunking and embedding configuration is immutable: kb create snapshots
-it from config.yaml, and every later command reads it back from the kb itself.";
-
 #[derive(Parser)]
-#[command(name = "nanokb", about = ABOUT, after_help = EPILOGUE, arg_required_else_help = true)]
+#[command(
+    name = "nanokb",
+    about = "nanokb - a tiny local knowledge base",
+    after_help = "A kb's chunking and embedding configuration is immutable: kb create snapshots\n\
+                  it from config.yaml, and every later command reads it back from the kb itself.",
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: TopLevelCommand,
@@ -311,13 +311,19 @@ async fn run_query(
     kb_name: &str,
     query_text: &str,
 ) -> Result<()> {
-    let model = EmbedClient::from_config(config.embedding()?)?
+    let meta = postgres::load_kb_meta(pool, kb_name).await?;
+    let stored_model = meta
+        .embed_config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
+    let embedding_config = config.embedding_for_model(stored_model)?;
+    let model = EmbedClient::from_config(embedding_config)?
         .dimension()
         .await?;
-    let meta = postgres::load_kb_meta(pool, kb_name).await?;
     anyhow::ensure!(
         model.dimension == meta.dimension,
-        "kb {kb_name} stores {}d vectors but the configured model returns {}d",
+        "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
         meta.dimension,
         model.dimension
     );
@@ -409,12 +415,13 @@ async fn drain_tasks(
         let pipeline = pipeline.clone();
         let progress = progress.clone();
         let rx = shutdown_rx.clone();
+        let kb = kb_name.to_string();
         handles.push(tokio::spawn(async move {
-            task::run_worker(pool, config, pipeline, progress, rx).await;
+            task::run_worker(pool, config, pipeline, progress, kb, rx).await;
         }));
     }
 
-    let completed_normally = wait_all_done(pool, &progress).await;
+    let completed_normally = wait_all_done(pool, kb_name, &progress).await;
 
     let _ = shutdown_tx.send(true);
     for handle in handles {
@@ -424,7 +431,7 @@ async fn drain_tasks(
     progress.teardown();
 
     if !completed_normally {
-        let canceled = postgres::cancel_all_running(pool).await?;
+        let canceled = postgres::cancel_all_running(pool, kb_name).await?;
         if canceled > 0 {
             eprintln!("canceled {canceled} running tasks");
         }
@@ -434,8 +441,8 @@ async fn drain_tasks(
     Ok(())
 }
 
-/// Returns true if all tasks completed, false if interrupted by ctrl_c.
-async fn wait_all_done(pool: &sqlx::PgPool, progress: &Progress) -> bool {
+/// Returns true if all kb tasks completed, false if interrupted by ctrl_c.
+async fn wait_all_done(pool: &sqlx::PgPool, kb_name: &str, progress: &Progress) -> bool {
     let mut listener = match postgres::listen_on(pool, "task_completed").await {
         Ok(l) => l,
         Err(e) => {
@@ -445,7 +452,7 @@ async fn wait_all_done(pool: &sqlx::PgPool, progress: &Progress) -> bool {
     };
 
     // Check in case all tasks finished before the listener was set up.
-    match postgres::count_active_tasks(pool).await {
+    match postgres::count_active_tasks(pool, kb_name).await {
         Ok((0, 0)) => return true,
         Err(e) => progress.log(format!("failed to check task status: {e:#}")),
         _ => {}
@@ -464,7 +471,7 @@ async fn wait_all_done(pool: &sqlx::PgPool, progress: &Progress) -> bool {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
-        match postgres::count_active_tasks(pool).await {
+        match postgres::count_active_tasks(pool, kb_name).await {
             Ok((0, 0)) => return true,
             Err(e) => progress.log(format!("failed to check task status: {e:#}")),
             _ => {}

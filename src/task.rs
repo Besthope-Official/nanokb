@@ -68,6 +68,7 @@ pub async fn run_worker(
     config: Arc<AppConfig>,
     pipeline: Arc<Pipeline>,
     progress: Arc<Progress>,
+    kb_name: String,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let poll_timeout = Duration::from_secs(config.pipeline.worker_poll_timeout_secs);
@@ -86,7 +87,7 @@ pub async fn run_worker(
             break;
         }
 
-        match postgres::fetch_and_lock_pending(&pool).await {
+        match postgres::fetch_and_lock_pending(&pool, &kb_name).await {
             Ok(Some(row)) => {
                 let task_id = row.id;
                 match Task::try_from(row) {

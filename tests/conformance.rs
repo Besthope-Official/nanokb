@@ -61,7 +61,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .await?;
     let task_id = insert_task(&pool, document_id, 0).await?;
 
-    let task = fetch_and_lock_pending(&pool).await?.expect("pending task");
+    let task = fetch_and_lock_pending(&pool, KB_NAME).await?.expect("pending task");
     assert_eq!(task.id, task_id);
     assert_eq!(task.document_id, document_id);
     assert_eq!(task.filename, "guide.md");
