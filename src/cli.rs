@@ -1,9 +1,9 @@
 use crate::pipeline::Pipeline;
 use crate::{AppConfig, EmbedClient, postgres, task};
 use anyhow::{Context, Result};
-use std::env;
+use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -130,254 +130,122 @@ impl Progress {
     }
 }
 
-/// One invocable command, named by the path of words that selects it.
-///
-/// The table below is the single source of truth for dispatch, argument names,
-/// arity and help text, so a command cannot document one signature and accept
-/// another.
-struct Command {
-    path: &'static [&'static str],
-    params: &'static [&'static str],
-    about: &'static str,
-}
-
-const COMMANDS: &[Command] = &[
-    Command {
-        path: &["kb", "create"],
-        params: &["name"],
-        about: "Create a kb from config.yaml (or pass a second path)",
-    },
-    Command {
-        path: &["kb", "delete"],
-        params: &["name"],
-        about: "Delete a kb with all its docs and chunks",
-    },
-    Command {
-        path: &["kb", "list"],
-        params: &[],
-        about: "List every kb",
-    },
-    Command {
-        path: &["kb", "info"],
-        params: &["name"],
-        about: "Show one kb's config, counts and task state",
-    },
-    Command {
-        path: &["doc", "add"],
-        params: &["kb", "source"],
-        about: "Ingest a file, or every supported file in a directory",
-    },
-    Command {
-        path: &["doc", "update"],
-        params: &["kb", "doc-id", "path"],
-        about: "Re-read a doc from path and rebuild its chunks",
-    },
-    Command {
-        path: &["doc", "remove"],
-        params: &["kb", "doc-id"],
-        about: "Delete a doc and its chunks",
-    },
-    Command {
-        path: &["doc", "list"],
-        params: &["kb"],
-        about: "List the docs in a kb",
-    },
-    Command {
-        path: &["query"],
-        params: &["kb", "text"],
-        about: "Return the top_k nearest chunks in a kb",
-    },
-    Command {
-        path: &["flush-db"],
-        params: &[],
-        about: "Drop every nanokb table",
-    },
-    Command {
-        path: &["help"],
-        params: &[],
-        about: "Show this message",
-    },
-];
-
 const ABOUT: &str = "nanokb - a tiny local knowledge base";
 
 const EPILOGUE: &str = "\
 A kb's chunking and embedding configuration is immutable: kb create snapshots
 it from config.yaml, and every later command reads it back from the kb itself.";
 
-impl Command {
-    /// `kb create <spec.yaml>`
-    fn usage(&self) -> String {
-        let mut usage = self.path.join(" ");
-        for param in self.params {
-            usage.push_str(&format!(" <{param}>"));
-        }
-        usage
-    }
+#[derive(Parser)]
+#[command(name = "nanokb", about = ABOUT, after_help = EPILOGUE, arg_required_else_help = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: TopLevelCommand,
 }
 
-fn help() -> String {
-    let usages: Vec<String> = COMMANDS.iter().map(Command::usage).collect();
-    let width = usages.iter().map(String::len).max().unwrap_or(0);
-    let mut help = format!("{ABOUT}\n\nUsage:\n");
-    for (command, usage) in COMMANDS.iter().zip(&usages) {
-        help.push_str(&format!(
-            "  nanokb {usage:<width$}  {}\n",
-            command.about,
-            width = width
-        ));
-    }
-    help.push_str(&format!("\n{EPILOGUE}\n"));
-    help
+#[derive(Subcommand)]
+enum TopLevelCommand {
+    #[command(about = "Manage knowledge bases")]
+    Kb {
+        #[command(subcommand)]
+        command: KbCommand,
+    },
+    #[command(about = "Manage knowledge base documents")]
+    Doc {
+        #[command(subcommand)]
+        command: DocCommand,
+    },
+    #[command(about = "Return the top_k nearest chunks in a kb")]
+    Query { kb: String, text: String },
+    #[command(name = "flush-db", about = "Drop every nanokb table")]
+    FlushDb,
 }
 
-/// The arguments of the command selected by `words`, in declaration order.
-///
-/// Returns an error naming the first missing parameter, or listing the
-/// alternatives when no command matches.
-fn parse(words: &[String]) -> Result<(&'static Command, Vec<&str>)> {
-    let command = COMMANDS
-        .iter()
-        .find(|command| {
-            command.path.len() <= words.len()
-                && command
-                    .path
-                    .iter()
-                    .zip(words)
-                    .all(|(expected, word)| expected == word)
-        })
-        .ok_or_else(|| unknown_command(words))?;
-
-    let given = &words[command.path.len()..];
-    for (index, param) in command.params.iter().enumerate() {
-        let missing = match given.get(index) {
-            Some(value) => value.trim().is_empty(),
-            None => true,
-        };
-        anyhow::ensure!(
-            !missing,
-            "missing <{param}>; usage: nanokb {}",
-            command.usage()
-        );
-    }
-    // `kb create` accepts an optional second argument: the config path.
-    let is_kb_create = command.path == ["kb", "create"];
-    let max = if is_kb_create {
-        command.params.len() + 1
-    } else {
-        command.params.len()
-    };
-    anyhow::ensure!(
-        given.len() <= max,
-        "unexpected argument {:?}; usage: nanokb {}",
-        given[max],
-        command.usage()
-    );
-
-    Ok((command, given.iter().map(String::as_str).collect()))
+#[derive(Subcommand)]
+enum KbCommand {
+    #[command(about = "Create a kb from config.yaml or a provided config path")]
+    Create {
+        name: String,
+        config_path: Option<PathBuf>,
+    },
+    #[command(about = "Delete a kb with all its docs and chunks")]
+    Delete { name: String },
+    #[command(about = "List every kb")]
+    List,
+    #[command(about = "Show one kb's config, counts and task state")]
+    Info { name: String },
 }
 
-/// Suggest the commands reachable from however much of `words` did match.
-fn unknown_command(words: &[String]) -> anyhow::Error {
-    let prefix_length = COMMANDS
-        .iter()
-        .map(|command| {
-            command
-                .path
-                .iter()
-                .zip(words)
-                .take_while(|(expected, word)| expected == word)
-                .count()
-        })
-        .max()
-        .unwrap_or(0);
-
-    let expected: Vec<&str> = COMMANDS
-        .iter()
-        .filter(|command| {
-            command.path.len() > prefix_length && command.path[..prefix_length] == words[..prefix_length]
-        })
-        .map(|command| command.path[prefix_length])
-        .collect();
-
-    let given = words.get(prefix_length).map(String::as_str).unwrap_or("");
-    let scope = words[..prefix_length].join(" ");
-    let mut deduplicated = Vec::new();
-    for name in expected {
-        if !deduplicated.contains(&name) {
-            deduplicated.push(name);
-        }
-    }
-    if scope.is_empty() {
-        anyhow::anyhow!(
-            "unknown command {given:?}; expected one of: {}",
-            deduplicated.join(", ")
-        )
-    } else {
-        anyhow::anyhow!(
-            "unknown {scope} subcommand {given:?}; expected one of: {}",
-            deduplicated.join(", ")
-        )
-    }
+#[derive(Subcommand)]
+enum DocCommand {
+    #[command(about = "Ingest a file, or every supported file in a directory")]
+    Add { kb: String, source: String },
+    #[command(about = "Re-read a doc from path and rebuild its chunks")]
+    Update {
+        kb: String,
+        doc_id: i64,
+        path: String,
+    },
+    #[command(about = "Delete a doc and its chunks")]
+    Remove { kb: String, doc_id: i64 },
+    #[command(about = "List the docs in a kb")]
+    List { kb: String },
 }
 
 pub async fn run() -> Result<()> {
-    let words: Vec<String> = env::args_os()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-
-    if words.is_empty() || matches!(words[0].as_str(), "help" | "-h" | "--help") {
-        print!("{}", help());
-        return Ok(());
-    }
-
-    let (command, args) = parse(&words)?;
+    let cli = Cli::parse();
 
     let config = AppConfig::try_load_from("config.yaml")
         .context("failed to load application configuration")?;
     let pool = postgres::connect(&config.database.url).await?;
 
-    if command.path != ["flush-db"] {
+    if !matches!(cli.command, TopLevelCommand::FlushDb) {
         postgres::initialize(&pool).await?;
     }
 
-    match command.path {
-        ["kb", "create"] => {
-            let config_path = args.get(1).copied().unwrap_or("config.yaml");
+    match cli.command {
+        TopLevelCommand::Kb {
+            command: KbCommand::Create { name, config_path },
+        } => {
+            let config_path = config_path.as_deref().unwrap_or(Path::new("config.yaml"));
             let create_config = AppConfig::try_load_from(config_path)
-                .with_context(|| format!("failed to load config from {config_path}"))?;
-            Pipeline::create_kb(&pool, &create_config, args[0]).await?;
-            println!("created kb '{}'", args[0]);
+                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            Pipeline::create_kb(&pool, &create_config, &name).await?;
+            println!("created kb '{name}'");
             Ok(())
         }
-        ["kb", "delete"] => {
-            postgres::delete_kb(&pool, args[0]).await?;
-            println!("deleted kb '{}'", args[0]);
+        TopLevelCommand::Kb {
+            command: KbCommand::Delete { name },
+        } => {
+            postgres::delete_kb(&pool, &name).await?;
+            println!("deleted kb '{name}'");
             Ok(())
         }
-        ["kb", "list"] => run_kb_list(&pool).await,
-        ["kb", "info"] => run_kb_info(&pool, args[0]).await,
-        ["doc", "add"] => run_doc_add(&config, &pool, args[0], args[1]).await,
-        ["doc", "update"] => {
-            run_doc_update(&config, &pool, args[0], parse_doc_id(args[1])?, args[2]).await
-        }
-        ["doc", "remove"] => {
-            let document_id = parse_doc_id(args[1])?;
-            let filename = postgres::delete_document(&pool, args[0], document_id).await?;
-            println!("removed doc {document_id} ({filename}) from kb '{}'", args[0]);
+        TopLevelCommand::Kb {
+            command: KbCommand::List,
+        } => run_kb_list(&pool).await,
+        TopLevelCommand::Kb {
+            command: KbCommand::Info { name },
+        } => run_kb_info(&pool, &name).await,
+        TopLevelCommand::Doc {
+            command: DocCommand::Add { kb, source },
+        } => run_doc_add(&config, &pool, &kb, &source).await,
+        TopLevelCommand::Doc {
+            command: DocCommand::Update { kb, doc_id, path },
+        } => run_doc_update(&config, &pool, &kb, doc_id, &path).await,
+        TopLevelCommand::Doc {
+            command: DocCommand::Remove { kb, doc_id },
+        } => {
+            let filename = postgres::delete_document(&pool, &kb, doc_id).await?;
+            println!("removed doc {doc_id} ({filename}) from kb '{kb}'");
             Ok(())
         }
-        ["doc", "list"] => run_doc_list(&pool, args[0]).await,
-        ["query"] => run_query(&config, &pool, args[0], args[1]).await,
-        ["flush-db"] => postgres::flush_db(&pool).await,
-        path => anyhow::bail!("command {} is declared but not wired up", path.join(" ")),
+        TopLevelCommand::Doc {
+            command: DocCommand::List { kb },
+        } => run_doc_list(&pool, &kb).await,
+        TopLevelCommand::Query { kb, text } => run_query(&config, &pool, &kb, &text).await,
+        TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
-}
-
-fn parse_doc_id(raw: &str) -> Result<i64> {
-    raw.parse()
-        .with_context(|| format!("<doc-id> must be an integer, got {raw:?}"))
 }
 
 async fn run_kb_list(pool: &sqlx::PgPool) -> Result<()> {
@@ -601,5 +469,25 @@ async fn wait_all_done(pool: &sqlx::PgPool, progress: &Progress) -> bool {
             Err(e) => progress.log(format!("failed to check task status: {e:#}")),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kb_create_with_an_optional_config_path() {
+        let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "recipe.yaml"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Kb {
+                command: KbCommand::Create {
+                    name,
+                    config_path: Some(config_path),
+                },
+            } if name == "books" && config_path == PathBuf::from("recipe.yaml")
+        ));
     }
 }
