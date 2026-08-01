@@ -13,9 +13,15 @@ pub async fn run() -> Result<()> {
     let config = AppConfig::try_load_from("config.yaml")
         .context("failed to load application configuration")?;
     let pool = postgres::connect(&config.database.url).await?;
-    postgres::initialize(&pool).await?;
 
-    match args.next().as_deref().and_then(|s| s.to_str()) {
+    let command = args.next();
+    let command = command.as_deref().and_then(|s| s.to_str());
+
+    if command != Some("flush-db") {
+        postgres::initialize(&pool).await?;
+    }
+
+    match command {
         Some("query") => {
             let query_text = args
                 .next()
