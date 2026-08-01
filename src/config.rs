@@ -22,6 +22,8 @@ pub struct AppConfig {
 pub struct PipelineConfig {
     #[serde(default = "default_kb_name")]
     pub kb_name: String,
+    #[serde(default = "default_embedding")]
+    pub embedding: String,
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
     #[serde(default = "default_embed_batch_size")]
@@ -42,6 +44,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             kb_name: default_kb_name(),
+            embedding: default_embedding(),
             worker_count: default_worker_count(),
             embed_batch_size: default_embed_batch_size(),
             top_k: default_top_k(),
@@ -65,6 +68,10 @@ impl PipelineConfig {
 
 fn default_kb_name() -> String {
     "test".to_string()
+}
+
+fn default_embedding() -> String {
+    "default".to_string()
 }
 
 fn default_worker_count() -> usize {
@@ -106,7 +113,7 @@ pub struct DatabaseConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    pub embedding: EmbeddingConfig,
+    pub embeddings: HashMap<String, EmbeddingConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -155,6 +162,20 @@ impl Default for IndexConfig {
 }
 
 impl AppConfig {
+    pub fn embedding(&self) -> Result<&EmbeddingConfig> {
+        let name = &self.pipeline.embedding;
+        self.model.embeddings.get(name).ok_or_else(|| {
+            let mut available: Vec<&str> =
+                self.model.embeddings.keys().map(String::as_str).collect();
+            available.sort_unstable();
+            anyhow::anyhow!(
+                "pipeline.embedding refers to unknown provider {name:?}; \
+                 model.embeddings defines: {}",
+                available.join(", ")
+            )
+        })
+    }
+
     pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)

@@ -53,6 +53,7 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
             name         TEXT PRIMARY KEY,
             chunk_config JSONB NOT NULL,
             embed_config JSONB NOT NULL,
+            dimension    INTEGER NOT NULL,
             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         )"#,
     )
@@ -151,11 +152,12 @@ pub async fn create_kb(
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
     sqlx::query(
-        "INSERT INTO kb_meta (name, chunk_config, embed_config) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING",
+        "INSERT INTO kb_meta (name, chunk_config, embed_config, dimension) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
     .bind(Json(chunk_config))
     .bind(Json(embed_config))
+    .bind(dimension as i32)
     .execute(&mut *transaction)
     .await
     .with_context(|| format!("failed to insert metadata for kb {name}"))?;
@@ -164,6 +166,44 @@ pub async fn create_kb(
         .commit()
         .await
         .with_context(|| format!("failed to commit kb {name}"))
+}
+
+/// Reject a model whose identity differs from the one the kb was built with.
+///
+/// A kb is bound to the embedding model that produced its vectors: distances
+/// across two models' vector spaces are meaningless even when the dimensions
+/// happen to agree. Returns `Ok(())` for a kb that does not exist yet.
+pub async fn assert_kb_compatible(
+    pool: &PgPool,
+    kb_name: &str,
+    model_name: &str,
+    dimension: usize,
+) -> Result<()> {
+    validate_kb_name(kb_name)?;
+    let Some(row) = sqlx::query("SELECT embed_config, dimension FROM kb_meta WHERE name = $1")
+        .bind(kb_name)
+        .fetch_optional(pool)
+        .await
+        .with_context(|| format!("failed to read metadata for kb {kb_name}"))?
+    else {
+        return Ok(());
+    };
+
+    let embed_config: Value = row.get("embed_config");
+    let stored_model = embed_config
+        .get("model")
+        .and_then(Value::as_str)
+        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
+    let stored_dimension: i32 = row.get("dimension");
+
+    anyhow::ensure!(
+        stored_model == model_name && stored_dimension as usize == dimension,
+        "kb {kb_name} was built with embedding model {stored_model} ({stored_dimension}d) \
+         but the configured model is {model_name} ({dimension}d); \
+         vectors from different models are not comparable — \
+         point pipeline.embedding back at {stored_model}, or run 'flush-db' and rebuild"
+    );
+    Ok(())
 }
 
 fn validate_kb_name(name: &str) -> Result<()> {

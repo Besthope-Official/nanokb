@@ -17,7 +17,7 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub async fn from_config(config: &AppConfig) -> Result<Self> {
-        let model = EmbedClient::from_config(&config.model.embedding)?
+        let model = EmbedClient::from_config(config.embedding()?)?
             .dimension()
             .await?;
         Ok(Self {
@@ -29,6 +29,13 @@ impl Pipeline {
     }
 
     pub async fn prepare_kb(&self, pool: &PgPool, kb_name: &str) -> Result<()> {
+        crate::postgres::assert_kb_compatible(
+            pool,
+            kb_name,
+            &self.model.model_name,
+            self.model.dimension,
+        )
+        .await?;
         let chunk_config = self.chunk_config_json();
         let embed_config = json!({"model": &self.model.model_name});
         crate::postgres::create_kb(

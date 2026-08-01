@@ -167,11 +167,13 @@ pub async fn run() -> Result<()> {
 }
 
 async fn run_query(config: &AppConfig, pool: &sqlx::PgPool, query_text: &str) -> Result<()> {
-    let model = EmbedClient::from_config(&config.model.embedding)?
+    let model = EmbedClient::from_config(config.embedding()?)?
         .dimension()
         .await?;
-    let embedding = model.embed_query(query_text).await?;
     let kb_name = &config.pipeline.kb_name;
+    postgres::assert_kb_compatible(pool, kb_name, &model.model_name, model.dimension).await?;
+
+    let embedding = model.embed_query(query_text).await?;
     let top_k = config.pipeline.top_k;
     let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
 
