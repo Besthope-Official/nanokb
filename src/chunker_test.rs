@@ -461,7 +461,8 @@ fn fixed_single_chunk_when_fits() {
         paragraph("hello"),
         paragraph("world"),
     ]);
-    let chunks = fixed_chunks(&doc, 256, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].text, "hello\n\nworld");
     assert_eq!(chunks[0].embedding_text, "hello\n\nworld");
@@ -474,8 +475,9 @@ fn fixed_uses_token_window_for_cjk_sentence_boundaries() {
         paragraph("alpha。bravo。charlie。"),
     ]);
     let chunk_size = bpe_token_count("alpha。bravo。charlie");
+    let full = doc.full_text();
 
-    let chunks = fixed_chunks(&doc, chunk_size, 0);
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, chunk_size, 0);
 
     assert_eq!(chunks[0].text, "alpha。bravo。");
 }
@@ -489,7 +491,8 @@ fn fixed_splits_document_into_token_windows() {
         paragraph(&p),
         paragraph(&p),
     ]);
-    let chunks = fixed_chunks(&doc, 128, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 128, 0);
     assert!(
         chunks.len() >= 2,
         "expected multiple chunks, got {}",
@@ -507,7 +510,8 @@ fn fixed_hard_splits_when_no_boundary_exists() {
     let big = "A ".repeat(1000);
     // 0: Root -> [1]
     let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph(&big)]);
-    let chunks = fixed_chunks(&doc, 128, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 128, 0);
     assert!(chunks.len() > 1);
     assert!(
         chunks
@@ -527,8 +531,9 @@ fn fixed_starts_next_window_at_configured_token_overlap() {
     let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph(&text)]);
     let chunk_size = 128;
     let overlap_tokens = 32;
+    let full = doc.full_text();
 
-    let chunks = fixed_chunks(&doc, chunk_size, overlap_tokens);
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, chunk_size, overlap_tokens);
     let offsets = bpe_encode(&text).get_offsets().to_vec();
     let start = char_boundary_floor(&text, offsets[chunk_size - overlap_tokens].0);
     let end = char_boundary_floor(&text, offsets[chunk_size * 2 - overlap_tokens - 1].1);
@@ -539,7 +544,8 @@ fn fixed_starts_next_window_at_configured_token_overlap() {
 #[test]
 fn fixed_empty_document_yields_no_chunks() {
     let doc = make_doc(vec![root(vec![])]);
-    let chunks = fixed_chunks(&doc, 256, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
     assert!(chunks.is_empty());
 }
 
@@ -547,8 +553,9 @@ fn fixed_empty_document_yields_no_chunks() {
 fn fixed_chunk_id_is_stable() {
     // 0: Root -> [1]
     let doc = make_doc(vec![root(vec![NodeId(1)]), paragraph("stable content")]);
-    let a = fixed_chunks(&doc, 256, 0);
-    let b = fixed_chunks(&doc, 256, 0);
+    let full = doc.full_text();
+    let a = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
+    let b = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
     assert_eq!(a[0].chunk_id, b[0].chunk_id);
 }
 
@@ -560,7 +567,8 @@ fn fixed_chunk_ids_distinct_across_indices() {
         paragraph(&p),
         paragraph(&p),
     ]);
-    let chunks = fixed_chunks(&doc, 128, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 128, 0);
     assert!(chunks.len() >= 2);
     for i in 1..chunks.len() {
         assert_ne!(chunks[i - 1].chunk_id, chunks[i].chunk_id);
@@ -582,7 +590,8 @@ fn fixed_ignores_heading_structure() {
         heading(2, "Section B", vec![NodeId(4)]),
         paragraph("content b"),
     ]);
-    let chunks = fixed_chunks(&doc, 256, 0);
+    let full = doc.full_text();
+    let chunks = fixed_chunks(&full, &doc.metadata.filename, 256, 0);
     assert_eq!(chunks.len(), 1);
     assert!(chunks[0].text.contains("content a"));
     assert!(chunks[0].text.contains("content b"));

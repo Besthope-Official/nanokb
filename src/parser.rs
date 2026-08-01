@@ -48,6 +48,15 @@ impl StructuredDocument {
         &self.tree[node_id.0]
     }
 
+    /// Collect all content blocks in depth-first order, ignoring heading
+    /// structure. Used by fixed-length chunking which treats the document as
+    /// a flat token stream.
+    pub fn full_text(&self) -> String {
+        let mut texts = Vec::new();
+        collect_content_texts(self, self.node(self.root), &mut texts);
+        texts.join("\n\n")
+    }
+
     fn fmt_children(&self, f: &mut fmt::Formatter<'_>, node: &Node, prefix: &str) -> fmt::Result {
         for (index, &child_id) in node.children.iter().enumerate() {
             let is_last = index == node.children.len() - 1;
@@ -94,6 +103,33 @@ impl fmt::Display for NodeKind {
         match text.char_indices().nth(60) {
             Some((end, _)) => write!(f, "{label} \"{}\"...", &text[..end]),
             None => write!(f, "{label} \"{text}\""),
+        }
+    }
+}
+
+fn collect_content_texts(
+    document: &StructuredDocument,
+    node: &Node,
+    texts: &mut Vec<String>,
+) {
+    for &child_id in &node.children {
+        let child = document.node(child_id);
+        match &child.kind {
+            NodeKind::Heading { .. } => {
+                collect_content_texts(document, child, texts);
+            }
+            _ => {
+                let text = match &child.kind {
+                    NodeKind::Paragraph { text }
+                    | NodeKind::CodeBlock { text }
+                    | NodeKind::MathBlock { text }
+                    | NodeKind::Table { text } => text.clone(),
+                    _ => String::new(),
+                };
+                if !text.is_empty() {
+                    texts.push(text);
+                }
+            }
         }
     }
 }

@@ -57,7 +57,7 @@ impl StructuredDocument {
             ChunkStrategy::Fixed {
                 chunk_size,
                 overlap_tokens,
-            } => fixed_chunks(&self, *chunk_size, *overlap_tokens),
+            } => fixed_chunks(&self.full_text(), &self.metadata.filename, *chunk_size, *overlap_tokens),
         }
     }
 }
@@ -267,44 +267,22 @@ fn flush_content_blocks(
 // fixed-length chunking
 // ---------------------------------------------------------------------------
 
-/// Walk the document tree collecting content blocks in depth-first order,
-/// ignoring heading structure.
-fn collect_content_texts(document: &StructuredDocument, node: &Node) -> Vec<String> {
-    let mut texts = Vec::new();
-    for &child_id in &node.children {
-        let child = document.node(child_id);
-        match &child.kind {
-            NodeKind::Heading { .. } => {
-                texts.extend(collect_content_texts(document, child));
-            }
-            _ => {
-                let text = content_block_text(&child.kind);
-                if !text.is_empty() {
-                    texts.push(text);
-                }
-            }
-        }
-    }
-    texts
-}
-
 fn fixed_chunks(
-    document: &StructuredDocument,
+    full_text: &str,
+    filename: &str,
     chunk_size: usize,
     overlap_tokens: usize,
 ) -> Vec<Chunk> {
     assert!(chunk_size > 0, "fixed chunk size must be greater than zero");
 
-    let texts = collect_content_texts(document, document.node(document.root));
-    if texts.is_empty() {
+    if full_text.is_empty() {
         return vec![];
     }
 
-    let full_text = texts.join("\n\n");
-    let encoding = bpe_encode(&full_text);
+    let encoding = bpe_encode(full_text);
     let total_tokens = encoding.len();
     if total_tokens <= chunk_size {
-        return vec![make_fixed_chunk(&full_text, &document.metadata.filename, 0)];
+        return vec![make_fixed_chunk(full_text, filename, 0)];
     }
 
     let offsets = encoding.get_offsets();
@@ -314,8 +292,8 @@ fn fixed_chunks(
 
     while token_pos < total_tokens {
         let end_pos = (token_pos + chunk_size).min(total_tokens);
-        let byte_start = char_boundary_floor(&full_text, offsets[token_pos].0);
-        let byte_end = char_boundary_floor(&full_text, offsets[end_pos - 1].1);
+        let byte_start = char_boundary_floor(full_text, offsets[token_pos].0);
+        let byte_end = char_boundary_floor(full_text, offsets[end_pos - 1].1);
         let chunk_size_bytes = byte_end - byte_start;
         let bytes = byte_chunk(&full_text.as_bytes()[byte_start..])
             .size(chunk_size_bytes)
@@ -326,7 +304,7 @@ fn fixed_chunks(
         let text = {
             let text = std::str::from_utf8(bytes)
                 .unwrap_or_else(|error| panic!("chunker produced invalid UTF-8: {error}"));
-            make_fixed_chunk(text, &document.metadata.filename, chunks.len())
+            make_fixed_chunk(text, filename, chunks.len())
         };
         chunks.push(text);
 
