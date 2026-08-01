@@ -124,6 +124,9 @@ impl Document {
         let root = NodeId(0);
         let mut node_path: Vec<NodeId> = Vec::new();
         let mut node_text = String::new();
+        // A paragraph holding one display formula and nothing else is a math block.
+        let mut display_math_count = 0usize;
+        let mut has_prose = false;
 
         tree.push(Node {
             kind: NodeKind::Root,
@@ -174,6 +177,8 @@ impl Document {
                         children: Vec::new(),
                     };
                     node_text.clear();
+                    display_math_count = 0;
+                    has_prose = false;
                     let node_id = NodeId(tree.len());
                     tree.push(node);
 
@@ -183,12 +188,27 @@ impl Document {
                     node_path.push(node_id);
                 }
 
-                Event::Text(text)
-                | Event::Code(text)
-                | Event::InlineMath(text)
-                | Event::Html(text)
+                Event::Text(text) | Event::Code(text) | Event::Html(text)
                 | Event::InlineHtml(text) => {
+                    if !text.trim().is_empty() {
+                        has_prose = true;
+                    }
                     node_text.push_str(&text);
+                }
+
+                // Math delimiters are dropped by the parser; restore them so the
+                // text stays valid markdown for downstream embedding.
+                Event::InlineMath(text) => {
+                    has_prose = true;
+                    node_text.push('$');
+                    node_text.push_str(&text);
+                    node_text.push('$');
+                }
+                Event::DisplayMath(text) => {
+                    display_math_count += 1;
+                    node_text.push_str("$$");
+                    node_text.push_str(&text);
+                    node_text.push_str("$$");
                 }
                 Event::SoftBreak => node_text.push(' '),
                 Event::HardBreak => node_text.push('\n'),
@@ -196,6 +216,8 @@ impl Document {
                 Event::End(tag_end) => match tag_end {
                     TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Table => {
                         if let Some(node_id) = node_path.pop() {
+                            let standalone_math =
+                                matches!(tag_end, TagEnd::Paragraph) && !has_prose;
                             match &mut tree[node_id.0].kind {
                                 NodeKind::Paragraph { text }
                                 | NodeKind::CodeBlock { text }
@@ -203,6 +225,13 @@ impl Document {
                                     *text = std::mem::take(&mut node_text);
                                 }
                                 _ => {}
+                            }
+                            if standalone_math
+                                && display_math_count == 1
+                                && let NodeKind::Paragraph { text } = &tree[node_id.0].kind
+                            {
+                                let text = text.clone();
+                                tree[node_id.0].kind = NodeKind::MathBlock { text };
                             }
                         }
                     }
@@ -215,21 +244,6 @@ impl Document {
                     }
                     _ => {}
                 },
-
-                Event::DisplayMath(text) => {
-                    node_text.clear();
-                    let node = Node {
-                        kind: NodeKind::MathBlock {
-                            text: text.to_string(),
-                        },
-                        children: Vec::new(),
-                    };
-                    let node_id = NodeId(tree.len());
-                    tree.push(node);
-                    if let Some(&parent_id) = node_path.last() {
-                        tree[parent_id.0].children.push(node_id);
-                    }
-                }
 
                 _ => {}
             }

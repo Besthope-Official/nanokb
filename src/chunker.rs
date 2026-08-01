@@ -8,7 +8,7 @@ use tokenizers::Tokenizer;
 static BPE_TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
 pub struct Chunk {
-    /// Hash of `embedding_text`.
+    /// Hash of the heading path and the chunk's leading block index within its section.
     pub chunk_id: String,
     pub text: String,
     pub embedding_text: String,
@@ -85,6 +85,7 @@ fn chunk_children(
     chunks: &mut Vec<Chunk>,
 ) {
     let mut block_texts: Vec<String> = Vec::new();
+    let mut block_offset = 0;
 
     for &child_id in &node.children {
         let child = document.node(child_id);
@@ -92,12 +93,14 @@ fn chunk_children(
             NodeKind::Heading { title, .. } => {
                 flush_content_blocks(
                     &block_texts,
+                    block_offset,
                     heading_path,
                     max_chunk_tokens,
                     overlap_ratio,
                     metadata_mode,
                     chunks,
                 );
+                block_offset += block_texts.len();
                 block_texts.clear();
 
                 let mut sub_path = heading_path.to_vec();
@@ -123,6 +126,7 @@ fn chunk_children(
 
     flush_content_blocks(
         &block_texts,
+        block_offset,
         heading_path,
         max_chunk_tokens,
         overlap_ratio,
@@ -149,8 +153,12 @@ fn content_block_text(kind: &NodeKind) -> String {
 ///
 /// A chunk may inherit a consecutive suffix of complete content blocks from the
 /// previous chunk when that suffix fits within the overlap budget.
+///
+/// `block_offset` is the index of `block_texts[0]` within its section, so that
+/// chunk ids stay unique across the successive flushes of one section.
 fn flush_content_blocks(
     block_texts: &[String],
+    block_offset: usize,
     heading_path: &[String],
     max_chunk_tokens: usize,
     overlap_ratio: f32,
@@ -164,7 +172,12 @@ fn flush_content_blocks(
     let full_text = block_texts.join("\n\n");
 
     if bpe_token_count(&full_text) <= max_chunk_tokens {
-        chunks.push(make_chunk(&full_text, heading_path, metadata_mode));
+        chunks.push(make_chunk(
+            &full_text,
+            block_offset,
+            heading_path,
+            metadata_mode,
+        ));
         return;
     }
 
@@ -173,6 +186,9 @@ fn flush_content_blocks(
     let mut overlap_blocks: Vec<String> = Vec::new();
 
     while idx < block_texts.len() {
+        // The first not-yet-packed block identifies the chunk; each iteration
+        // consumes at least one, so this index is unique within the section.
+        let chunk_start = block_offset + idx;
         let mut batch_blocks: Vec<String> = Vec::new();
         let mut batch = String::new();
 
@@ -230,7 +246,7 @@ fn flush_content_blocks(
             overlap_blocks = tail_blocks;
         }
 
-        let chunk = make_chunk(&batch, heading_path, metadata_mode);
+        let chunk = make_chunk(&batch, chunk_start, heading_path, metadata_mode);
         // Oversized content blocks remain valid chunks but surface a diagnostic.
         warn_oversized_chunk(&chunk, max_chunk_tokens);
 
@@ -261,7 +277,12 @@ fn make_breadcrumb(heading_path: &[String]) -> String {
     heading_path.join(" > ")
 }
 
-fn make_chunk(text: &str, heading_path: &[String], metadata_mode: MetadataMode) -> Chunk {
+fn make_chunk(
+    text: &str,
+    block_index: usize,
+    heading_path: &[String],
+    metadata_mode: MetadataMode,
+) -> Chunk {
     let embedding_text = match metadata_mode {
         MetadataMode::None => text.to_string(),
         MetadataMode::Path => {
@@ -274,8 +295,9 @@ fn make_chunk(text: &str, heading_path: &[String], metadata_mode: MetadataMode) 
     };
 
     let mut hasher = DefaultHasher::new();
-    embedding_text.hash(&mut hasher);
-    let chunk_id = format!("{:x}", hasher.finish());
+    heading_path.hash(&mut hasher);
+    block_index.hash(&mut hasher);
+    let chunk_id = format!("{:016x}", hasher.finish());
 
     Chunk {
         chunk_id,

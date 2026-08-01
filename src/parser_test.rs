@@ -109,6 +109,83 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
     assert_eq!(strip_frontmatter(input), None);
 }
 
+fn parse(content: &str) -> StructuredDocument {
+    Document::from_content(content, "math.md")
+        .unwrap()
+        .into_parsed()
+}
+
+fn kinds(document: &StructuredDocument) -> Vec<NodeKind> {
+    document
+        .node(document.root)
+        .children
+        .iter()
+        .map(|&id| document.node(id).kind.clone())
+        .collect()
+}
+
+/// A display formula inline with prose must not discard the surrounding text.
+#[test]
+fn display_math_inside_a_paragraph_keeps_surrounding_prose() {
+    let document = parse("text before $$x=1$$ text after\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "text before $$x=1$$ text after".into()
+        }]
+    );
+}
+
+/// A formula written on its own is a structural block, not prose.
+#[rstest]
+#[case::fenced("para one\n\n$$\nx=1\n$$\n\npara two\n", "$$\nx=1\n$$")]
+#[case::single_line("para one\n\n$$x=1$$\n\npara two\n", "$$x=1$$")]
+fn standalone_display_math_becomes_a_math_block(#[case] input: &str, #[case] expected: &str) {
+    let document = parse(input);
+
+    assert_eq!(
+        kinds(&document),
+        vec![
+            NodeKind::Paragraph {
+                text: "para one".into()
+            },
+            NodeKind::MathBlock {
+                text: expected.into()
+            },
+            NodeKind::Paragraph {
+                text: "para two".into()
+            },
+        ]
+    );
+}
+
+/// Delimiters are dropped by the event stream; the text must stay valid markdown.
+#[test]
+fn inline_math_keeps_its_delimiters() {
+    let document = parse("inline $a=b$ here\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "inline $a=b$ here".into()
+        }]
+    );
+}
+
+/// Two formulas in one paragraph are prose-like, so the paragraph stays a paragraph.
+#[test]
+fn paragraph_with_multiple_display_formulas_stays_a_paragraph() {
+    let document = parse("$$x=1$$\n$$y=2$$\n");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "$$x=1$$ $$y=2$$".into()
+        }]
+    );
+}
+
 #[test]
 fn structured_document_returns_node_by_id() {
     let document = StructuredDocument {
