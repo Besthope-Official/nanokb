@@ -1,6 +1,6 @@
 use crate::cli::Progress;
 use crate::config::AppConfig;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{DocumentInput, Pipeline};
 use crate::postgres::{self, TaskRow};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
@@ -117,13 +117,16 @@ pub async fn run_worker(
 
 async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool, progress: &Progress) {
     let slot = progress.start(&task.filename);
+    let input = DocumentInput {
+        document_id: task.document_id,
+        content: &task.content,
+        filename: &task.filename,
+        kb_name: &task.kb_name,
+    };
     let result = pipeline
         .run(
             pool,
-            task.document_id,
-            &task.content,
-            &task.filename,
-            &task.kb_name,
+            &input,
             &|stage| progress.stage(slot, stage),
             &|info| progress.log(info),
         )

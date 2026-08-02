@@ -34,6 +34,12 @@ pub struct PipelineConfig {
     pub worker_poll_timeout_secs: u64,
     #[serde(default = "default_worker_error_retry_secs")]
     pub worker_error_retry_secs: u64,
+    #[serde(default = "default_chunk_strategy_name")]
+    pub chunk_strategy: String,
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size: usize,
+    #[serde(default = "default_chunk_overlap")]
+    pub chunk_overlap: usize,
 }
 
 impl Default for PipelineConfig {
@@ -46,16 +52,26 @@ impl Default for PipelineConfig {
             chunk_overlap_ratio: default_chunk_overlap_ratio(),
             worker_poll_timeout_secs: default_worker_poll_timeout_secs(),
             worker_error_retry_secs: default_worker_error_retry_secs(),
+            chunk_strategy: default_chunk_strategy_name(),
+            chunk_size: default_chunk_size(),
+            chunk_overlap: default_chunk_overlap(),
         }
     }
 }
 
 impl PipelineConfig {
     pub fn chunk_strategy(&self) -> ChunkStrategy {
-        ChunkStrategy::Layered {
-            max_chunk_tokens: self.max_chunk_tokens,
-            overlap_ratio: self.chunk_overlap_ratio,
-            metadata_mode: MetadataMode::Path,
+        match self.chunk_strategy.as_str() {
+            "fixed" => ChunkStrategy::Fixed {
+                chunk_size: self.chunk_size,
+                overlap_tokens: self.chunk_overlap,
+            },
+            "layered" => ChunkStrategy::Layered {
+                max_chunk_tokens: self.max_chunk_tokens,
+                overlap_ratio: self.chunk_overlap_ratio,
+                metadata_mode: MetadataMode::Path,
+            },
+            other => panic!("unknown pipeline.chunk_strategy {other:?}; expected \"fixed\" or \"layered\""),
         }
     }
 }
@@ -90,6 +106,18 @@ fn default_worker_poll_timeout_secs() -> u64 {
 
 fn default_worker_error_retry_secs() -> u64 {
     5
+}
+
+fn default_chunk_strategy_name() -> String {
+    "layered".to_string()
+}
+
+fn default_chunk_size() -> usize {
+    256
+}
+
+fn default_chunk_overlap() -> usize {
+    25
 }
 
 #[derive(Clone, Deserialize)]

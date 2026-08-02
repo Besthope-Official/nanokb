@@ -29,6 +29,10 @@ pub enum ChunkStrategy {
         overlap_ratio: f32,
         metadata_mode: MetadataMode,
     },
+    Fixed {
+        chunk_size: usize,
+        overlap_tokens: usize,
+    },
 }
 
 impl Default for ChunkStrategy {
@@ -43,13 +47,17 @@ impl Default for ChunkStrategy {
 
 impl StructuredDocument {
     pub fn into_chunks(self, strategy: &ChunkStrategy) -> Vec<Chunk> {
-        let ChunkStrategy::Layered {
-            max_chunk_tokens,
-            overlap_ratio,
-            metadata_mode,
-        } = strategy;
-
-        layered_chunks(&self, *max_chunk_tokens, *overlap_ratio, *metadata_mode)
+        match strategy {
+            ChunkStrategy::Layered {
+                max_chunk_tokens,
+                overlap_ratio,
+                metadata_mode,
+            } => layered_chunks(&self, *max_chunk_tokens, *overlap_ratio, *metadata_mode),
+            ChunkStrategy::Fixed {
+                chunk_size,
+                overlap_tokens,
+            } => fixed_chunks(&self.full_text(), &self.metadata.filename, *chunk_size, *overlap_tokens),
+        }
     }
 }
 
@@ -251,6 +259,146 @@ fn flush_content_blocks(
         warn_oversized_chunk(&chunk, max_chunk_tokens);
 
         chunks.push(chunk);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// fixed-length chunking
+// ---------------------------------------------------------------------------
+
+/// Sentence-boundary delimiters that terminate a chunk-friendly segment.
+const SENTENCE_DELIMITERS: [char; 7] = ['\n', '.', '?', '!', '。', '！', '？'];
+
+fn fixed_chunks(
+    full_text: &str,
+    filename: &str,
+    chunk_size: usize,
+    overlap_tokens: usize,
+) -> Vec<Chunk> {
+    assert!(chunk_size > 0, "fixed chunk size must be greater than zero");
+
+    if full_text.is_empty() {
+        return vec![];
+    }
+
+    let encoding = bpe_encode(full_text);
+    let offsets = encoding.get_offsets();
+    let total_tokens = offsets.len();
+    if total_tokens <= chunk_size {
+        return vec![make_fixed_chunk(full_text, filename, 0)];
+    }
+
+    // Split the token stream into sentence-aligned segments.  A segment
+    // ends at the first token whose text ends with a delimiter, so chunks
+    // never cut mid-sentence when a boundary exists.  BPE byte offsets are
+    // always valid UTF-8 char boundaries, so slicing is safe.  Every token
+    // lands in exactly one segment, and concatenating segments reproduces
+    // full_text exactly — no content is ever dropped.
+    let mut segments: Vec<&str> = Vec::new();
+    let mut seg_start = 0;
+    for i in 0..total_tokens {
+        let (start, end) = offsets[i];
+        if full_text[start..end].ends_with(SENTENCE_DELIMITERS) {
+            push_sentence(&full_text, &offsets, seg_start, i, chunk_size, &mut segments);
+            seg_start = i + 1;
+        }
+    }
+    if seg_start < total_tokens {
+        push_sentence(
+            &full_text,
+            &offsets,
+            seg_start,
+            total_tokens - 1,
+            chunk_size,
+            &mut segments,
+        );
+    }
+
+    let counts: Vec<usize> = segments.iter().map(|s| bpe_token_count(s)).collect();
+
+    let mut chunks = Vec::new();
+    let mut start = 0; // segment index
+
+    while start < segments.len() {
+        // Greedily pack segments from `start`.
+        let mut end = start;
+        let mut batch_tokens = 0;
+        while end < segments.len() {
+            let next = counts[end];
+            if batch_tokens > 0 && batch_tokens + next > chunk_size {
+                break;
+            }
+            batch_tokens += next;
+            end += 1;
+        }
+
+        let text = segments[start..end].concat();
+        chunks.push(make_fixed_chunk(&text, filename, chunks.len()));
+
+        if end >= segments.len() {
+            break;
+        }
+
+        // Overlap: back-track so the next chunk shares ~overlap_tokens of
+        // trailing tokens from the one just emitted.
+        if overlap_tokens > 0 {
+            let mut back = 0;
+            let mut tokens = 0;
+            for i in (start..end).rev() {
+                let t = counts[i];
+                if tokens > 0 && tokens + t > overlap_tokens {
+                    break;
+                }
+                tokens += t;
+                back += 1;
+            }
+            // Always advance at least one segment so overlap never
+            // backtracks to the same position, which would loop forever.
+            start = end.saturating_sub(back).max(start + 1);
+        } else {
+            start = end;
+        }
+    }
+
+    chunks
+}
+
+/// Emit a sentence (token span `first..=last`, inclusive of its terminating
+/// delimiter) as one segment, or hard-split it when it exceeds `chunk_size`.
+///
+/// A sentence contains no internal sentence boundary by construction — the
+/// next delimiter token would have ended it earlier — so there is nothing
+/// to split at except token boundaries.
+fn push_sentence<'a>(
+    full_text: &'a str,
+    offsets: &[(usize, usize)],
+    first: usize,
+    last: usize,
+    chunk_size: usize,
+    out: &mut Vec<&'a str>,
+) {
+    if last - first + 1 <= chunk_size {
+        out.push(&full_text[offsets[first].0..offsets[last].1]);
+        return;
+    }
+    let mut t = first;
+    while t <= last {
+        let end = (t + chunk_size - 1).min(last);
+        out.push(&full_text[offsets[t].0..offsets[end].1]);
+        t = end + 1;
+    }
+}
+
+fn make_fixed_chunk(text: &str, filename: &str, chunk_index: usize) -> Chunk {
+    let mut hasher = DefaultHasher::new();
+    filename.hash(&mut hasher);
+    chunk_index.hash(&mut hasher);
+    let chunk_id = format!("{:016x}", hasher.finish());
+
+    Chunk {
+        chunk_id,
+        text: text.to_string(),
+        embedding_text: text.to_string(),
     }
 }
 
