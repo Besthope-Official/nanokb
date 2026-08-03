@@ -1,14 +1,18 @@
 use anyhow::{Context, Result};
 use nanokb::AppConfig;
 use nanokb::postgres::{
-    ChunkRow, connect, create_index, create_kb, fetch_and_lock_pending, initialize, insert_task,
-    mark_document_parsed, register_document, replace_document_chunks,
+    ChunkRow, connect, create_index, create_kb, create_marker_index, fetch_and_lock_pending,
+    initialize, insert_task, mark_document_parsed, query_markers,
+    register_document, replace_document_chunks,
 };
+use nanokb::IndexConfig;
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 
 const KB_NAME: &str = "config_conformance";
 const KB_TABLE: &str = "kb_config_conformance";
+const MARKER_KB_NAME: &str = "marker_conformance";
+const MARKER_KB_TABLE: &str = "kb_marker_conformance";
 
 #[tokio::test]
 #[ignore = "requires the Docker Compose pgvector service"]
@@ -29,7 +33,16 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
 
     let chunk_config = json!({"strategy": "layered", "max_chunk_tokens": 256});
     let embed_config = json!({"model": "conformance", "dimension": 3});
-    create_kb(&pool, KB_NAME, 3, &chunk_config, &embed_config).await?;
+    create_kb(
+        &pool,
+        KB_NAME,
+        Some(3),
+        &chunk_config,
+        Some(&embed_config),
+        None,
+        "vector",
+    )
+    .await?;
 
     let vector_type: String = sqlx::query_scalar(
         "SELECT format_type(attribute.atttypid, attribute.atttypmod) \
@@ -43,13 +56,33 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .context("failed to inspect the conformance KB embedding column")?;
     assert_eq!(vector_type, "vector(3)");
 
-    let stored_config: (serde_json::Value, serde_json::Value) =
-        sqlx::query_as("SELECT chunk_config, embed_config FROM kb_meta WHERE name = $1")
+    let marker_type: (String, bool) = sqlx::query_as(
+        "SELECT format_type(attribute.atttypid, attribute.atttypmod), \
+                attribute.attnotnull \
+         FROM pg_attribute AS attribute \
+         JOIN pg_class AS relation ON relation.oid = attribute.attrelid \
+         WHERE relation.relname = $1 AND attribute.attname = 'marker_embedding'",
+    )
+    .bind(KB_TABLE)
+    .fetch_one(&pool)
+    .await
+    .context("failed to inspect the conformance KB marker_embedding column")?;
+    assert_eq!(marker_type, ("vector(3)".into(), true));
+
+    let stored_config: (serde_json::Value, serde_json::Value, String) =
+        sqlx::query_as("SELECT chunk_config, embed_config, query_mode FROM kb_meta WHERE name = $1")
             .bind(KB_NAME)
             .fetch_one(&pool)
             .await
             .context("failed to load persisted conformance KB configuration")?;
-    assert_eq!(stored_config, (chunk_config, embed_config));
+    assert_eq!(
+        stored_config,
+        (
+            chunk_config.clone(),
+            embed_config.clone(),
+            "vector".into()
+        )
+    );
 
     let content = "# Test Guide\n\nThis is a conformance test document.\n";
     let document_id = register_document(&pool, KB_NAME, content, "guide.md").await?;
@@ -77,9 +110,21 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
             text: "Introduction".into(),
             embedding_text: "Guide\n\nIntroduction".into(),
             embedding: vec![0.1, 0.2, 0.3],
+            marker_embedding: vec![0.4, 0.5, 0.6],
+            markers: vec!["guide".into(), "introduction".into()],
         }],
     )
     .await?;
+
+    let query_emb = vec![0.1_f32, 0.2, 0.3];
+    let marker_hits = query_markers(&pool, KB_NAME, &query_emb, 5).await?;
+    assert_eq!(marker_hits.len(), 1);
+    assert_eq!(marker_hits[0].chunk_id, "intro");
+    assert!(marker_hits[0].marker_distance >= 0.0, "marker distance should be non-negative");
+    assert_eq!(marker_hits[0].markers, vec!["guide", "introduction"]);
+    let far_hits = query_markers(&pool, KB_NAME, &[1.0, 1.0, 1.0], 5).await?;
+    assert!(far_hits[0].marker_distance > marker_hits[0].marker_distance,
+        "farther embedding should have larger distance");
 
     let document: (String, String, String, serde_json::Value) = sqlx::query_as(
         "SELECT kb_name, filename, content, frontmatter FROM document WHERE id = $1",
@@ -148,6 +193,46 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .context("failed to inspect index access method")?;
     assert_eq!(index_method, "hnsw", "index should use HNSW access method");
 
+    create_marker_index(
+        &pool,
+        KB_NAME,
+        &IndexConfig::Hnsw {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 40,
+        },
+    )
+    .await?;
+    let marker_index_name = format!("idx_{KB_TABLE}_marker_embedding");
+    let marker_index_method: String = sqlx::query_scalar(
+        "SELECT am.amname FROM pg_index i \
+             JOIN pg_class rel ON rel.oid = i.indexrelid \
+             JOIN pg_am am ON am.oid = rel.relam \
+             WHERE rel.relname = $1",
+    )
+    .bind(&marker_index_name)
+    .fetch_one(&pool)
+    .await
+    .context("failed to inspect marker index access method")?;
+    assert_eq!(marker_index_method, "hnsw", "marker index should use HNSW");
+
+    // --- LLM without embedding is rejected ---
+    let llm_only_error = create_kb(
+        &pool,
+        MARKER_KB_NAME,
+        None,
+        &chunk_config,
+        None,
+        Some(&json!({"model": "conformance-llm"})),
+        "marker",
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{llm_only_error:#}").contains("marker search requires an embedding model"),
+        "LLM without embedding should be rejected: {llm_only_error:#}"
+    );
+
     reset_test_kb(&pool).await?;
     Ok(())
 }
@@ -157,8 +242,15 @@ async fn reset_test_kb(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to drop the conformance KB table")?;
-    sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+    sqlx::query(AssertSqlSafe(format!(
+        "DROP TABLE IF EXISTS {MARKER_KB_TABLE}"
+    )))
+    .execute(pool)
+    .await
+    .context("failed to drop the marker-only conformance KB table")?;
+    sqlx::query("DELETE FROM kb_meta WHERE name = $1 OR name = $2")
         .bind(KB_NAME)
+        .bind(MARKER_KB_NAME)
         .execute(pool)
         .await
         .context("failed to delete conformance KB metadata")?;

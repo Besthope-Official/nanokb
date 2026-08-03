@@ -25,7 +25,7 @@ async fn rejects_zero_dimension_before_connecting() {
     let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
     let config = serde_json::json!({});
 
-    let error = create_kb(&pool, "docs", 0, &config, &config)
+    let error = create_kb(&pool, "docs", Some(0), &config, Some(&config), None, "vector")
         .await
         .unwrap_err();
 
@@ -57,4 +57,34 @@ async fn query_chunks_rejects_invalid_kb_name() {
         .unwrap_err();
 
     assert_eq!(error.to_string(), "invalid kb name: bad-name!");
+}
+
+#[tokio::test]
+async fn query_markers_rejects_invalid_kb_name() {
+    let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
+
+    let error = query_markers(&pool, "bad-name!", &[0.0_f32; 3], 5)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.to_string(), "invalid kb name: bad-name!");
+}
+
+#[tokio::test]
+async fn create_marker_index_rejects_invalid_kb_name() {
+    let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
+
+    let error = create_marker_index(
+        &pool,
+        "contains-hyphen",
+        &IndexConfig::Hnsw {
+            m: 16,
+            ef_construction: 64,
+            ef_search: 40,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.to_string(), "invalid kb name: contains-hyphen");
 }
