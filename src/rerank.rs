@@ -192,6 +192,7 @@ mod tests {
             node_id: node_id.to_string(),
             chunk_seq,
             heading_path: Vec::new(),
+            sort_order: 0,
             text: text.to_string(),
             markers: Vec::new(),
             marker_distance,

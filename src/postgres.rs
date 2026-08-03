@@ -6,6 +6,7 @@ use serde_json::Value;
 use sqlx::postgres::PgListener;
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, PgPool, Postgres, Row, Transaction};
+use std::collections::HashSet;
 
 const KB_TABLE_PREFIX: &str = "kb_";
 const POSTGRES_IDENTIFIER_MAX_BYTES: usize = 63;
@@ -570,6 +571,8 @@ pub struct QueryResult {
     pub node_id: String,
     pub chunk_seq: i32,
     pub heading_path: Vec<String>,
+    /// Document-order index of the chunk's node; structural output sorts by it.
+    pub sort_order: i32,
     pub text: String,
     pub markers: Vec<String>,
     /// Cosine distance of the chunk's marker embedding against the query vector.
@@ -588,7 +591,7 @@ pub async fn query_chunks(
     let vector = Vector::from(query_embedding.to_vec());
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
-                chunk.node_id, chunk.chunk_seq, node.heading_path, \
+                chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
                 chunk.text, chunk.markers, \
                 chunk.embedding <=> $1::vector AS distance \
          FROM {chunk_table} AS chunk \
@@ -616,6 +619,7 @@ pub async fn query_chunks(
                 .get::<Option<Value>, _>("heading_path")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
+            sort_order: row.get("sort_order"),
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
@@ -681,7 +685,7 @@ pub async fn query_markers(
 
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
-                chunk.node_id, chunk.chunk_seq, node.heading_path, \
+                chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
                 chunk.text, chunk.markers, \
                 chunk.marker_embedding <=> $1::vector AS marker_distance \
          FROM {chunk_table} AS chunk \
@@ -709,12 +713,179 @@ pub async fn query_markers(
                 .get::<Option<Value>, _>("heading_path")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
+            sort_order: row.get("sort_order"),
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             marker_distance: row.get("marker_distance"),
+            distance: 0.0,
+        })
+        .collect())
+}
+
+/// Expand a set of hit chunks to their structural tree neighbors.
+///
+/// TreeRAG-style bidirectional traversal: for every distinct hit node, collect
+/// its ancestors up to `max_ancestor_depth` levels (leaf-to-root), its direct
+/// children (root-to-leaves), and its direct siblings. The entry chunks
+/// themselves are not included — callers merge them back and dedupe. Neighbors
+/// are returned in document order (`sort_order`, `chunk_seq`), so the output
+/// reads as a tree context rather than a score ranking.
+pub async fn expand_neighbors(
+    pool: &PgPool,
+    kb_name: &str,
+    hits: &[QueryResult],
+    max_ancestor_depth: usize,
+) -> Result<Vec<QueryResult>> {
+    let chunk_table = chunk_table(kb_name)?;
+    let node_table = node_table(kb_name)?;
+
+    // Distinct hit nodes: a section counts once no matter how many of its
+    // chunks were retrieved.
+    let mut seen: HashSet<(i64, String)> = HashSet::new();
+    let mut hit_nodes: Vec<(i64, String)> = Vec::new();
+    for hit in hits {
+        if seen.insert((hit.document_id, hit.node_id.clone())) {
+            hit_nodes.push((hit.document_id, hit.node_id.clone()));
+        }
+    }
+    if hit_nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut neighbors: HashSet<(i64, String)> = HashSet::new();
+
+    // Leaf-to-root: walk parent pointers, bounded by max_ancestor_depth.
+    let mut frontier = hit_nodes.clone();
+    for _ in 0..max_ancestor_depth {
+        if frontier.is_empty() {
+            break;
+        }
+        frontier = query_nodes_by_parent(pool, &node_table, &frontier).await?;
+        neighbors.extend(frontier.iter().cloned());
+    }
+
+    // Root-to-leaves: direct children of the hit nodes.
+    let children = query_nodes_by_parent(pool, &node_table, &hit_nodes).await?;
+    neighbors.extend(children);
+
+    // Siblings: nodes sharing a hit node's parent, minus the hits themselves.
+    let siblings = query_sibling_nodes(pool, &node_table, &hit_nodes).await?;
+    neighbors.extend(siblings);
+
+    if neighbors.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    fetch_chunks_by_nodes(pool, &chunk_table, &node_table, &neighbors).await
+}
+
+/// Distinct nodes whose `parent_id` points at any of `nodes`. Used for both
+/// the leaf-to-root walk (hits → parents → grandparents) and root-to-leaves
+/// (hits → children), so the two directions share one query shape.
+async fn query_nodes_by_parent(
+    pool: &PgPool,
+    node_table: &str,
+    nodes: &[(i64, String)],
+) -> Result<Vec<(i64, String)>> {
+    let doc_ids: Vec<i64> = nodes.iter().map(|(doc, _)| *doc).collect();
+    let node_ids: Vec<String> = nodes.iter().map(|(_, node)| node.clone()).collect();
+    let sql = format!(
+        "SELECT DISTINCT n.document_id, n.node_id \
+         FROM {node_table} AS n \
+         JOIN unnest($1::bigint[], $2::text[]) AS h(doc_id, node_id) \
+           ON n.document_id = h.doc_id AND n.parent_id = h.node_id"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(doc_ids)
+        .bind(node_ids)
+        .fetch_all(pool)
+        .await
+        .context("failed to query node tree")?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("document_id"), row.get("node_id")))
+        .collect())
+}
+
+/// Distinct nodes that share a parent with any of `nodes`, excluding `nodes`
+/// themselves. Root-level nodes have `parent_id IS NULL`, which never matches,
+/// so the document root has no siblings by construction.
+async fn query_sibling_nodes(
+    pool: &PgPool,
+    node_table: &str,
+    nodes: &[(i64, String)],
+) -> Result<Vec<(i64, String)>> {
+    let doc_ids: Vec<i64> = nodes.iter().map(|(doc, _)| *doc).collect();
+    let node_ids: Vec<String> = nodes.iter().map(|(_, node)| node.clone()).collect();
+    let sql = format!(
+        "SELECT DISTINCT s.document_id, s.node_id \
+         FROM {node_table} AS s \
+         JOIN {node_table} AS h ON s.document_id = h.document_id AND s.parent_id = h.parent_id \
+         JOIN unnest($1::bigint[], $2::text[]) AS hit(doc_id, node_id) \
+           ON h.document_id = hit.doc_id AND h.node_id = hit.node_id \
+         WHERE NOT (s.document_id = hit.doc_id AND s.node_id = hit.node_id)"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(doc_ids)
+        .bind(node_ids)
+        .fetch_all(pool)
+        .await
+        .context("failed to query sibling nodes")?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("document_id"), row.get("node_id")))
+        .collect())
+}
+
+/// Fetch every chunk belonging to `nodes`, in document order.
+async fn fetch_chunks_by_nodes(
+    pool: &PgPool,
+    chunk_table: &str,
+    node_table: &str,
+    nodes: &HashSet<(i64, String)>,
+) -> Result<Vec<QueryResult>> {
+    let doc_ids: Vec<i64> = nodes.iter().map(|(doc, _)| *doc).collect();
+    let node_ids: Vec<String> = nodes.iter().map(|(_, node)| node.clone()).collect();
+    let sql = format!(
+        "SELECT chunk.document_id, document.filename, document.frontmatter, \
+                chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
+                chunk.text, chunk.markers, \
+                0.0 AS distance, 0.0 AS marker_distance \
+         FROM {chunk_table} AS chunk \
+         JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
+         JOIN document ON document.id = chunk.document_id \
+         JOIN unnest($1::bigint[], $2::text[]) AS n(doc_id, node_id) \
+           ON chunk.document_id = n.doc_id AND chunk.node_id = n.node_id \
+         ORDER BY chunk.document_id, node.sort_order, chunk.chunk_seq"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(doc_ids)
+        .bind(node_ids)
+        .fetch_all(pool)
+        .await
+        .context("failed to fetch neighbor chunks")?;
+    Ok(rows
+        .iter()
+        .map(|row| QueryResult {
+            document_id: row.get("document_id"),
+            filename: row.get("filename"),
+            frontmatter: row.get("frontmatter"),
+            node_id: row.get("node_id"),
+            chunk_seq: row.get("chunk_seq"),
+            heading_path: row
+                .get::<Option<Value>, _>("heading_path")
+                .and_then(|v| parse_string_array(&v))
+                .unwrap_or_default(),
+            sort_order: row.get("sort_order"),
+            text: row.get("text"),
+            markers: row
+                .get::<Option<Value>, _>("markers")
+                .and_then(|v| parse_string_array(&v))
+                .unwrap_or_default(),
+            marker_distance: 0.0,
             distance: 0.0,
         })
         .collect())

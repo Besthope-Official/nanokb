@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use nanokb::chunker::NodeRow;
 use nanokb::postgres::{
-    ChunkRow, connect, create_index, create_kb, create_marker_index, fetch_and_lock_pending,
-    initialize, insert_task, mark_document_parsed, query_markers,
-    register_document, replace_document_chunks,
+    ChunkRow, QueryResult, connect, create_index, create_kb, create_marker_index,
+    expand_neighbors, fetch_and_lock_pending, initialize, insert_task, mark_document_parsed,
+    query_markers, register_document, replace_document_chunks,
 };
 use nanokb::AppConfig;
 use nanokb::IndexConfig;
@@ -16,6 +16,9 @@ const KB_NODE_TABLE: &str = "kb_config_conformance_node";
 const KB_NAME_MARKER: &str = "config_conformance_marker";
 const KB_CHUNK_TABLE_MARKER: &str = "kb_config_conformance_marker_chunk";
 const KB_NODE_TABLE_MARKER: &str = "kb_config_conformance_marker_node";
+const KB_NAME_TREE: &str = "config_conformance_tree";
+const KB_CHUNK_TABLE_TREE: &str = "kb_config_conformance_tree_chunk";
+const KB_NODE_TABLE_TREE: &str = "kb_config_conformance_tree_node";
 
 #[tokio::test]
 #[ignore = "requires the Docker Compose pgvector service"]
@@ -312,4 +315,178 @@ async fn reset_test_kb(pool: &PgPool) -> Result<()> {
         .await
         .context("failed to delete conformance marker KB metadata")?;
     Ok(())
+}
+
+fn tree_node(
+    node_id: &str,
+    parent_id: Option<&str>,
+    level: usize,
+    sort_order: usize,
+    heading_path: Vec<&str>,
+) -> NodeRow {
+    NodeRow {
+        node_id: node_id.into(),
+        parent_id: parent_id.map(String::from),
+        heading_path: heading_path.iter().map(|s| (*s).to_string()).collect(),
+        title: heading_path.last().unwrap_or(&"").to_string(),
+        level,
+        sort_order,
+    }
+}
+
+fn tree_chunk(node_id: &str, chunk_seq: usize, text: &str) -> ChunkRow {
+    ChunkRow {
+        node_id: node_id.into(),
+        chunk_seq: chunk_seq as i32,
+        text: text.into(),
+        blocks: Vec::new(),
+        embedding: vec![0.1, 0.2, 0.3],
+        marker_embedding: Vec::new(),
+        markers: Vec::new(),
+    }
+}
+
+fn tree_hit(document_id: i64, node_id: &str, chunk_seq: usize) -> QueryResult {
+    QueryResult {
+        document_id,
+        filename: "tree.md".into(),
+        frontmatter: json!({}),
+        node_id: node_id.into(),
+        chunk_seq: chunk_seq as i32,
+        heading_path: Vec::new(),
+        sort_order: 0,
+        text: String::new(),
+        markers: Vec::new(),
+        marker_distance: 0.0,
+        distance: 0.0,
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Compose pgvector service"]
+async fn expand_neighbors_returns_tree_context_in_document_order() -> Result<()> {
+    let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance/config.yaml");
+    let config = AppConfig::try_load_from(config_path)?;
+    let pool = connect(&config.database.url).await?;
+    initialize(&pool).await?;
+
+    for table in [KB_CHUNK_TABLE_TREE, KB_NODE_TABLE_TREE] {
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+        .bind(KB_NAME_TREE)
+        .execute(&pool)
+        .await?;
+
+    create_kb(
+        &pool,
+        KB_NAME_TREE,
+        3,
+        &json!({"strategy": "layered"}),
+        &json!({"model": "conformance", "dimension": 3}),
+        None,
+        "vector",
+    )
+    .await?;
+
+    //   root            (preface chunk)
+    //   ├── ch1         (chapter body chunk)
+    //   │   ├── ch1a    (two chunks)
+    //   │   └── ch1b
+    //   └── ch2
+    //       └── ch2a
+    let document_id = register_document(&pool, KB_NAME_TREE, "tree", "tree.md").await?;
+    mark_document_parsed(&pool, document_id, &json!({})).await?;
+    replace_document_chunks(
+        &pool,
+        KB_NAME_TREE,
+        document_id,
+        &[
+            tree_node("root", None, 0, 0, vec![]),
+            tree_node("ch1", Some("root"), 1, 1, vec!["Chapter 1"]),
+            tree_node("ch1a", Some("ch1"), 2, 2, vec!["Chapter 1", "1.1"]),
+            tree_node("ch1b", Some("ch1"), 2, 3, vec!["Chapter 1", "1.2"]),
+            tree_node("ch2", Some("root"), 1, 4, vec!["Chapter 2"]),
+            tree_node("ch2a", Some("ch2"), 2, 5, vec!["Chapter 2", "2.1"]),
+        ],
+        &[
+            tree_chunk("root", 0, "preface"),
+            tree_chunk("ch1", 0, "chapter 1 body"),
+            tree_chunk("ch1a", 0, "section 1.1 first"),
+            tree_chunk("ch1a", 1, "section 1.1 second"),
+            tree_chunk("ch1b", 0, "section 1.2 body"),
+            tree_chunk("ch2", 0, "chapter 2 body"),
+            tree_chunk("ch2a", 0, "section 2.1 body"),
+        ],
+    )
+    .await?;
+
+    // A second document reusing the same node ids must not leak into the
+    // first document's expansion: traversal is document-scoped.
+    let other_id = register_document(&pool, KB_NAME_TREE, "other", "other.md").await?;
+    mark_document_parsed(&pool, other_id, &json!({})).await?;
+    replace_document_chunks(
+        &pool,
+        KB_NAME_TREE,
+        other_id,
+        &[
+            tree_node("root", None, 0, 0, vec![]),
+            tree_node("ch1", Some("root"), 1, 1, vec!["Chapter 1"]),
+        ],
+        &[tree_chunk("ch1", 0, "other doc chapter")],
+    )
+    .await?;
+
+    // Leaf-to-root (two levels) + siblings; the hit itself is excluded and
+    // the root (no chunks) contributes nothing. Document order, not score.
+    let hit = tree_hit(document_id, "ch1a", 0);
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 2).await?;
+    assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch1b"]);
+    assert_eq!(tree_texts(&neighbors), vec!["chapter 1 body", "section 1.2 body"]);
+
+    // Depth 1 keeps only the direct parent.
+    let hit = tree_hit(document_id, "ch1a", 0);
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 1).await?;
+    assert_eq!(tree_node_order(&neighbors), vec!["ch1"]);
+
+    // Both siblings retrieved: each hit's sibling is the other hit, so the
+    // shared parent is the only new neighbor.
+    let hit = tree_hit(document_id, "ch1a", 0);
+    let hit_b = tree_hit(document_id, "ch1b", 0);
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit, hit_b], 2).await?;
+    assert_eq!(tree_node_order(&neighbors), vec!["ch1"]);
+
+    // A root hit has no ancestors or siblings; root-to-leaves pulls the
+    // top-level sections.
+    let root_hit = tree_hit(document_id, "root", 0);
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[root_hit], 2).await?;
+    assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch2"]);
+
+    // Empty hits expand to nothing.
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[], 2).await?;
+    assert!(neighbors.is_empty());
+
+    sqlx::query("DELETE FROM document WHERE id = $1")
+        .bind(document_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM document WHERE id = $1")
+        .bind(other_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+        .bind(KB_NAME_TREE)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+fn tree_node_order(results: &[QueryResult]) -> Vec<&str> {
+    results.iter().map(|r| r.node_id.as_str()).collect()
+}
+
+fn tree_texts(results: &[QueryResult]) -> Vec<&str> {
+    results.iter().map(|r| r.text.as_str()).collect()
 }
