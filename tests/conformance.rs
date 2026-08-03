@@ -355,6 +355,7 @@ fn tree_hit(document_id: i64, node_id: &str, chunk_seq: usize) -> QueryResult {
         chunk_seq: chunk_seq as i32,
         heading_path: Vec::new(),
         sort_order: 0,
+        source: "VEC".to_string(),
         text: String::new(),
         markers: Vec::new(),
         marker_distance: 0.0,

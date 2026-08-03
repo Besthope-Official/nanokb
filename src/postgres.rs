@@ -573,6 +573,9 @@ pub struct QueryResult {
     pub heading_path: Vec<String>,
     /// Document-order index of the chunk's node; structural output sorts by it.
     pub sort_order: i32,
+    /// Retrieval channel that produced this row: `VEC`, `MARKER`, or `TREE`
+    /// for structural expansion neighbors.
+    pub source: String,
     pub text: String,
     pub markers: Vec<String>,
     /// Cosine distance of the chunk's marker embedding against the query vector.
@@ -620,6 +623,7 @@ pub async fn query_chunks(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
+            source: "VEC".to_string(),
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
@@ -714,6 +718,7 @@ pub async fn query_markers(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
+            source: "MARKER".to_string(),
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
@@ -880,6 +885,7 @@ async fn fetch_chunks_by_nodes(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
+            source: "TREE".to_string(),
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")

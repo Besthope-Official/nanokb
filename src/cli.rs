@@ -392,20 +392,20 @@ async fn run_query(
             }
             let ordered = rerank_ordered(reranker, query_text, candidates, top_k).await?;
             print_chunks(ordered.iter().map(|(score, result)| {
-                (format!("[{score:.4} RERANK] "), result)
+                (format!("[{score:.4} RERANK] [{}] ", result.source), result)
             }));
         }
         (None, QueryMode::Vector, false) => {
             let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let embedding = model.embed_query(query_text).await?;
             let results = postgres::query_chunks(pool, kb_name, &embedding, limit).await?;
-            print_chunks(results.iter().map(|r| (format!("[{:.4}] ", r.distance), r)));
+            print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.distance, r.source), r)));
         }
         (None, QueryMode::Marker, false) => {
             let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let emb = embed_model.embed_query(query_text).await?;
             let results = postgres::query_markers(pool, kb_name, &emb, limit).await?;
-            print_chunks(results.iter().map(|r| (format!("[{:.4} MARKER] ", r.marker_distance), r)));
+            print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.marker_distance, r.source), r)));
         }
         (None, QueryMode::Hybrid, false) => {
             let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
@@ -425,12 +425,12 @@ async fn run_query(
 
             let entries = rrf_fusion(&marker_results, &vector_results, Some(top_k));
             print_chunks(entries.iter().map(|entry| {
-                let source = if entry.source == "marker" {
+                let inner = if entry.result.source == "MARKER" {
                     format!("{:.4} MARKER", entry.result.marker_distance)
                 } else {
                     format!("{:.4} VEC", entry.result.distance)
                 };
-                (format!("[{:.4} RRF] [{source}] ", entry.rrf_score), entry.result)
+                (format!("[{:.4} RRF] [{inner}] ", entry.rrf_score), entry.result)
             }));
         }
         (None, _, true) => {
@@ -439,7 +439,9 @@ async fn run_query(
                     .await?;
             let neighbors =
                 postgres::expand_neighbors(pool, kb_name, &candidates, MAX_ANCESTOR_DEPTH).await?;
-            print_chunks(merge_with_neighbors(candidates, neighbors).iter().map(|r| (String::new(), r)));
+            print_chunks(merge_with_neighbors(candidates, neighbors).iter().map(|r| {
+                (format!("[{}] ", r.source), r)
+            }));
         }
     }
 
@@ -786,6 +788,7 @@ mod tests {
             chunk_seq,
             heading_path: heading_path.into_iter().map(String::from).collect(),
             sort_order,
+            source: "VEC".to_string(),
             text: text.to_string(),
             markers: Vec::new(),
             marker_distance: 0.0,
