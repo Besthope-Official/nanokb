@@ -1,18 +1,21 @@
 use anyhow::{Context, Result};
-use nanokb::AppConfig;
+use nanokb::chunker::NodeRow;
 use nanokb::postgres::{
     ChunkRow, connect, create_index, create_kb, create_marker_index, fetch_and_lock_pending,
     initialize, insert_task, mark_document_parsed, query_markers,
     register_document, replace_document_chunks,
 };
+use nanokb::AppConfig;
 use nanokb::IndexConfig;
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool};
 
 const KB_NAME: &str = "config_conformance";
-const KB_TABLE: &str = "kb_config_conformance";
+const KB_CHUNK_TABLE: &str = "kb_config_conformance_chunk";
+const KB_NODE_TABLE: &str = "kb_config_conformance_node";
 const KB_NAME_MARKER: &str = "config_conformance_marker";
-const KB_TABLE_MARKER: &str = "kb_config_conformance_marker";
+const KB_CHUNK_TABLE_MARKER: &str = "kb_config_conformance_marker_chunk";
+const KB_NODE_TABLE_MARKER: &str = "kb_config_conformance_marker_node";
 
 #[tokio::test]
 #[ignore = "requires the Docker Compose pgvector service"]
@@ -50,7 +53,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
          JOIN pg_class AS relation ON relation.oid = attribute.attrelid \
          WHERE relation.relname = $1 AND attribute.attname = 'embedding'",
     )
-    .bind(KB_TABLE)
+    .bind(KB_CHUNK_TABLE)
     .fetch_one(&pool)
     .await
     .context("failed to inspect the conformance KB embedding column")?;
@@ -64,7 +67,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
              WHERE c.relname = $1 AND a.attname = 'marker_embedding'\
          )",
     )
-    .bind(KB_TABLE)
+    .bind(KB_CHUNK_TABLE)
     .fetch_one(&pool)
     .await
     .context("failed to inspect the conformance KB marker_embedding column")?;
@@ -106,10 +109,19 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         &pool,
         KB_NAME,
         document_id,
+        &[NodeRow {
+            node_id: "intro".into(),
+            parent_id: None,
+            heading_path: vec!["Guide".into()],
+            title: "Guide".into(),
+            level: 1,
+            sort_order: 0,
+        }],
         &[ChunkRow {
-            chunk_id: "intro".into(),
+            node_id: "intro".into(),
+            chunk_seq: 0,
             text: "Introduction".into(),
-            embedding_text: "Guide\n\nIntroduction".into(),
+            blocks: Vec::new(),
             embedding: vec![0.1, 0.2, 0.3],
             marker_embedding: vec![0.4, 0.5, 0.6],
             markers: vec!["guide".into(), "introduction".into()],
@@ -134,7 +146,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     );
 
     let chunk_document_id: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT document_id FROM {KB_TABLE} WHERE chunk_id = $1"
+        "SELECT document_id FROM {KB_CHUNK_TABLE} WHERE node_id = $1 AND chunk_seq = 0"
     )))
     .bind("intro")
     .fetch_one(&pool)
@@ -151,7 +163,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         .await?;
     assert!(!task_exists);
     let chunk_exists: bool = sqlx::query_scalar(AssertSqlSafe(format!(
-        "SELECT EXISTS (SELECT 1 FROM {KB_TABLE} WHERE chunk_id = $1)"
+        "SELECT EXISTS (SELECT 1 FROM {KB_CHUNK_TABLE} WHERE node_id = $1)"
     )))
     .bind("intro")
     .fetch_one(&pool)
@@ -161,11 +173,11 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     let index_config = &config.database.index;
     create_index(&pool, KB_NAME, index_config).await?;
 
-    let index_name = format!("idx_{KB_TABLE}_embedding");
+    let index_name = format!("idx_{KB_CHUNK_TABLE}_embedding");
     let index_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE tablename = $1 AND indexname = $2)",
     )
-    .bind(KB_TABLE)
+    .bind(KB_CHUNK_TABLE)
     .bind(&index_name)
     .fetch_one(&pool)
     .await
@@ -202,7 +214,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
              WHERE c.relname = $1 AND a.attname = 'marker_embedding'\
          )",
     )
-    .bind(KB_TABLE_MARKER)
+    .bind(KB_CHUNK_TABLE_MARKER)
     .fetch_one(&pool)
     .await
     .context("failed to inspect the marker KB marker_embedding column")?;
@@ -220,10 +232,19 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         &pool,
         KB_NAME_MARKER,
         marker_document_id,
+        &[NodeRow {
+            node_id: "intro".into(),
+            parent_id: None,
+            heading_path: vec!["Guide".into()],
+            title: "Guide".into(),
+            level: 1,
+            sort_order: 0,
+        }],
         &[ChunkRow {
-            chunk_id: "intro".into(),
+            node_id: "intro".into(),
+            chunk_seq: 0,
             text: "Introduction".into(),
-            embedding_text: "Guide\n\nIntroduction".into(),
+            blocks: Vec::new(),
             embedding: vec![0.1, 0.2, 0.3],
             marker_embedding: vec![0.4, 0.5, 0.6],
             markers: vec!["guide".into(), "introduction".into()],
@@ -234,7 +255,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     let query_emb = vec![0.1_f32, 0.2, 0.3];
     let marker_hits = query_markers(&pool, KB_NAME_MARKER, &query_emb, 5).await?;
     assert_eq!(marker_hits.len(), 1);
-    assert_eq!(marker_hits[0].chunk_id, "intro");
+    assert_eq!(marker_hits[0].node_id, "intro");
     assert!(marker_hits[0].marker_distance >= 0.0, "marker distance should be non-negative");
     assert_eq!(marker_hits[0].markers, vec!["guide", "introduction"]);
     let far_hits = query_markers(&pool, KB_NAME_MARKER, &[1.0, 1.0, 1.0], 5).await?;
@@ -251,7 +272,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         },
     )
     .await?;
-    let marker_index_name = format!("idx_{KB_TABLE_MARKER}_marker_embedding");
+    let marker_index_name = format!("idx_{KB_CHUNK_TABLE_MARKER}_marker_embedding");
     let marker_index_method: String = sqlx::query_scalar(
         "SELECT am.amname FROM pg_index i \
              JOIN pg_class rel ON rel.oid = i.indexrelid \
@@ -274,7 +295,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
 }
 
 async fn reset_test_kb(pool: &PgPool) -> Result<()> {
-    for table in [KB_TABLE, KB_TABLE_MARKER] {
+    for table in [KB_CHUNK_TABLE, KB_NODE_TABLE, KB_CHUNK_TABLE_MARKER, KB_NODE_TABLE_MARKER] {
         sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
             .execute(pool)
             .await

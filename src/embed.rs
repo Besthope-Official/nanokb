@@ -1,3 +1,4 @@
+use crate::chunker::{Block, NodeRow};
 use crate::config::EmbeddingConfig;
 use crate::postgres::{self, ChunkRow};
 use anyhow::{Context, Result};
@@ -112,37 +113,40 @@ impl EmbedModel {
 }
 
 pub struct EmbeddedChunk {
-    pub chunk_id: String,
+    pub node_id: String,
+    pub chunk_seq: usize,
     pub text: String,
-    pub embedding_text: String,
+    pub blocks: Vec<Block>,
     pub embedding: Vec<f32>,
     pub marker_embedding: Vec<f32>,
     pub markers: Vec<String>,
 }
 
 pub struct EmbeddedChunks {
+    pub nodes: Vec<NodeRow>,
     pub chunks: Vec<EmbeddedChunk>,
 }
 
 impl EmbeddedChunks {
-    /// Replace this document's chunks in an existing knowledge base.
+    /// Replace this document's nodes and chunks in an existing knowledge base.
     ///
-    /// The table, its metadata, and the vector index are created once per build
-    /// by `Pipeline::prepare_kb`.
+    /// The tables, their metadata, and the vector index are created once per
+    /// build by `Pipeline::prepare_kb`.
     pub async fn store(self, pool: &PgPool, kb_name: &str, document_id: i64) -> Result<()> {
         let rows: Vec<ChunkRow> = self
             .chunks
             .into_iter()
             .map(|c| ChunkRow {
-                chunk_id: c.chunk_id,
+                node_id: c.node_id,
+                chunk_seq: c.chunk_seq as i32,
                 text: c.text,
-                embedding_text: c.embedding_text,
+                blocks: c.blocks,
                 embedding: c.embedding,
                 marker_embedding: c.marker_embedding,
                 markers: c.markers,
             })
             .collect();
-        postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await
+        postgres::replace_document_chunks(pool, kb_name, document_id, &self.nodes, &rows).await
     }
 }
 

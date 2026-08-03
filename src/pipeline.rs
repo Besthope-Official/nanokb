@@ -155,7 +155,8 @@ impl Pipeline {
 
         // Stage 2: Chunk
         on_stage("chunking".to_string());
-        let chunks = document.into_chunks(&self.strategy);
+        let doc_chunks = document.into_chunks(&self.strategy);
+        let chunks = &doc_chunks.chunks;
         let total = chunks.len();
 
         // Stage 3: Markers
@@ -187,9 +188,10 @@ impl Pipeline {
             for (i, (chunk, embedding)) in batch.iter().zip(embeddings).enumerate() {
                 let chunk_idx = current + i;
                 embedded.push(EmbeddedChunk {
-                    chunk_id: chunk.chunk_id.clone(),
+                    node_id: chunk.node_id.clone(),
+                    chunk_seq: chunk.chunk_seq,
                     text: chunk.text.clone(),
-                    embedding_text: chunk.embedding_text.clone(),
+                    blocks: chunk.blocks.clone(),
                     embedding,
                     marker_embedding: Vec::new(),
                     markers: markers[chunk_idx].clone(),
@@ -222,9 +224,12 @@ impl Pipeline {
 
         // Stage 5: Store
         on_stage(format!("storing {total} chunks"));
-        EmbeddedChunks { chunks: embedded }
-            .store(pool, input.kb_name, input.document_id)
-            .await?;
+        EmbeddedChunks {
+            nodes: doc_chunks.nodes,
+            chunks: embedded,
+        }
+        .store(pool, input.kb_name, input.document_id)
+        .await?;
 
         Ok(())
     }

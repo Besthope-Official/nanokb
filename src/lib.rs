@@ -1,5 +1,5 @@
 pub mod chunker;
-pub use chunker::{Chunk, ChunkStrategy, MetadataMode};
+pub use chunker::{Block, BlockType, Chunk, ChunkStrategy, DocumentChunks, MetadataMode, NodeRow};
 
 pub mod config;
 pub use config::{AppConfig, DatabaseConfig, IndexConfig};

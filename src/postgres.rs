@@ -1,3 +1,4 @@
+use crate::chunker::{Block, NodeRow};
 use crate::config::IndexConfig;
 use anyhow::{Context, Result};
 use pgvector::Vector;
@@ -114,9 +115,14 @@ async fn ensure_document_table(transaction: &mut Transaction<'_, Postgres>) -> R
     Ok(())
 }
 
-fn kb_table(name: &str) -> Result<String> {
+fn chunk_table(name: &str) -> Result<String> {
     validate_kb_name(name)?;
-    Ok(format!("{KB_TABLE_PREFIX}{name}"))
+    Ok(format!("{KB_TABLE_PREFIX}{name}_chunk"))
+}
+
+fn node_table(name: &str) -> Result<String> {
+    validate_kb_name(name)?;
+    Ok(format!("{KB_TABLE_PREFIX}{name}_node"))
 }
 
 /// Create a kb, failing if one already exists under `name`.
@@ -133,7 +139,8 @@ pub async fn create_kb(
     llm_config: Option<&Value>,
     query_mode: &str,
 ) -> Result<()> {
-    let table_name = kb_table(name)?;
+    let chunk_table = chunk_table(name)?;
+    let node_table = node_table(name)?;
     anyhow::ensure!(
         dimension > 0,
         "embedding dimension must be greater than zero"
@@ -148,24 +155,42 @@ pub async fn create_kb(
     } else {
         String::new()
     };
-    let create_table = format!(
-        r#"CREATE TABLE IF NOT EXISTS {table_name} (
-            document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-            chunk_id       TEXT NOT NULL,
-            text           TEXT NOT NULL,
-            embedding_text TEXT NOT NULL,
-            embedding      vector({dimension}) NOT NULL,
+    let create_node_table = format!(
+        r#"CREATE TABLE IF NOT EXISTS {node_table} (
+            document_id  BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            node_id      TEXT NOT NULL,
+            parent_id    TEXT,
+            heading_path JSONB NOT NULL DEFAULT '[]',
+            title        TEXT NOT NULL DEFAULT '',
+            level        INTEGER NOT NULL DEFAULT 0,
+            sort_order   INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (document_id, node_id)
+        )"#
+    );
+    let create_chunk_table = format!(
+        r#"CREATE TABLE IF NOT EXISTS {chunk_table} (
+            document_id     BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            node_id         TEXT NOT NULL,
+            chunk_seq       INTEGER NOT NULL,
+            text            TEXT NOT NULL,
+            blocks          JSONB NOT NULL DEFAULT '[]',
+            embedding       vector({dimension}) NOT NULL,
             {marker_col}
-            markers        JSONB NOT NULL DEFAULT '[]',
-            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (document_id, chunk_id)
+            markers         JSONB NOT NULL DEFAULT '[]',
+            PRIMARY KEY (document_id, node_id, chunk_seq),
+            FOREIGN KEY (document_id, node_id)
+                REFERENCES {node_table} (document_id, node_id) ON DELETE CASCADE
         )"#
     );
 
-    sqlx::query(AssertSqlSafe(create_table))
+    sqlx::query(AssertSqlSafe(create_node_table))
         .execute(&mut *transaction)
         .await
-        .with_context(|| format!("failed to create data table for kb {name}"))?;
+        .with_context(|| format!("failed to create node table for kb {name}"))?;
+    sqlx::query(AssertSqlSafe(create_chunk_table))
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to create chunk table for kb {name}"))?;
 
     let inserted = sqlx::query(
         "INSERT INTO kb_meta \
@@ -284,16 +309,17 @@ pub async fn list_kbs(pool: &PgPool) -> Result<Vec<KbSummary>> {
 
 /// Chunks live in a per-kb table, so this cannot be folded into [`list_kbs`]'s join.
 pub async fn count_chunks(pool: &PgPool, kb_name: &str) -> Result<i64> {
-    let table_name = kb_table(kb_name)?;
+    let table_name = chunk_table(kb_name)?;
     sqlx::query_scalar(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table_name}")))
         .fetch_one(pool)
         .await
         .with_context(|| format!("failed to count chunks in kb {kb_name}"))
 }
 
-/// Drop a kb's chunk table and metadata row; documents and tasks cascade.
+/// Drop a kb's chunk and node tables and metadata row; documents and tasks cascade.
 pub async fn delete_kb(pool: &PgPool, kb_name: &str) -> Result<()> {
-    let table_name = kb_table(kb_name)?;
+    let chunk_table = chunk_table(kb_name)?;
+    let node_table = node_table(kb_name)?;
     let mut transaction = pool
         .begin()
         .await
@@ -306,10 +332,14 @@ pub async fn delete_kb(pool: &PgPool, kb_name: &str) -> Result<()> {
         .with_context(|| format!("failed to delete metadata for kb {kb_name}"))?;
     anyhow::ensure!(deleted.rows_affected() == 1, "kb {kb_name} does not exist");
 
-    sqlx::query(AssertSqlSafe(format!("DROP TABLE {table_name}")))
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE {chunk_table}")))
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to drop chunk table for kb {kb_name}"))?;
+    sqlx::query(AssertSqlSafe(format!("DROP TABLE {node_table}")))
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to drop node table for kb {kb_name}"))?;
 
     transaction
         .commit()
@@ -334,9 +364,10 @@ pub async fn count_kb_tasks(pool: &PgPool, kb_name: &str) -> Result<(i64, i64, i
 }
 
 pub struct ChunkRow {
-    pub chunk_id: String,
+    pub node_id: String,
+    pub chunk_seq: i32,
     pub text: String,
-    pub embedding_text: String,
+    pub blocks: Vec<Block>,
     pub embedding: Vec<f32>,
     pub marker_embedding: Vec<f32>,
     pub markers: Vec<String>,
@@ -346,9 +377,11 @@ pub async fn replace_document_chunks(
     pool: &PgPool,
     kb_name: &str,
     document_id: i64,
+    nodes: &[NodeRow],
     chunks: &[ChunkRow],
 ) -> Result<()> {
-    let table_name = kb_table(kb_name)?;
+    let chunk_table = chunk_table(kb_name)?;
+    let node_table = node_table(kb_name)?;
     let mut transaction = pool
         .begin()
         .await
@@ -370,16 +403,67 @@ pub async fn replace_document_chunks(
     .await
     .with_context(|| format!("failed to load kb meta for {kb_name}"))?;
 
-    let delete_sql = format!("DELETE FROM {table_name} WHERE document_id = $1");
-    sqlx::query(AssertSqlSafe(delete_sql))
+    let delete_chunks_sql = format!("DELETE FROM {chunk_table} WHERE document_id = $1");
+    sqlx::query(AssertSqlSafe(delete_chunks_sql))
         .bind(document_id)
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to delete chunks for document {document_id}"))?;
+    let delete_nodes_sql = format!("DELETE FROM {node_table} WHERE document_id = $1");
+    sqlx::query(AssertSqlSafe(delete_nodes_sql))
+        .bind(document_id)
+        .execute(&mut *transaction)
+        .await
+        .with_context(|| format!("failed to delete nodes for document {document_id}"))?;
+
+    if !nodes.is_empty() {
+        let node_ids: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+        let parent_ids: Vec<&str> = nodes
+            .iter()
+            .map(|n| n.parent_id.as_deref().unwrap_or(""))
+            .collect();
+        let heading_paths: Vec<Value> = nodes
+            .iter()
+            .map(|n| {
+                Value::Array(
+                    n.heading_path
+                        .iter()
+                        .map(|t| Value::String(t.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let titles: Vec<&str> = nodes.iter().map(|n| n.title.as_str()).collect();
+        let levels: Vec<i32> = nodes.iter().map(|n| n.level as i32).collect();
+        let sort_orders: Vec<i32> = nodes.iter().map(|n| n.sort_order as i32).collect();
+
+        let insert_sql = format!(
+            "INSERT INTO {node_table} (document_id, node_id, parent_id, heading_path, title, level, sort_order) \
+             SELECT $1, node_id, NULLIF(parent_id, ''), heading_path, title, level, sort_order \
+             FROM UNNEST($2::text[], $3::text[], $4::jsonb[], $5::text[], $6::int[], $7::int[]) \
+             AS batch(node_id, parent_id, heading_path, title, level, sort_order)"
+        );
+        sqlx::query(AssertSqlSafe(insert_sql))
+            .bind(document_id)
+            .bind(&node_ids)
+            .bind(&parent_ids)
+            .bind(&heading_paths)
+            .bind(&titles)
+            .bind(&levels)
+            .bind(&sort_orders)
+            .execute(&mut *transaction)
+            .await
+            .with_context(|| format!("failed to insert {} nodes for document {document_id}", nodes.len()))?;
+    }
+
     if !chunks.is_empty() {
-        let chunk_ids: Vec<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
+        let node_ids: Vec<&str> = chunks.iter().map(|c| c.node_id.as_str()).collect();
+        let chunk_seqs: Vec<i32> = chunks.iter().map(|c| c.chunk_seq).collect();
         let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let embedding_texts: Vec<&str> = chunks.iter().map(|c| c.embedding_text.as_str()).collect();
+        let blocks_json: Vec<Value> = chunks
+            .iter()
+            .map(|c| serde_json::to_value(&c.blocks).context("failed to serialize chunk blocks"))
+            .collect::<Result<_>>()?;
         let markers_json: Vec<Value> = chunks
             .iter()
             .map(|c| Value::Array(c.markers.iter().map(|m| Value::String(m.clone())).collect()))
@@ -396,16 +480,17 @@ pub async fn replace_document_chunks(
                 .map(|c| Vector::from(c.marker_embedding.clone()))
                 .collect();
             let insert_sql = format!(
-                "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding, marker_embedding, markers) \
-                 SELECT $1, chunk_id, text, embedding_text, embedding, marker_embedding, markers \
-                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[], $6::vector[], $7::jsonb[]) \
-                 AS batch(chunk_id, text, embedding_text, embedding, marker_embedding, markers)"
+                "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers) \
+                 SELECT $1, node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers \
+                 FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[], $7::vector[], $8::jsonb[]) \
+                 AS batch(node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers)"
             );
             sqlx::query(AssertSqlSafe(insert_sql))
                 .bind(document_id)
-                .bind(&chunk_ids)
+                .bind(&node_ids)
+                .bind(&chunk_seqs)
                 .bind(&texts)
-                .bind(&embedding_texts)
+                .bind(&blocks_json)
                 .bind(&embeddings)
                 .bind(&marker_embeddings)
                 .bind(&markers_json)
@@ -419,16 +504,17 @@ pub async fn replace_document_chunks(
                 })?;
         } else {
             let insert_sql = format!(
-                "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding, markers) \
-                 SELECT $1, chunk_id, text, embedding_text, embedding, markers \
-                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[], $6::jsonb[]) \
-                 AS batch(chunk_id, text, embedding_text, embedding, markers)"
+                "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding, markers) \
+                 SELECT $1, node_id, chunk_seq, text, blocks, embedding, markers \
+                 FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[], $7::jsonb[]) \
+                 AS batch(node_id, chunk_seq, text, blocks, embedding, markers)"
             );
             sqlx::query(AssertSqlSafe(insert_sql))
                 .bind(document_id)
-                .bind(&chunk_ids)
+                .bind(&node_ids)
+                .bind(&chunk_seqs)
                 .bind(&texts)
-                .bind(&embedding_texts)
+                .bind(&blocks_json)
                 .bind(&embeddings)
                 .bind(&markers_json)
                 .execute(&mut *transaction)
@@ -448,7 +534,7 @@ pub async fn replace_document_chunks(
 }
 
 pub async fn create_index(pool: &PgPool, kb_name: &str, index_config: &IndexConfig) -> Result<()> {
-    let table_name = kb_table(kb_name)?;
+    let table_name = chunk_table(kb_name)?;
     match index_config {
         IndexConfig::Hnsw {
             m,
@@ -481,9 +567,10 @@ pub struct QueryResult {
     pub document_id: i64,
     pub filename: String,
     pub frontmatter: Value,
-    pub chunk_id: String,
+    pub node_id: String,
+    pub chunk_seq: i32,
+    pub heading_path: Vec<String>,
     pub text: String,
-    pub embedding_text: String,
     pub markers: Vec<String>,
     /// Cosine distance of the chunk's marker embedding against the query vector.
     pub marker_distance: f64,
@@ -496,13 +583,16 @@ pub async fn query_chunks(
     query_embedding: &[f32],
     top_k: usize,
 ) -> Result<Vec<QueryResult>> {
-    let table_name = kb_table(kb_name)?;
+    let chunk_table = chunk_table(kb_name)?;
+    let node_table = node_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
-                chunk.chunk_id, chunk.text, chunk.embedding_text, chunk.markers, \
+                chunk.node_id, chunk.chunk_seq, node.heading_path, \
+                chunk.text, chunk.markers, \
                 chunk.embedding <=> $1::vector AS distance \
-         FROM {table_name} AS chunk \
+         FROM {chunk_table} AS chunk \
+         JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
          JOIN document ON document.id = chunk.document_id \
          ORDER BY chunk.embedding <=> $1::vector \
          LIMIT $2"
@@ -520,12 +610,16 @@ pub async fn query_chunks(
             document_id: row.get("document_id"),
             filename: row.get("filename"),
             frontmatter: row.get("frontmatter"),
-            chunk_id: row.get("chunk_id"),
+            node_id: row.get("node_id"),
+            chunk_seq: row.get("chunk_seq"),
+            heading_path: row
+                .get::<Option<Value>, _>("heading_path")
+                .and_then(|v| parse_string_array(&v))
+                .unwrap_or_default(),
             text: row.get("text"),
-            embedding_text: row.get("embedding_text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
-                .and_then(|v| parse_markers_json(&v))
+                .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             marker_distance: 0.0,
             distance: row.get("distance"),
@@ -533,7 +627,7 @@ pub async fn query_chunks(
         .collect())
 }
 
-fn parse_markers_json(value: &Value) -> Option<Vec<String>> {
+fn parse_string_array(value: &Value) -> Option<Vec<String>> {
     value.as_array().map(|arr| {
         arr.iter()
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
@@ -547,7 +641,7 @@ pub async fn create_marker_index(
     kb_name: &str,
     index_config: &IndexConfig,
 ) -> Result<()> {
-    let table_name = kb_table(kb_name)?;
+    let table_name = chunk_table(kb_name)?;
     match index_config {
         IndexConfig::Hnsw {
             m,
@@ -581,14 +675,17 @@ pub async fn query_markers(
     query_embedding: &[f32],
     top_k: usize,
 ) -> Result<Vec<QueryResult>> {
-    let table_name = kb_table(kb_name)?;
+    let chunk_table = chunk_table(kb_name)?;
+    let node_table = node_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
 
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
-                chunk.chunk_id, chunk.text, chunk.embedding_text, chunk.markers, \
+                chunk.node_id, chunk.chunk_seq, node.heading_path, \
+                chunk.text, chunk.markers, \
                 chunk.marker_embedding <=> $1::vector AS marker_distance \
-         FROM {table_name} AS chunk \
+         FROM {chunk_table} AS chunk \
+         JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
          JOIN document ON document.id = chunk.document_id \
          ORDER BY chunk.marker_embedding <=> $1::vector \
          LIMIT $2"
@@ -606,12 +703,16 @@ pub async fn query_markers(
             document_id: row.get("document_id"),
             filename: row.get("filename"),
             frontmatter: row.get("frontmatter"),
-            chunk_id: row.get("chunk_id"),
+            node_id: row.get("node_id"),
+            chunk_seq: row.get("chunk_seq"),
+            heading_path: row
+                .get::<Option<Value>, _>("heading_path")
+                .and_then(|v| parse_string_array(&v))
+                .unwrap_or_default(),
             text: row.get("text"),
-            embedding_text: row.get("embedding_text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
-                .and_then(|v| parse_markers_json(&v))
+                .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             marker_distance: row.get("marker_distance"),
             distance: 0.0,
@@ -661,11 +762,11 @@ pub struct DocumentSummary {
 }
 
 pub async fn list_documents(pool: &PgPool, kb_name: &str) -> Result<Vec<DocumentSummary>> {
-    let table_name = kb_table(kb_name)?;
+    let table_name = chunk_table(kb_name)?;
     let rows = sqlx::query(AssertSqlSafe(format!(
         "SELECT document.id, document.filename, \
                 to_char(document.updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at, \
-                COUNT(chunk.chunk_id) AS chunk_count, \
+                COUNT(chunk.node_id) AS chunk_count, \
                 (SELECT status FROM task WHERE task.document_id = document.id \
                  ORDER BY task.created_at DESC LIMIT 1) AS task_status \
          FROM document \

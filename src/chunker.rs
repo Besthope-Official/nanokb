@@ -1,17 +1,57 @@
 use crate::{Node, NodeKind, StructuredDocument};
 use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::OnceLock;
 use tokenizers::Tokenizer;
 
 static BPE_TOKENIZER: OnceLock<Tokenizer> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum BlockType {
+    #[serde(rename = "paragraph")]
+    Paragraph,
+    #[serde(rename = "code_block")]
+    CodeBlock,
+    #[serde(rename = "math_block")]
+    MathBlock,
+    #[serde(rename = "table")]
+    Table,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Block {
+    /// Index of this block within its section; stable across chunk repacking.
+    pub block_index: usize,
+    pub block_type: BlockType,
+    pub text: String,
+}
+
+pub struct NodeRow {
+    /// Hash of the heading path; content-derived, stable under sibling insertions.
+    pub node_id: String,
+    pub parent_id: Option<String>,
+    pub heading_path: Vec<String>,
+    pub title: String,
+    pub level: usize,
+    pub sort_order: usize,
+}
+
 pub struct Chunk {
-    /// Hash of the heading path and the chunk's leading block index within its section.
-    pub chunk_id: String,
+    /// The section this chunk belongs to.
+    pub node_id: String,
+    /// 0-based sequence of this chunk within its section.
+    pub chunk_seq: usize,
     pub text: String,
     pub embedding_text: String,
+    pub heading_path: Vec<String>,
+    pub blocks: Vec<Block>,
+}
+
+pub struct DocumentChunks {
+    pub nodes: Vec<NodeRow>,
+    pub chunks: Vec<Chunk>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -46,7 +86,7 @@ impl Default for ChunkStrategy {
 }
 
 impl StructuredDocument {
-    pub fn into_chunks(self, strategy: &ChunkStrategy) -> Vec<Chunk> {
+    pub fn into_chunks(self, strategy: &ChunkStrategy) -> DocumentChunks {
         match strategy {
             ChunkStrategy::Layered {
                 max_chunk_tokens,
@@ -56,7 +96,7 @@ impl StructuredDocument {
             ChunkStrategy::Fixed {
                 chunk_size,
                 overlap_tokens,
-            } => fixed_chunks(&self.full_text(), &self.metadata.filename, *chunk_size, *overlap_tokens),
+            } => fixed_chunks(&self.full_text(), *chunk_size, *overlap_tokens),
         }
     }
 }
@@ -66,9 +106,23 @@ fn layered_chunks(
     max_chunk_tokens: usize,
     overlap_ratio: f32,
     metadata_mode: MetadataMode,
-) -> Vec<Chunk> {
+) -> DocumentChunks {
+    let mut nodes = Vec::new();
     let mut chunks = Vec::new();
     let root = document.node(document.root);
+
+    let root_node_id = hash_node_id(&[], 0, 0);
+    nodes.push(NodeRow {
+        node_id: root_node_id.clone(),
+        parent_id: None,
+        heading_path: Vec::new(),
+        title: String::new(),
+        level: 0,
+        sort_order: 0,
+    });
+
+    let mut sort_counter = 1;
+    let mut sibling_ordinals: HashMap<(String, String, usize), usize> = HashMap::new();
     chunk_children(
         document,
         root,
@@ -76,9 +130,13 @@ fn layered_chunks(
         max_chunk_tokens,
         overlap_ratio,
         metadata_mode,
+        &root_node_id,
+        &mut sort_counter,
+        &mut sibling_ordinals,
+        &mut nodes,
         &mut chunks,
     );
-    chunks
+    DocumentChunks { nodes, chunks }
 }
 
 /// Process a section's direct content blocks in document order. A nested heading
@@ -90,19 +148,28 @@ fn chunk_children(
     max_chunk_tokens: usize,
     overlap_ratio: f32,
     metadata_mode: MetadataMode,
+    node_id: &str,
+    sort_counter: &mut usize,
+    sibling_ordinals: &mut HashMap<(String, String, usize), usize>,
+    nodes: &mut Vec<NodeRow>,
     chunks: &mut Vec<Chunk>,
 ) {
     let mut block_texts: Vec<String> = Vec::new();
+    let mut block_types: Vec<BlockType> = Vec::new();
     let mut block_offset = 0;
+    let mut chunk_counter = 0;
 
     for &child_id in &node.children {
         let child = document.node(child_id);
         match &child.kind {
-            NodeKind::Heading { title, .. } => {
+            NodeKind::Heading { title, level } => {
                 flush_content_blocks(
                     &block_texts,
+                    &block_types,
                     block_offset,
                     heading_path,
+                    node_id,
+                    &mut chunk_counter,
                     max_chunk_tokens,
                     overlap_ratio,
                     metadata_mode,
@@ -110,9 +177,28 @@ fn chunk_children(
                 );
                 block_offset += block_texts.len();
                 block_texts.clear();
+                block_types.clear();
 
                 let mut sub_path = heading_path.to_vec();
                 sub_path.push(title.clone());
+                let ordinal = {
+                    let counter = sibling_ordinals
+                        .entry((node_id.to_string(), title.clone(), *level))
+                        .or_insert(0);
+                    let ordinal = *counter;
+                    *counter += 1;
+                    ordinal
+                };
+                let sub_node_id = hash_node_id(&sub_path, *level, ordinal);
+                nodes.push(NodeRow {
+                    node_id: sub_node_id.clone(),
+                    parent_id: Some(node_id.to_string()),
+                    heading_path: sub_path.clone(),
+                    title: title.clone(),
+                    level: *level,
+                    sort_order: *sort_counter,
+                });
+                *sort_counter += 1;
                 chunk_children(
                     document,
                     child,
@@ -120,6 +206,10 @@ fn chunk_children(
                     max_chunk_tokens,
                     overlap_ratio,
                     metadata_mode,
+                    &sub_node_id,
+                    sort_counter,
+                    sibling_ordinals,
+                    nodes,
                     chunks,
                 );
             }
@@ -127,6 +217,7 @@ fn chunk_children(
                 let text = content_block_text(&child.kind);
                 if !text.is_empty() {
                     block_texts.push(text);
+                    block_types.push(block_type_of(&child.kind));
                 }
             }
         }
@@ -134,8 +225,11 @@ fn chunk_children(
 
     flush_content_blocks(
         &block_texts,
+        &block_types,
         block_offset,
         heading_path,
+        node_id,
+        &mut chunk_counter,
         max_chunk_tokens,
         overlap_ratio,
         metadata_mode,
@@ -166,8 +260,11 @@ fn content_block_text(kind: &NodeKind) -> String {
 /// chunk ids stay unique across the successive flushes of one section.
 fn flush_content_blocks(
     block_texts: &[String],
+    block_types: &[BlockType],
     block_offset: usize,
     heading_path: &[String],
+    node_id: &str,
+    chunk_counter: &mut usize,
     max_chunk_tokens: usize,
     overlap_ratio: f32,
     metadata_mode: MetadataMode,
@@ -182,22 +279,30 @@ fn flush_content_blocks(
     if bpe_token_count(&full_text) <= max_chunk_tokens {
         chunks.push(make_chunk(
             &full_text,
-            block_offset,
             heading_path,
             metadata_mode,
+            node_id,
+            *chunk_counter,
+            block_texts
+                .iter()
+                .enumerate()
+                .map(|(i, text)| Block {
+                    block_index: block_offset + i,
+                    block_type: block_types[i],
+                    text: text.clone(),
+                })
+                .collect(),
         ));
+        *chunk_counter += 1;
         return;
     }
 
     let overlap_size = ((max_chunk_tokens as f32 * overlap_ratio) as usize).min(max_chunk_tokens);
     let mut idx = 0;
-    let mut overlap_blocks: Vec<String> = Vec::new();
+    let mut overlap_blocks: Vec<Block> = Vec::new();
 
     while idx < block_texts.len() {
-        // The first not-yet-packed block identifies the chunk; each iteration
-        // consumes at least one, so this index is unique within the section.
-        let chunk_start = block_offset + idx;
-        let mut batch_blocks: Vec<String> = Vec::new();
+        let mut batch_blocks: Vec<Block> = Vec::new();
         let mut batch = String::new();
 
         // Overlap reuses complete content blocks, never sentences or characters.
@@ -205,7 +310,11 @@ fn flush_content_blocks(
             for block in &overlap_blocks {
                 batch_blocks.push(block.clone());
             }
-            batch = overlap_blocks.join("\n\n");
+            batch = overlap_blocks
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
             overlap_blocks.clear();
         }
 
@@ -230,19 +339,23 @@ fn flush_content_blocks(
                 break;
             }
             batch = candidate;
-            batch_blocks.push(next_block.to_string());
+            batch_blocks.push(Block {
+                block_index: block_offset + idx,
+                block_type: block_types[idx],
+                text: next_block.to_string(),
+            });
             idx += 1;
         }
 
         // Preserve the largest consecutive suffix that fits the overlap budget.
         if overlap_size > 0 && idx < block_texts.len() && !batch_blocks.is_empty() {
-            let mut tail_blocks: Vec<String> = Vec::new();
+            let mut tail_blocks: Vec<Block> = Vec::new();
             let mut tail = String::new();
             for block in batch_blocks.iter().rev() {
                 let candidate = if tail.is_empty() {
-                    block.clone()
+                    block.text.clone()
                 } else {
-                    format!("{block}\n\n{tail}")
+                    format!("{}\n\n{}", block.text, tail)
                 };
                 if bpe_token_count(&candidate) > overlap_size {
                     break;
@@ -254,11 +367,19 @@ fn flush_content_blocks(
             overlap_blocks = tail_blocks;
         }
 
-        let chunk = make_chunk(&batch, chunk_start, heading_path, metadata_mode);
+        let chunk = make_chunk(
+            &batch,
+            heading_path,
+            metadata_mode,
+            node_id,
+            *chunk_counter,
+            batch_blocks,
+        );
         // Oversized content blocks remain valid chunks but surface a diagnostic.
         warn_oversized_chunk(&chunk, max_chunk_tokens);
 
         chunks.push(chunk);
+        *chunk_counter += 1;
     }
 }
 
@@ -271,21 +392,36 @@ const SENTENCE_DELIMITERS: [char; 7] = ['\n', '.', '?', '!', '。', '！', '？'
 
 fn fixed_chunks(
     full_text: &str,
-    filename: &str,
     chunk_size: usize,
     overlap_tokens: usize,
-) -> Vec<Chunk> {
+) -> DocumentChunks {
     assert!(chunk_size > 0, "fixed chunk size must be greater than zero");
 
+    let root_node_id = hash_node_id(&[], 0, 0);
+    let nodes = vec![NodeRow {
+        node_id: root_node_id.clone(),
+        parent_id: None,
+        heading_path: Vec::new(),
+        title: String::new(),
+        level: 0,
+        sort_order: 0,
+    }];
+
     if full_text.is_empty() {
-        return vec![];
+        return DocumentChunks {
+            nodes,
+            chunks: Vec::new(),
+        };
     }
 
     let encoding = bpe_encode(full_text);
     let offsets = encoding.get_offsets();
     let total_tokens = offsets.len();
     if total_tokens <= chunk_size {
-        return vec![make_fixed_chunk(full_text, filename, 0)];
+        return DocumentChunks {
+            nodes,
+            chunks: vec![make_fixed_chunk(full_text, &root_node_id, 0)],
+        };
     }
 
     // Split the token stream into sentence-aligned segments.  A segment
@@ -333,7 +469,7 @@ fn fixed_chunks(
         }
 
         let text = segments[start..end].concat();
-        chunks.push(make_fixed_chunk(&text, filename, chunks.len()));
+        chunks.push(make_fixed_chunk(&text, &root_node_id, chunks.len()));
 
         if end >= segments.len() {
             break;
@@ -360,7 +496,7 @@ fn fixed_chunks(
         }
     }
 
-    chunks
+    DocumentChunks { nodes, chunks }
 }
 
 /// Emit a sentence (token span `first..=last`, inclusive of its terminating
@@ -389,16 +525,14 @@ fn push_sentence<'a>(
     }
 }
 
-fn make_fixed_chunk(text: &str, filename: &str, chunk_index: usize) -> Chunk {
-    let mut hasher = DefaultHasher::new();
-    filename.hash(&mut hasher);
-    chunk_index.hash(&mut hasher);
-    let chunk_id = format!("{:016x}", hasher.finish());
-
+fn make_fixed_chunk(text: &str, node_id: &str, chunk_seq: usize) -> Chunk {
     Chunk {
-        chunk_id,
+        node_id: node_id.to_string(),
+        chunk_seq,
         text: text.to_string(),
         embedding_text: text.to_string(),
+        heading_path: Vec::new(),
+        blocks: Vec::new(),
     }
 }
 
@@ -431,9 +565,11 @@ fn make_breadcrumb(heading_path: &[String]) -> String {
 
 fn make_chunk(
     text: &str,
-    block_index: usize,
     heading_path: &[String],
     metadata_mode: MetadataMode,
+    node_id: &str,
+    chunk_seq: usize,
+    blocks: Vec<Block>,
 ) -> Chunk {
     let embedding_text = match metadata_mode {
         MetadataMode::None => text.to_string(),
@@ -446,15 +582,31 @@ fn make_chunk(
         }
     };
 
-    let mut hasher = DefaultHasher::new();
-    heading_path.hash(&mut hasher);
-    block_index.hash(&mut hasher);
-    let chunk_id = format!("{:016x}", hasher.finish());
-
     Chunk {
-        chunk_id,
+        node_id: node_id.to_string(),
+        chunk_seq,
         text: text.to_string(),
         embedding_text,
+        heading_path: heading_path.to_vec(),
+        blocks,
+    }
+}
+
+fn hash_node_id(heading_path: &[String], level: usize, ordinal: usize) -> String {
+    let mut hasher = DefaultHasher::new();
+    heading_path.hash(&mut hasher);
+    level.hash(&mut hasher);
+    ordinal.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn block_type_of(kind: &NodeKind) -> BlockType {
+    match kind {
+        NodeKind::Paragraph { .. } => BlockType::Paragraph,
+        NodeKind::CodeBlock { .. } => BlockType::CodeBlock,
+        NodeKind::MathBlock { .. } => BlockType::MathBlock,
+        NodeKind::Table { .. } => BlockType::Table,
+        _ => unreachable!("content block kinds only"),
     }
 }
 
@@ -465,8 +617,8 @@ fn warn_oversized_chunk(chunk: &Chunk, max_chunk_tokens: usize) {
         let split_span = encoding.get_offsets()[max_chunk_tokens];
         let report = [Level::WARNING
             .primary_title(format!(
-                "chunk {} contains a node of {} tokens (> max_chunk_tokens {})",
-                chunk.chunk_id, chunk_tokens, max_chunk_tokens
+                "chunk {}:{} contains a node of {} tokens (> max_chunk_tokens {})",
+                chunk.node_id, chunk.chunk_seq, chunk_tokens, max_chunk_tokens
             ))
             .element(
                 Snippet::source(&chunk.text).annotation(
