@@ -248,19 +248,24 @@ impl std::fmt::Display for TokenUsage {
         let output_m = output as f64 / 1_000_000.0;
         let reasoning_m = self.reasoning as f64 / 1_000_000.0;
 
-        write!(f, "tokens: {input_m:.2} M input")?;
+        let mut line = format!("tokens: {input_m:.2} M input");
         if self.prompt > 0 {
             let pct = self.cache_hit as f64 / self.prompt as f64 * 100.0;
-            write!(f, " (cache {:.0}% hit)", pct)?;
+            line.push_str(&format!(" (cache {:.0}% hit)", pct));
         }
-        if self.reasoning > 0 {
-            write!(
-                f,
-                "\n        {reasoning_m:.2} M reasoning + {output_m:.2} M output"
-            )
+        let output_str = if output_m < 0.01 {
+            format!("{} K output", output / 1000)
         } else {
-            write!(f, " + {output_m:.2} M output")
+            format!("{output_m:.2} M output")
+        };
+        if self.reasoning > 0 {
+            line.push_str(&format!(
+                "\n        {reasoning_m:.2} M reasoning + {output_str}"
+            ));
+        } else {
+            line.push_str(&format!(" + {output_str}"));
         }
+        f.write_str(&line)
     }
 }
 

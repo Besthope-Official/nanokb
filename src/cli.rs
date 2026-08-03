@@ -565,18 +565,18 @@ async fn drain_tasks(
 
     let completed_normally = wait_all_done(pool, kb_name, &progress).await;
 
-    if completed_normally {
-        if let Some(usage) = pipeline.token_usage() {
-            eprintln!("{usage}");
-        }
-    }
-
     let _ = shutdown_tx.send(true);
     for handle in handles {
         let _ = handle.await;
     }
 
     progress.teardown();
+
+    if completed_normally {
+        if let Some(usage) = pipeline.token_usage() {
+            eprintln!("{usage}");
+        }
+    }
 
     if !completed_normally {
         let canceled = postgres::cancel_all_running(pool, kb_name).await?;
