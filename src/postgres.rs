@@ -476,7 +476,7 @@ pub async fn create_index(pool: &PgPool, kb_name: &str, index_config: &IndexConf
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct QueryResult {
     pub document_id: i64,
     pub filename: String,
