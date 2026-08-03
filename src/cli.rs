@@ -354,13 +354,6 @@ async fn run_query(
             "kb '{kb_name}' has no semantic index; it was created without pipeline.llm"
         );
     }
-    if matches!(effective_mode, QueryMode::Marker | QueryMode::Vector | QueryMode::Hybrid)
-        && meta.embed_config.is_none()
-    {
-        anyhow::bail!(
-            "kb '{kb_name}' is marker-only (no vector index); query it with --mode marker"
-        );
-    }
 
     match effective_mode {
         QueryMode::Vector => {

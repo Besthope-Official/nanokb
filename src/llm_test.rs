@@ -1,6 +1,7 @@
 use super::*;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::AtomicU64;
 use std::thread;
 
 fn start_mock_server(response_json: &'static str) -> String {
@@ -78,6 +79,8 @@ async fn chat_sends_expected_request_shape() {
         max_retries: 0,
         retry_delay_ms: 100,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -106,6 +109,8 @@ async fn chat_json_parses_response() {
         max_retries: 0,
         retry_delay_ms: 100,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -137,6 +142,8 @@ async fn chat_errors_on_empty_choices() {
         max_retries: 0,
         retry_delay_ms: 100,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -161,6 +168,8 @@ async fn chat_json_errors_on_invalid_json() {
         max_retries: 0,
         retry_delay_ms: 100,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -196,6 +205,8 @@ async fn chat_json_retries_and_succeeds() {
         max_retries: 2,
         retry_delay_ms: 1,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -232,6 +243,8 @@ async fn chat_json_exhausts_retries_and_fails() {
         max_retries: 2,
         retry_delay_ms: 1,
         reasoning_effort: None,
+        prompt_tokens: AtomicU64::new(0),
+        completion_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 

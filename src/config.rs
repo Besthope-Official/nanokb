@@ -290,8 +290,8 @@ impl QueryMode {
 impl AppConfig {
     /// The embedding provider selected by `pipeline.embedding`.
     ///
-    /// Errors when unset — an absent embedding means a marker-only kb, whose
-    /// retrieval does not touch the embedding provider at all.
+    /// Every kb requires an embedding model — vector, marker, and hybrid
+    /// retrieval all depend on dense vector comparison.
     pub fn embedding(&self) -> Result<&EmbeddingConfig> {
         let name = self.pipeline.embedding.as_deref().ok_or_else(|| {
             anyhow::anyhow!("pipeline.embedding is not set; marker-only kbs are built without it")

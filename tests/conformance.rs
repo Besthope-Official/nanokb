@@ -11,8 +11,6 @@ use sqlx::{AssertSqlSafe, PgPool};
 
 const KB_NAME: &str = "config_conformance";
 const KB_TABLE: &str = "kb_config_conformance";
-const MARKER_KB_NAME: &str = "marker_conformance";
-const MARKER_KB_TABLE: &str = "kb_marker_conformance";
 
 #[tokio::test]
 #[ignore = "requires the Docker Compose pgvector service"]
@@ -36,10 +34,10 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     create_kb(
         &pool,
         KB_NAME,
-        Some(3),
+        3,
         &chunk_config,
-        Some(&embed_config),
-        None,
+        &embed_config,
+        None,           // no LLM → vector-only kb
         "vector",
     )
     .await?;
@@ -56,18 +54,19 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .context("failed to inspect the conformance KB embedding column")?;
     assert_eq!(vector_type, "vector(3)");
 
-    let marker_type: (String, bool) = sqlx::query_as(
-        "SELECT format_type(attribute.atttypid, attribute.atttypmod), \
-                attribute.attnotnull \
-         FROM pg_attribute AS attribute \
-         JOIN pg_class AS relation ON relation.oid = attribute.attrelid \
-         WHERE relation.relname = $1 AND attribute.attname = 'marker_embedding'",
+    // marker_embedding column only exists when llm_config is set.
+    let has_marker_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_attribute AS a \
+             JOIN pg_class AS c ON c.oid = a.attrelid \
+             WHERE c.relname = $1 AND a.attname = 'marker_embedding'\
+         )",
     )
     .bind(KB_TABLE)
     .fetch_one(&pool)
     .await
     .context("failed to inspect the conformance KB marker_embedding column")?;
-    assert_eq!(marker_type, ("vector(3)".into(), true));
+    assert!(!has_marker_col, "marker_embedding column should not exist for vector-only kb");
 
     let stored_config: (serde_json::Value, serde_json::Value, String) =
         sqlx::query_as("SELECT chunk_config, embed_config, query_mode FROM kb_meta WHERE name = $1")
@@ -216,23 +215,6 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .context("failed to inspect marker index access method")?;
     assert_eq!(marker_index_method, "hnsw", "marker index should use HNSW");
 
-    // --- LLM without embedding is rejected ---
-    let llm_only_error = create_kb(
-        &pool,
-        MARKER_KB_NAME,
-        None,
-        &chunk_config,
-        None,
-        Some(&json!({"model": "conformance-llm"})),
-        "marker",
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        format!("{llm_only_error:#}").contains("marker search requires an embedding model"),
-        "LLM without embedding should be rejected: {llm_only_error:#}"
-    );
-
     reset_test_kb(&pool).await?;
     Ok(())
 }
@@ -242,15 +224,8 @@ async fn reset_test_kb(pool: &PgPool) -> Result<()> {
         .execute(pool)
         .await
         .context("failed to drop the conformance KB table")?;
-    sqlx::query(AssertSqlSafe(format!(
-        "DROP TABLE IF EXISTS {MARKER_KB_TABLE}"
-    )))
-    .execute(pool)
-    .await
-    .context("failed to drop the marker-only conformance KB table")?;
-    sqlx::query("DELETE FROM kb_meta WHERE name = $1 OR name = $2")
+    sqlx::query("DELETE FROM kb_meta WHERE name = $1")
         .bind(KB_NAME)
-        .bind(MARKER_KB_NAME)
         .execute(pool)
         .await
         .context("failed to delete conformance KB metadata")?;

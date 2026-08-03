@@ -122,67 +122,45 @@ fn kb_table(name: &str) -> Result<String> {
 /// Create a kb, failing if one already exists under `name`.
 ///
 /// A kb's chunking and embedding configuration is immutable, so creation is the
-/// only point at which either is written. `dimension`/`embed_config` are `None`
-/// for marker-only kbs, which skip the vector column and HNSW index entirely.
+/// only point at which either is written. The embedding model is required for
+/// every kb — vector, marker, and hybrid retrieval all depend on it.
 pub async fn create_kb(
     pool: &PgPool,
     name: &str,
-    dimension: Option<usize>,
+    dimension: usize,
     chunk_config: &Value,
-    embed_config: Option<&Value>,
+    embed_config: &Value,
     llm_config: Option<&Value>,
     query_mode: &str,
 ) -> Result<()> {
     let table_name = kb_table(name)?;
-    if let Some(dimension) = dimension {
-        anyhow::ensure!(
-            dimension > 0,
-            "embedding dimension must be greater than zero"
-        );
-    }
     anyhow::ensure!(
-        dimension.is_some() || llm_config.is_none(),
-        "kb '{name}' has llm configured but no embedding; \
-         marker search requires an embedding model"
+        dimension > 0,
+        "embedding dimension must be greater than zero"
     );
     let mut transaction = pool
         .begin()
         .await
         .with_context(|| format!("failed to begin transaction for kb {name}"))?;
 
-    let create_table = match dimension {
-        Some(dimension) => {
-            let marker_col = if llm_config.is_some() {
-                format!("marker_embedding vector({dimension}) NOT NULL,")
-            } else {
-                String::new()
-            };
-            format!(
-                r#"CREATE TABLE IF NOT EXISTS {table_name} (
-                document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-                chunk_id       TEXT NOT NULL,
-                text           TEXT NOT NULL,
-                embedding_text TEXT NOT NULL,
-                embedding      vector({dimension}) NOT NULL,
-                {marker_col}
-                markers        JSONB NOT NULL DEFAULT '[]',
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (document_id, chunk_id)
-            )"#
-            )
-        }
-        None => format!(
-            r#"CREATE TABLE IF NOT EXISTS {table_name} (
-                document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
-                chunk_id       TEXT NOT NULL,
-                text           TEXT NOT NULL,
-                embedding_text TEXT NOT NULL,
-                markers        JSONB NOT NULL DEFAULT '[]',
-                created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (document_id, chunk_id)
-            )"#
-        ),
+    let marker_col = if llm_config.is_some() {
+        format!("marker_embedding vector({dimension}) NOT NULL,")
+    } else {
+        String::new()
     };
+    let create_table = format!(
+        r#"CREATE TABLE IF NOT EXISTS {table_name} (
+            document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
+            chunk_id       TEXT NOT NULL,
+            text           TEXT NOT NULL,
+            embedding_text TEXT NOT NULL,
+            embedding      vector({dimension}) NOT NULL,
+            {marker_col}
+            markers        JSONB NOT NULL DEFAULT '[]',
+            created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (document_id, chunk_id)
+        )"#
+    );
 
     sqlx::query(AssertSqlSafe(create_table))
         .execute(&mut *transaction)
@@ -196,9 +174,9 @@ pub async fn create_kb(
     )
     .bind(name)
     .bind(Json(chunk_config))
-    .bind(embed_config.map(Json))
+    .bind(Json(embed_config))
     .bind(llm_config.map(Json))
-    .bind(dimension.map(|d| d as i32))
+    .bind(dimension as i32)
     .bind(query_mode)
     .execute(&mut *transaction)
     .await
@@ -464,27 +442,6 @@ pub async fn replace_document_chunks(
                 .bind(&texts)
                 .bind(&embedding_texts)
                 .bind(&embeddings)
-                .bind(&markers_json)
-                .execute(&mut *transaction)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to insert {} chunks for document {document_id}",
-                        chunks.len()
-                    )
-                })?;
-        } else {
-            let insert_sql = format!(
-                "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, markers) \
-                 SELECT $1, chunk_id, text, embedding_text, markers \
-                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::jsonb[]) \
-                 AS batch(chunk_id, text, embedding_text, markers)"
-            );
-            sqlx::query(AssertSqlSafe(insert_sql))
-                .bind(document_id)
-                .bind(&chunk_ids)
-                .bind(&texts)
-                .bind(&embedding_texts)
                 .bind(&markers_json)
                 .execute(&mut *transaction)
                 .await

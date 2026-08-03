@@ -1,6 +1,7 @@
 use crate::config::LlmConfig;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct ChatMessage {
     pub role: String,
@@ -33,6 +34,8 @@ pub struct LlmClient {
     retry_delay_ms: u64,
     reasoning_effort: Option<String>,
     http: reqwest::Client,
+    prompt_tokens: AtomicU64,
+    completion_tokens: AtomicU64,
 }
 
 impl LlmClient {
@@ -51,6 +54,8 @@ impl LlmClient {
             retry_delay_ms: config.retry_delay_ms,
             reasoning_effort: config.reasoning_effort.clone(),
             http,
+            prompt_tokens: AtomicU64::new(0),
+            completion_tokens: AtomicU64::new(0),
         })
     }
 
@@ -90,6 +95,12 @@ impl LlmClient {
             self.reasoning_effort.as_deref(),
         )
         .await?;
+        if let Some(ref usage) = response.usage {
+            self.prompt_tokens
+                .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
+            self.completion_tokens
+                .fetch_add(usage.completion_tokens, Ordering::Relaxed);
+        }
         let choice = response
             .choices
             .into_iter()
@@ -140,6 +151,12 @@ impl LlmClient {
             self.reasoning_effort.as_deref(),
         )
         .await?;
+        if let Some(ref usage) = response.usage {
+            self.prompt_tokens
+                .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
+            self.completion_tokens
+                .fetch_add(usage.completion_tokens, Ordering::Relaxed);
+        }
         let choice = response
             .choices
             .into_iter()
@@ -148,6 +165,16 @@ impl LlmClient {
         serde_json::from_str(&choice.message.content).with_context(|| {
             format!("failed to parse LLM JSON response: {}", choice.message.content)
         })
+    }
+
+    /// Cumulative token consumption since this client was created.
+    ///
+    /// Returns `(prompt_tokens, completion_tokens)`.
+    pub fn token_usage(&self) -> (u64, u64) {
+        (
+            self.prompt_tokens.load(Ordering::Relaxed),
+            self.completion_tokens.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -202,11 +229,18 @@ async fn send_chat_request(
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 struct Choice {
     message: ResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct Usage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]

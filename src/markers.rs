@@ -12,26 +12,31 @@ const MARKER_SYSTEM_PROMPT: &str =
      that a user search query about this block would plausibly contain. Prefer terms \
      that are specific, reusable across blocks, and stable.";
 
+fn marker_messages(embedding_text: &str) -> [ChatMessage; 2] {
+    [
+        ChatMessage::system(MARKER_SYSTEM_PROMPT),
+        ChatMessage::user(format!(
+            "{}\n\nRespond with JSON: {{\"markers\": [...]}}. Only the JSON object.",
+            embedding_text
+        )),
+    ]
+}
+
 /// Extract markers for one chunk via LLM.
 ///
 /// Uses `chunk.embedding_text` as input, which carries the heading path for
 /// layered chunks — this is the paper's structural position **p**.
 pub async fn generate_chunk_markers(llm: &LlmClient, chunk: &Chunk) -> Result<Vec<String>> {
-    let messages = [
-        ChatMessage::system(MARKER_SYSTEM_PROMPT),
-        ChatMessage::user(format!(
-            "{}\n\nRespond with JSON: {{\"markers\": [...]}}. Only the JSON object.",
-            chunk.embedding_text
-        )),
-    ];
-
-    let response: Value = llm.chat_json(&messages).await?;
+    let response: Value = llm.chat_json(&marker_messages(&chunk.embedding_text)).await?;
     parse_string_list(&response, "markers")
 }
 
 /// Generate markers for all chunks with bounded concurrency.
 ///
 /// Fail-fast: the first error aborts all remaining tasks.
+///
+/// Returns the per-chunk marker lists and the cumulative LLM token usage
+/// `(prompt_tokens, completion_tokens)`.
 pub async fn generate_document_markers(
     llm: Arc<LlmClient>,
     chunks: &[Chunk],
@@ -50,15 +55,10 @@ pub async fn generate_document_markers(
         for (i, chunk) in batch.iter().enumerate() {
             let idx = batch_start + i;
             let llm = Arc::clone(&llm);
-            let messages = [
-                ChatMessage::system(MARKER_SYSTEM_PROMPT),
-                ChatMessage::user(format!(
-                    "{}\n\nRespond with JSON: {{\"markers\": [...]}}. Only the JSON object.",
-                    chunk.embedding_text
-                )),
-            ];
+            let chunk_text = chunk.embedding_text.clone();
 
             set.spawn(async move {
+                let messages = marker_messages(&chunk_text);
                 let response: Value = llm.chat_json(&messages).await?;
                 let markers = parse_string_list(&response, "markers")?;
                 Ok::<_, anyhow::Error>((idx, markers))
