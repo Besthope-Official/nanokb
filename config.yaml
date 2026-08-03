@@ -18,9 +18,20 @@ model:
       api_base: "{QWEN_EMBED_API_BASE}"
       api_key: "{QWEN_EMBED_API_KEY}"
       batch_size: 20
+  llms:
+    deepseek:
+      model_name: "deepseek-v4-flash"
+      api_base: "{DEEPSEEK_API_BASE}"
+      api_key: "{DEEPSEEK_API_KEY}"
+      temperature: 0.2
+      max_tokens: 2048
+      concurrency: 5
+      reasoning_effort: "low"
 
 pipeline:
   embedding: bge_m3
+  llm: deepseek
+  query_mode: hybrid
   worker_count: 4
   top_k: 5
   max_chunk_tokens: 256

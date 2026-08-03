@@ -20,8 +20,15 @@ pub struct AppConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
-    #[serde(default = "default_embedding")]
-    pub embedding: String,
+    /// Embedding provider for the vector index. Required — every kb depends on it.
+    #[serde(default)]
+    pub embedding: Option<String>,
+    /// LLM provider for the semantic marker index. Absent -> vector-only kb.
+    #[serde(default)]
+    pub llm: Option<String>,
+    /// Default retrieval mode for `query`; snapshotted into the kb at create time.
+    #[serde(default)]
+    pub query_mode: Option<String>,
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
     #[serde(default = "default_top_k")]
@@ -45,7 +52,9 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            embedding: default_embedding(),
+            embedding: None,
+            llm: None,
+            query_mode: None,
             worker_count: default_worker_count(),
             top_k: default_top_k(),
             max_chunk_tokens: default_max_chunk_tokens(),
@@ -74,10 +83,6 @@ impl PipelineConfig {
             other => panic!("unknown pipeline.chunk_strategy {other:?}; expected \"fixed\" or \"layered\""),
         }
     }
-}
-
-fn default_embedding() -> String {
-    "default".to_string()
 }
 
 fn default_worker_count() -> usize {
@@ -132,6 +137,8 @@ pub struct DatabaseConfig {
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     pub embeddings: HashMap<String, EmbeddingConfig>,
+    #[serde(default)]
+    pub llms: HashMap<String, LlmConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -143,6 +150,74 @@ pub struct EmbeddingConfig {
     /// Maximum inputs per embedding request, capped by the provider's API limit.
     #[serde(default = "default_embed_batch_size")]
     pub batch_size: usize,
+    /// HTTP request timeout in seconds.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts for failed embedding calls (0 = no retry).
+    #[serde(default = "default_embed_max_retries")]
+    pub max_retries: usize,
+    /// Base delay between retries in milliseconds, doubled each attempt.
+    #[serde(default = "default_embed_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    pub model_name: String,
+    pub api_base: String,
+    pub api_key: String,
+    #[serde(default = "default_llm_temperature")]
+    pub temperature: f32,
+    #[serde(default = "default_llm_max_tokens")]
+    pub max_tokens: usize,
+    #[serde(default = "default_llm_concurrency")]
+    pub concurrency: usize,
+    /// HTTP request timeout in seconds.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts for failed LLM calls (0 = no retry).
+    #[serde(default = "default_llm_max_retries")]
+    pub max_retries: usize,
+    /// Base delay between retries in milliseconds, doubled each attempt.
+    #[serde(default = "default_llm_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+    /// Reasoning effort for supported models ("low", "medium", "high").
+    /// Omitted from the request when unset.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+fn default_llm_temperature() -> f32 {
+    0.2
+}
+
+fn default_llm_max_tokens() -> usize {
+    512
+}
+
+fn default_llm_concurrency() -> usize {
+    4
+}
+
+fn default_request_timeout_secs() -> u64 {
+    60
+}
+
+fn default_embed_max_retries() -> usize {
+    3
+}
+
+fn default_embed_retry_delay_ms() -> u64 {
+    1000
+}
+
+fn default_llm_max_retries() -> usize {
+    3
+}
+
+fn default_llm_retry_delay_ms() -> u64 {
+    1000
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -182,10 +257,45 @@ impl Default for IndexConfig {
     }
 }
 
+/// The retrieval modes a kb can serve; `query` defaults to the kb's
+/// snapshotted mode unless overridden with `--mode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum QueryMode {
+    Vector,
+    Marker,
+    Hybrid,
+}
+
+impl QueryMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueryMode::Vector => "vector",
+            QueryMode::Marker => "marker",
+            QueryMode::Hybrid => "hybrid",
+        }
+    }
+
+    pub fn parse(mode: &str) -> Result<Self> {
+        match mode {
+            "vector" => Ok(QueryMode::Vector),
+            "marker" => Ok(QueryMode::Marker),
+            "hybrid" => Ok(QueryMode::Hybrid),
+            other => anyhow::bail!(
+                "unknown query mode {other:?}; expected \"vector\", \"marker\" or \"hybrid\""
+            ),
+        }
+    }
+}
+
 impl AppConfig {
     /// The embedding provider selected by `pipeline.embedding`.
+    ///
+    /// Every kb requires an embedding model — vector, marker, and hybrid
+    /// retrieval all depend on dense vector comparison.
     pub fn embedding(&self) -> Result<&EmbeddingConfig> {
-        let name = &self.pipeline.embedding;
+        let name = self.pipeline.embedding.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("pipeline.embedding is not set; every kb requires an embedding model")
+        })?;
         self.model.embeddings.get(name).ok_or_else(|| {
             anyhow::anyhow!(
                 "pipeline.embedding refers to unknown provider {name:?}; \
@@ -222,6 +332,50 @@ impl AppConfig {
 
     fn embedding_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.model.embeddings.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+
+    /// The LLM provider selected by `pipeline.llm`.
+    pub fn llm(&self) -> Result<&LlmConfig> {
+        let name = self
+            .pipeline
+            .llm
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("pipeline.llm is not set"))?;
+        self.model.llms.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "pipeline.llm refers to unknown provider {name:?}; \
+                 model.llms defines: {}",
+                self.llm_names().join(", ")
+            )
+        })
+    }
+
+    /// Look up an LLM provider by the model name it serves.
+    pub fn llm_for_model(&self, model_name: &str) -> Result<&LlmConfig> {
+        let mut matches = self
+            .model
+            .llms
+            .values()
+            .filter(|llm| llm.model_name == model_name);
+        let llm = matches.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "no provider in model.llms serves model {model_name:?}; \
+                 defined providers: {}",
+                self.llm_names().join(", ")
+            )
+        })?;
+        anyhow::ensure!(
+            matches.next().is_none(),
+            "several providers in model.llms serve model {model_name:?}; \
+             remove the duplicates so the kb resolves to one endpoint"
+        );
+        Ok(llm)
+    }
+
+    fn llm_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.model.llms.keys().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
@@ -294,8 +448,12 @@ fn parse_config(yaml: &str, variables: &HashMap<String, String>) -> Result<AppCo
     if let Some(name) = unresolved_placeholder(&value) {
         bail!("unresolved configuration placeholder: {name}");
     }
-    yaml_serde::from_value(value)
-        .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))
+    let config: AppConfig = yaml_serde::from_value(value)
+        .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))?;
+    if let Some(mode) = &config.pipeline.query_mode {
+        QueryMode::parse(mode)?;
+    }
+    Ok(config)
 }
 
 fn interpolate_value(value: &mut Value, variables: &HashMap<String, String>) {

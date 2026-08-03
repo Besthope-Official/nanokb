@@ -53,7 +53,9 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
             name         TEXT PRIMARY KEY,
             chunk_config JSONB NOT NULL,
             embed_config JSONB NOT NULL,
+            llm_config   JSONB,
             dimension    INTEGER NOT NULL,
+            query_mode   TEXT NOT NULL,
             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         )"#,
     )
@@ -120,13 +122,16 @@ fn kb_table(name: &str) -> Result<String> {
 /// Create a kb, failing if one already exists under `name`.
 ///
 /// A kb's chunking and embedding configuration is immutable, so creation is the
-/// only point at which either is written.
+/// only point at which either is written. The embedding model is required for
+/// every kb — vector, marker, and hybrid retrieval all depend on it.
 pub async fn create_kb(
     pool: &PgPool,
     name: &str,
     dimension: usize,
     chunk_config: &Value,
     embed_config: &Value,
+    llm_config: Option<&Value>,
+    query_mode: &str,
 ) -> Result<()> {
     let table_name = kb_table(name)?;
     anyhow::ensure!(
@@ -138,6 +143,11 @@ pub async fn create_kb(
         .await
         .with_context(|| format!("failed to begin transaction for kb {name}"))?;
 
+    let marker_col = if llm_config.is_some() {
+        format!("marker_embedding vector({dimension}) NOT NULL,")
+    } else {
+        String::new()
+    };
     let create_table = format!(
         r#"CREATE TABLE IF NOT EXISTS {table_name} (
             document_id    BIGINT NOT NULL REFERENCES document(id) ON DELETE CASCADE,
@@ -145,6 +155,8 @@ pub async fn create_kb(
             text           TEXT NOT NULL,
             embedding_text TEXT NOT NULL,
             embedding      vector({dimension}) NOT NULL,
+            {marker_col}
+            markers        JSONB NOT NULL DEFAULT '[]',
             created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (document_id, chunk_id)
         )"#
@@ -156,12 +168,16 @@ pub async fn create_kb(
         .with_context(|| format!("failed to create data table for kb {name}"))?;
 
     let inserted = sqlx::query(
-        "INSERT INTO kb_meta (name, chunk_config, embed_config, dimension) VALUES ($1, $2, $3, $4) ON CONFLICT (name) DO NOTHING",
+        "INSERT INTO kb_meta \
+         (name, chunk_config, embed_config, llm_config, dimension, query_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
     .bind(Json(chunk_config))
     .bind(Json(embed_config))
+    .bind(llm_config.map(Json))
     .bind(dimension as i32)
+    .bind(query_mode)
     .execute(&mut *transaction)
     .await
     .with_context(|| format!("failed to insert metadata for kb {name}"))?;
@@ -179,7 +195,10 @@ pub struct KbMeta {
     pub name: String,
     pub chunk_config: Value,
     pub embed_config: Value,
+    pub llm_config: Option<Value>,
     pub dimension: usize,
+    /// Default retrieval mode, snapshotted at create; `query` falls back to it.
+    pub query_mode: String,
     pub created_at: String,
 }
 
@@ -193,7 +212,7 @@ pub struct KbMeta {
 pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
     validate_kb_name(kb_name)?;
     let row = sqlx::query(
-        "SELECT name, chunk_config, embed_config, dimension, \
+        "SELECT name, chunk_config, embed_config, llm_config, dimension, query_mode, \
                 to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at \
          FROM kb_meta WHERE name = $1",
     )
@@ -208,7 +227,9 @@ pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
         name: row.get("name"),
         chunk_config: row.get("chunk_config"),
         embed_config: row.get("embed_config"),
+        llm_config: row.get("llm_config"),
         dimension: dimension as usize,
+        query_mode: row.get("query_mode"),
         created_at: row.get("created_at"),
     })
 }
@@ -317,6 +338,8 @@ pub struct ChunkRow {
     pub text: String,
     pub embedding_text: String,
     pub embedding: Vec<f32>,
+    pub marker_embedding: Vec<f32>,
+    pub markers: Vec<String>,
 }
 
 pub async fn replace_document_chunks(
@@ -339,6 +362,14 @@ pub async fn replace_document_chunks(
         document_kb == kb_name,
         "document {document_id} belongs to kb {document_kb}, not {kb_name}"
     );
+    let has_llm: bool = sqlx::query_scalar(
+        "SELECT llm_config IS NOT NULL FROM kb_meta WHERE name = $1",
+    )
+    .bind(kb_name)
+    .fetch_one(&mut *transaction)
+    .await
+    .with_context(|| format!("failed to load kb meta for {kb_name}"))?;
+
     let delete_sql = format!("DELETE FROM {table_name} WHERE document_id = $1");
     sqlx::query(AssertSqlSafe(delete_sql))
         .bind(document_id)
@@ -349,31 +380,66 @@ pub async fn replace_document_chunks(
         let chunk_ids: Vec<&str> = chunks.iter().map(|c| c.chunk_id.as_str()).collect();
         let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
         let embedding_texts: Vec<&str> = chunks.iter().map(|c| c.embedding_text.as_str()).collect();
+        let markers_json: Vec<Value> = chunks
+            .iter()
+            .map(|c| Value::Array(c.markers.iter().map(|m| Value::String(m.clone())).collect()))
+            .collect();
+
         let embeddings: Vec<Vector> = chunks
             .iter()
             .map(|c| Vector::from(c.embedding.clone()))
             .collect();
 
-        let insert_sql = format!(
-            "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding) \
-             SELECT $1, chunk_id, text, embedding_text, embedding \
-             FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[]) \
-             AS batch(chunk_id, text, embedding_text, embedding)"
-        );
-        sqlx::query(AssertSqlSafe(insert_sql))
-            .bind(document_id)
-            .bind(&chunk_ids)
-            .bind(&texts)
-            .bind(&embedding_texts)
-            .bind(&embeddings)
-            .execute(&mut *transaction)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to insert {} chunks for document {document_id}",
-                    chunks.len()
-                )
-            })?;
+        if has_llm {
+            let marker_embeddings: Vec<Vector> = chunks
+                .iter()
+                .map(|c| Vector::from(c.marker_embedding.clone()))
+                .collect();
+            let insert_sql = format!(
+                "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding, marker_embedding, markers) \
+                 SELECT $1, chunk_id, text, embedding_text, embedding, marker_embedding, markers \
+                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[], $6::vector[], $7::jsonb[]) \
+                 AS batch(chunk_id, text, embedding_text, embedding, marker_embedding, markers)"
+            );
+            sqlx::query(AssertSqlSafe(insert_sql))
+                .bind(document_id)
+                .bind(&chunk_ids)
+                .bind(&texts)
+                .bind(&embedding_texts)
+                .bind(&embeddings)
+                .bind(&marker_embeddings)
+                .bind(&markers_json)
+                .execute(&mut *transaction)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to insert {} chunks for document {document_id}",
+                        chunks.len()
+                    )
+                })?;
+        } else {
+            let insert_sql = format!(
+                "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding, markers) \
+                 SELECT $1, chunk_id, text, embedding_text, embedding, markers \
+                 FROM UNNEST($2::text[], $3::text[], $4::text[], $5::vector[], $6::jsonb[]) \
+                 AS batch(chunk_id, text, embedding_text, embedding, markers)"
+            );
+            sqlx::query(AssertSqlSafe(insert_sql))
+                .bind(document_id)
+                .bind(&chunk_ids)
+                .bind(&texts)
+                .bind(&embedding_texts)
+                .bind(&embeddings)
+                .bind(&markers_json)
+                .execute(&mut *transaction)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to insert {} chunks for document {document_id}",
+                        chunks.len()
+                    )
+                })?;
+        }
     }
     transaction
         .commit()
@@ -418,6 +484,9 @@ pub struct QueryResult {
     pub chunk_id: String,
     pub text: String,
     pub embedding_text: String,
+    pub markers: Vec<String>,
+    /// Cosine distance of the chunk's marker embedding against the query vector.
+    pub marker_distance: f64,
     pub distance: f64,
 }
 
@@ -431,7 +500,7 @@ pub async fn query_chunks(
     let vector = Vector::from(query_embedding.to_vec());
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
-                chunk.chunk_id, chunk.text, chunk.embedding_text, \
+                chunk.chunk_id, chunk.text, chunk.embedding_text, chunk.markers, \
                 chunk.embedding <=> $1::vector AS distance \
          FROM {table_name} AS chunk \
          JOIN document ON document.id = chunk.document_id \
@@ -454,7 +523,98 @@ pub async fn query_chunks(
             chunk_id: row.get("chunk_id"),
             text: row.get("text"),
             embedding_text: row.get("embedding_text"),
+            markers: row
+                .get::<Option<Value>, _>("markers")
+                .and_then(|v| parse_markers_json(&v))
+                .unwrap_or_default(),
+            marker_distance: 0.0,
             distance: row.get("distance"),
+        })
+        .collect())
+}
+
+fn parse_markers_json(value: &Value) -> Option<Vec<String>> {
+    value.as_array().map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    })
+}
+
+/// Create an HNSW index on the marker_embedding column for dense vector marker search.
+pub async fn create_marker_index(
+    pool: &PgPool,
+    kb_name: &str,
+    index_config: &IndexConfig,
+) -> Result<()> {
+    let table_name = kb_table(kb_name)?;
+    match index_config {
+        IndexConfig::Hnsw {
+            m,
+            ef_construction,
+            ef_search: _,
+        } => {
+            let index_name = format!("idx_{table_name}_marker_embedding");
+            let create_sql = format!(
+                "CREATE INDEX IF NOT EXISTS {index_name} ON {table_name} \
+                 USING hnsw (marker_embedding vector_cosine_ops) \
+                 WITH (m = {m}, ef_construction = {ef_construction})"
+            );
+            sqlx::query(AssertSqlSafe(create_sql))
+                .execute(pool)
+                .await
+                .with_context(|| {
+                    format!("failed to create HNSW marker index for kb {kb_name}")
+                })?;
+        }
+    }
+    Ok(())
+}
+
+/// Search chunks by vector similarity on marker embeddings.
+///
+/// The query text is embedded with the same model used for chunk embeddings
+/// and compared against `marker_embedding` via cosine distance.
+pub async fn query_markers(
+    pool: &PgPool,
+    kb_name: &str,
+    query_embedding: &[f32],
+    top_k: usize,
+) -> Result<Vec<QueryResult>> {
+    let table_name = kb_table(kb_name)?;
+    let vector = Vector::from(query_embedding.to_vec());
+
+    let sql = format!(
+        "SELECT chunk.document_id, document.filename, document.frontmatter, \
+                chunk.chunk_id, chunk.text, chunk.embedding_text, chunk.markers, \
+                chunk.marker_embedding <=> $1::vector AS marker_distance \
+         FROM {table_name} AS chunk \
+         JOIN document ON document.id = chunk.document_id \
+         ORDER BY chunk.marker_embedding <=> $1::vector \
+         LIMIT $2"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(vector)
+        .bind(top_k as i64)
+        .fetch_all(pool)
+        .await
+        .with_context(|| format!("failed to query markers in kb {kb_name}"))?;
+
+    Ok(rows
+        .iter()
+        .map(|row| QueryResult {
+            document_id: row.get("document_id"),
+            filename: row.get("filename"),
+            frontmatter: row.get("frontmatter"),
+            chunk_id: row.get("chunk_id"),
+            text: row.get("text"),
+            embedding_text: row.get("embedding_text"),
+            markers: row
+                .get::<Option<Value>, _>("markers")
+                .and_then(|v| parse_markers_json(&v))
+                .unwrap_or_default(),
+            marker_distance: row.get("marker_distance"),
+            distance: 0.0,
         })
         .collect())
 }

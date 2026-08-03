@@ -1,5 +1,6 @@
+use crate::config::QueryMode;
 use crate::pipeline::Pipeline;
-use crate::{AppConfig, EmbedClient, postgres, task};
+use crate::{AppConfig, EmbedClient, EmbedModel, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -156,7 +157,14 @@ enum TopLevelCommand {
         command: DocCommand,
     },
     #[command(about = "Return the top_k nearest chunks in a kb")]
-    Query { kb: String, text: String },
+    Query {
+        kb: String,
+        text: String,
+        #[arg(long, value_enum)]
+        mode: Option<QueryMode>,
+        #[arg(long)]
+        top_k: Option<usize>,
+    },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
 }
@@ -243,7 +251,12 @@ pub async fn run() -> Result<()> {
         TopLevelCommand::Doc {
             command: DocCommand::List { kb },
         } => run_doc_list(&pool, &kb).await,
-        TopLevelCommand::Query { kb, text } => run_query(&config, &pool, &kb, &text).await,
+        TopLevelCommand::Query {
+            kb,
+            text,
+            mode,
+            top_k,
+        } => run_query(&config, &pool, &kb, &text, mode, top_k).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -274,7 +287,18 @@ async fn run_kb_info(pool: &sqlx::PgPool, kb_name: &str) -> Result<()> {
     println!("created     {}", meta.created_at);
     println!("dimension   {}", meta.dimension);
     println!("embedding   {}", meta.embed_config);
+    println!("retrieval   {} (default query mode)", meta.query_mode);
     println!("chunking    {}", meta.chunk_config);
+    match &meta.llm_config {
+        Some(cfg) => {
+            let model = cfg
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            println!("semantic    enabled ({model})");
+        }
+        None => println!("semantic    disabled"),
+    }
     println!("documents   {}", documents.len());
     println!("chunks      {chunks}");
     println!("tasks       {pending} pending, {running} running, {failed} failed");
@@ -310,32 +334,150 @@ async fn run_query(
     pool: &sqlx::PgPool,
     kb_name: &str,
     query_text: &str,
+    mode: Option<QueryMode>,
+    top_k: Option<usize>,
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
-    let stored_model = meta
-        .embed_config
+    let semantic = meta.llm_config.is_some();
+    let top_k = top_k.unwrap_or(config.pipeline.top_k);
+
+    let effective_mode = mode.unwrap_or(QueryMode::parse(&meta.query_mode)?);
+
+    if matches!(effective_mode, QueryMode::Marker | QueryMode::Hybrid) && !semantic {
+        anyhow::bail!(
+            "kb '{kb_name}' has no semantic index; it was created without pipeline.llm"
+        );
+    }
+
+    match effective_mode {
+        QueryMode::Vector => {
+            let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let embedding = model.embed_query(query_text).await?;
+            let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
+            for result in &results {
+                println!("[{:.4}] {}", result.distance, result.text);
+            }
+        }
+        QueryMode::Marker => {
+            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let emb = embed_model.embed_query(query_text).await?;
+            let results = postgres::query_markers(pool, kb_name, &emb, top_k).await?;
+            for result in &results {
+                println!("[{:.4} marker] {}", result.marker_distance, result.text);
+            }
+        }
+        QueryMode::Hybrid => {
+            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let query_emb = embed_model.embed_query(query_text).await?;
+
+            // Run marker and vector retrieval in parallel, sharing the query embedding.
+            let (marker_results, vector_results) = tokio::join!(
+                async {
+                    postgres::query_markers(pool, kb_name, &query_emb, top_k).await
+                },
+                async {
+                    postgres::query_chunks(pool, kb_name, &query_emb, top_k).await
+                },
+            );
+            let marker_results = marker_results?;
+            let vector_results = vector_results?;
+
+            for entry in rrf_fusion(&marker_results, &vector_results, top_k) {
+                println!(
+                    "[{:.4} rrf] [{}] {}",
+                    entry.rrf_score,
+                    if entry.source == "marker" {
+                        format!("{:.4} marker", entry.result.marker_distance)
+                    } else {
+                        format!("{:.4} vec", entry.result.distance)
+                    },
+                    entry.result.text
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn load_embed_model_for_kb(
+    config: &AppConfig,
+    meta: &postgres::KbMeta,
+    kb_name: &str,
+) -> Result<EmbedModel> {
+    let stored_model = meta.embed_config
         .get("model")
         .and_then(|value| value.as_str())
         .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
     let embedding_config = config.embedding_for_model(stored_model)?;
-    let model = EmbedClient::from_config(embedding_config)?
+    let embed_model = EmbedClient::from_config(embedding_config)?
         .dimension()
         .await?;
     anyhow::ensure!(
-        model.dimension == meta.dimension,
+        embed_model.dimension == meta.dimension,
         "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
         meta.dimension,
-        model.dimension
+        embed_model.dimension
     );
+    Ok(embed_model)
+}
 
-    let embedding = model.embed_query(query_text).await?;
-    let top_k = config.pipeline.top_k;
-    let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
+struct RrfEntry<'a> {
+    result: &'a postgres::QueryResult,
+    source: &'static str,
+    rrf_score: f64,
+}
 
-    for result in &results {
-        println!("[{:.4}] {}", result.distance, result.text);
+/// Fuse marker and vector retrieval results using Reciprocal Rank Fusion.
+///
+/// Each result list contributes to the fused score as `1 / (k + rank)`, where
+/// `rank` is 1-based and `k = 60`. Chunks appearing in both lists accumulate
+/// scores from both channels. Results are sorted by RRF score descending and
+/// truncated to `top_k`.
+///
+/// A later reranker can consume `RrfEntry` directly — the RRF score and
+/// per-channel metadata are preserved.
+fn rrf_fusion<'a>(
+    marker_results: &'a [postgres::QueryResult],
+    vector_results: &'a [postgres::QueryResult],
+    top_k: usize,
+) -> Vec<RrfEntry<'a>> {
+    const RRF_K: f64 = 60.0;
+
+    let mut scores: std::collections::HashMap<(i64, String), f64> =
+        std::collections::HashMap::new();
+    let mut chunk_map: std::collections::HashMap<(i64, String), (&'a postgres::QueryResult, &'static str)> =
+        std::collections::HashMap::new();
+
+    for (rank, result) in marker_results.iter().enumerate() {
+        let key = (result.document_id, result.chunk_id.clone());
+        let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *scores.entry(key.clone()).or_insert(0.0) += score;
+        chunk_map.entry(key).or_insert((result, "marker"));
     }
-    Ok(())
+
+    for (rank, result) in vector_results.iter().enumerate() {
+        let key = (result.document_id, result.chunk_id.clone());
+        let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
+        *scores.entry(key.clone()).or_insert(0.0) += score;
+        chunk_map.entry(key).or_insert((result, "vector"));
+    }
+
+    let mut ranked: Vec<((i64, String), f64)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(top_k);
+
+    ranked
+        .into_iter()
+        .map(|(key, score)| {
+            let (result, source) = chunk_map.remove(&key).unwrap();
+            RrfEntry {
+                result,
+                source,
+                rrf_score: score,
+            }
+        })
+        .collect()
 }
 
 async fn run_doc_add(
@@ -430,6 +572,12 @@ async fn drain_tasks(
 
     progress.teardown();
 
+    if completed_normally {
+        if let Some(usage) = pipeline.token_usage() {
+            eprintln!("{usage}");
+        }
+    }
+
     if !completed_normally {
         let canceled = postgres::cancel_all_running(pool, kb_name).await?;
         if canceled > 0 {
@@ -483,6 +631,26 @@ async fn wait_all_done(pool: &sqlx::PgPool, kb_name: &str, progress: &Progress) 
 mod tests {
     use super::*;
 
+    fn make_query_result(
+        doc_id: i64,
+        chunk_id: &str,
+        text: &str,
+        marker_distance: f64,
+        distance: f64,
+    ) -> postgres::QueryResult {
+        postgres::QueryResult {
+            document_id: doc_id,
+            filename: String::new(),
+            frontmatter: serde_json::Value::Null,
+            chunk_id: chunk_id.to_string(),
+            text: text.to_string(),
+            embedding_text: String::new(),
+            markers: Vec::new(),
+            marker_distance,
+            distance,
+        }
+    }
+
     #[test]
     fn parses_kb_create_with_an_optional_config_path() {
         let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "recipe.yaml"]).unwrap();
@@ -496,5 +664,90 @@ mod tests {
                 },
             } if name == "books" && config_path == PathBuf::from("recipe.yaml")
         ));
+    }
+
+    #[test]
+    fn rrf_single_channel_returns_in_order() {
+        let marker = vec![
+            make_query_result(1, "a", "alpha", 5.0, 0.0),
+            make_query_result(1, "b", "beta", 3.0, 0.0),
+        ];
+        let vector = vec![];
+
+        let fused = rrf_fusion(&marker, &vector, 2);
+
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].result.chunk_id, "a");
+        assert_eq!(fused[0].source, "marker");
+        assert_eq!(fused[1].result.chunk_id, "b");
+        // Higher rank (0 = 1st) gets higher RRF score.
+        assert!(fused[0].rrf_score > fused[1].rrf_score);
+    }
+
+    #[test]
+    fn rrf_overlapping_chunk_accumulates_score() {
+        let marker = vec![
+            make_query_result(1, "shared", "shared chunk", 3.0, 0.0),
+        ];
+        let vector = vec![
+            make_query_result(1, "shared", "shared chunk", 0.0, 0.12),
+        ];
+
+        let fused = rrf_fusion(&marker, &vector, 5);
+
+        assert_eq!(fused.len(), 1);
+        // Marker rank 1 -> 1/(60+1) = 1/61
+        // Vector rank 1 -> 1/(60+1) = 1/61
+        // Total = 2/61 ≈ 0.03279
+        assert_eq!(fused[0].result.chunk_id, "shared");
+        let expected = 1.0 / 61.0 + 1.0 / 61.0;
+        assert!((fused[0].rrf_score - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn rrf_merges_two_channels_sorted_by_score() {
+        let marker = vec![
+            make_query_result(1, "m1", "marker only", 5.0, 0.0),
+            make_query_result(1, "both", "both channels", 3.0, 0.0),
+        ];
+        let vector = vec![
+            make_query_result(1, "v1", "vector only", 0.0, 0.05),
+            make_query_result(1, "both", "both channels", 0.0, 0.20),
+        ];
+
+        let fused = rrf_fusion(&marker, &vector, 3);
+
+        // "both" first (accumulated score from two channels).
+        assert_eq!(fused[0].result.chunk_id, "both");
+        assert!(fused[0].rrf_score > fused[1].rrf_score);
+        // "m1" and "v1" tie at 1/(60+1) each; both should appear.
+        let tail_ids: std::collections::HashSet<&str> = fused[1..]
+            .iter()
+            .map(|e| e.result.chunk_id.as_str())
+            .collect();
+        assert!(tail_ids.contains("m1"));
+        assert!(tail_ids.contains("v1"));
+        assert_eq!(fused.len(), 3);
+    }
+
+    #[test]
+    fn rrf_truncates_to_top_k() {
+        let marker = vec![
+            make_query_result(1, "a", "A", 5.0, 0.0),
+            make_query_result(1, "b", "B", 4.0, 0.0),
+        ];
+        let vector = vec![
+            make_query_result(1, "c", "C", 0.0, 0.1),
+        ];
+
+        let fused = rrf_fusion(&marker, &vector, 2);
+
+        assert_eq!(fused.len(), 2);
+    }
+
+    #[test]
+    fn rrf_empty_inputs() {
+        let fused = rrf_fusion(&[], &[], 5);
+        assert!(fused.is_empty());
     }
 }
