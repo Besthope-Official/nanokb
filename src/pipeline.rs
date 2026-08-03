@@ -2,7 +2,7 @@ use crate::chunker::ChunkStrategy;
 use crate::config::{AppConfig, QueryMode};
 use crate::embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
 use crate::filter::Filter;
-use crate::llm::LlmClient;
+use crate::llm::{LlmClient, TokenUsage};
 use crate::parser::Document;
 use anyhow::{Context, Result};
 use serde_json::json;
@@ -72,6 +72,13 @@ impl Pipeline {
             llm,
             llm_concurrency,
         })
+    }
+
+    /// Cumulative LLM token consumption across all documents processed by this pipeline.
+    ///
+    /// Returns `None` when the kb has no semantic index (`pipeline.llm` is unset).
+    pub fn token_usage(&self) -> Option<TokenUsage> {
+        self.llm.as_ref().map(|llm| llm.token_usage())
     }
 
     /// Create a kb from `config.yaml` and freeze those settings into it.
@@ -161,27 +168,6 @@ impl Pipeline {
                     on_stage,
                 )
                 .await?;
-                let usage = llm.token_usage();
-                let input_m = usage.prompt as f64 / 1_000_000.0;
-                let output = usage.completion.saturating_sub(usage.reasoning);
-                let output_m = output as f64 / 1_000_000.0;
-                let reasoning_m = usage.reasoning as f64 / 1_000_000.0;
-                let cache_line = if usage.prompt > 0 {
-                    let pct = usage.cache_hit as f64 / usage.prompt as f64 * 100.0;
-                    format!(" (cache {:.0}% hit)", pct)
-                } else {
-                    String::new()
-                };
-                let reasoning_line = if usage.reasoning > 0 {
-                    format!(
-                        "\n        {reasoning_m:.2} M reasoning + {output_m:.2} M output"
-                    )
-                } else {
-                    format!(" + {output_m:.2} M output")
-                };
-                on_info(format!(
-                    "tokens: {input_m:.2} M input{cache_line}{reasoning_line}"
-                ));
                 markers
             }
             None => vec![Vec::new(); chunks.len()],

@@ -241,6 +241,29 @@ pub struct TokenUsage {
     pub reasoning: u64,
 }
 
+impl std::fmt::Display for TokenUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let input_m = self.prompt as f64 / 1_000_000.0;
+        let output = self.completion.saturating_sub(self.reasoning);
+        let output_m = output as f64 / 1_000_000.0;
+        let reasoning_m = self.reasoning as f64 / 1_000_000.0;
+
+        write!(f, "tokens: {input_m:.2} M input")?;
+        if self.prompt > 0 {
+            let pct = self.cache_hit as f64 / self.prompt as f64 * 100.0;
+            write!(f, " (cache {:.0}% hit)", pct)?;
+        }
+        if self.reasoning > 0 {
+            write!(
+                f,
+                "\n        {reasoning_m:.2} M reasoning + {output_m:.2} M output"
+            )
+        } else {
+            write!(f, " + {output_m:.2} M output")
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ResponseMessage {
     content: String,
