@@ -34,24 +34,18 @@ impl Pipeline {
         let strategy: ChunkStrategy = serde_json::from_value(meta.chunk_config.clone())
             .with_context(|| format!("kb {kb_name} has an unreadable chunk_config"))?;
 
-        let cfg = meta.embed_config.as_ref().with_context(|| {
-            format!("kb {kb_name} has no embedding model configured")
-        })?;
-        let stored_model = cfg
+        let stored_model = meta.embed_config
             .get("model")
             .and_then(|value| value.as_str())
             .with_context(|| {
                 format!("kb {kb_name} metadata is missing embed_config.model")
             })?;
-        let meta_dimension = meta.dimension.with_context(|| {
-            format!("kb {kb_name} has embed_config but no stored dimension")
-        })?;
         let embedding = config.embedding_for_model(stored_model)?;
         let model = EmbedClient::from_config(embedding)?.dimension().await?;
         anyhow::ensure!(
-            model.dimension == meta_dimension,
+            model.dimension == meta.dimension,
             "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-            meta_dimension,
+            meta.dimension,
             model.dimension
         );
         let embed_batch_size = embedding.batch_size;

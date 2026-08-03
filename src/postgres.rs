@@ -194,9 +194,9 @@ pub async fn create_kb(
 pub struct KbMeta {
     pub name: String,
     pub chunk_config: Value,
-    pub embed_config: Option<Value>,
+    pub embed_config: Value,
     pub llm_config: Option<Value>,
-    pub dimension: Option<usize>,
+    pub dimension: usize,
     /// Default retrieval mode, snapshotted at create; `query` falls back to it.
     pub query_mode: String,
     pub created_at: String,
@@ -222,13 +222,13 @@ pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
     .with_context(|| format!("failed to read metadata for kb {kb_name}"))?
     .with_context(|| format!("kb {kb_name} does not exist; create it with `nanokb kb create`"))?;
 
-    let dimension: Option<i32> = row.get("dimension");
+    let dimension: i32 = row.get("dimension");
     Ok(KbMeta {
         name: row.get("name"),
         chunk_config: row.get("chunk_config"),
         embed_config: row.get("embed_config"),
         llm_config: row.get("llm_config"),
-        dimension: dimension.map(|d| d as usize),
+        dimension: dimension as usize,
         query_mode: row.get("query_mode"),
         created_at: row.get("created_at"),
     })

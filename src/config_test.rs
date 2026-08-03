@@ -146,7 +146,7 @@ fn rejects_pipeline_reference_to_undefined_embedding_provider() {
 }
 
 #[test]
-fn embedding_errors_when_unset_for_marker_only_pipeline() {
+fn embedding_errors_when_unset() {
     let config = parse_config(
         &format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  llm: deepseek\n"),
         &HashMap::new(),

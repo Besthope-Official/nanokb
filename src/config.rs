@@ -20,7 +20,7 @@ pub struct AppConfig {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
-    /// Embedding provider for the vector index. Absent -> marker-only kb.
+    /// Embedding provider for the vector index. Required — every kb depends on it.
     #[serde(default)]
     pub embedding: Option<String>,
     /// LLM provider for the semantic marker index. Absent -> vector-only kb.
@@ -294,7 +294,7 @@ impl AppConfig {
     /// retrieval all depend on dense vector comparison.
     pub fn embedding(&self) -> Result<&EmbeddingConfig> {
         let name = self.pipeline.embedding.as_deref().ok_or_else(|| {
-            anyhow::anyhow!("pipeline.embedding is not set; marker-only kbs are built without it")
+            anyhow::anyhow!("pipeline.embedding is not set; every kb requires an embedding model")
         })?;
         self.model.embeddings.get(name).ok_or_else(|| {
             anyhow::anyhow!(

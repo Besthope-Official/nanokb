@@ -285,14 +285,8 @@ async fn run_kb_info(pool: &sqlx::PgPool, kb_name: &str) -> Result<()> {
 
     println!("kb          {}", meta.name);
     println!("created     {}", meta.created_at);
-    match &meta.dimension {
-        Some(dimension) => println!("dimension   {dimension}"),
-        None => println!("dimension   none (marker-only kb)"),
-    }
-    match &meta.embed_config {
-        Some(config) => println!("embedding   {config}"),
-        None => println!("embedding   none (marker-only kb)"),
-    }
+    println!("dimension   {}", meta.dimension);
+    println!("embedding   {}", meta.embed_config);
     println!("retrieval   {} (default query mode)", meta.query_mode);
     println!("chunking    {}", meta.chunk_config);
     match &meta.llm_config {
@@ -357,23 +351,18 @@ async fn run_query(
 
     match effective_mode {
         QueryMode::Vector => {
-            let stored_model = meta
-                .embed_config
-                .as_ref()
-                .and_then(|cfg| cfg.get("model"))
+            let stored_model = meta.embed_config
+                .get("model")
                 .and_then(|value| value.as_str())
                 .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-            let meta_dimension = meta
-                .dimension
-                .with_context(|| format!("kb {kb_name} has no stored embedding dimension"))?;
             let embedding_config = config.embedding_for_model(stored_model)?;
             let model = EmbedClient::from_config(embedding_config)?
                 .dimension()
                 .await?;
             anyhow::ensure!(
-                model.dimension == meta_dimension,
+                model.dimension == meta.dimension,
                 "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-                meta_dimension,
+                meta.dimension,
                 model.dimension
             );
 
@@ -430,23 +419,18 @@ async fn load_embed_model_for_kb(
     meta: &postgres::KbMeta,
     kb_name: &str,
 ) -> Result<EmbedModel> {
-    let stored_model = meta
-        .embed_config
-        .as_ref()
-        .and_then(|cfg| cfg.get("model"))
+    let stored_model = meta.embed_config
+        .get("model")
         .and_then(|value| value.as_str())
         .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-    let meta_dimension = meta
-        .dimension
-        .with_context(|| format!("kb {kb_name} has no stored embedding dimension"))?;
     let embedding_config = config.embedding_for_model(stored_model)?;
     let embed_model = EmbedClient::from_config(embedding_config)?
         .dimension()
         .await?;
     anyhow::ensure!(
-        embed_model.dimension == meta_dimension,
+        embed_model.dimension == meta.dimension,
         "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-        meta_dimension,
+        meta.dimension,
         embed_model.dimension
     );
     Ok(embed_model)
