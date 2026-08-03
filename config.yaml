@@ -27,6 +27,11 @@ model:
       max_tokens: 2048
       concurrency: 5
       reasoning_effort: "low"
+  rerankers:
+    bge_reranker:
+      model_name: "BAAI/bge-reranker-v2-m3"
+      api_base: "{BGE_M3_RERANKER_API_BASE}"
+      api_key: "{BGE_M3_RERANKER_API_KEY}"
 
 pipeline:
   embedding: bge_m3

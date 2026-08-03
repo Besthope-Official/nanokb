@@ -139,6 +139,8 @@ pub struct ModelConfig {
     pub embeddings: HashMap<String, EmbeddingConfig>,
     #[serde(default)]
     pub llms: HashMap<String, LlmConfig>,
+    #[serde(default)]
+    pub rerankers: HashMap<String, RerankConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -158,6 +160,23 @@ pub struct EmbeddingConfig {
     pub max_retries: usize,
     /// Base delay between retries in milliseconds, doubled each attempt.
     #[serde(default = "default_embed_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConfig {
+    pub model_name: String,
+    pub api_base: String,
+    pub api_key: String,
+    /// HTTP request timeout in seconds.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Maximum retry attempts for failed rerank calls (0 = no retry).
+    #[serde(default = "default_llm_max_retries")]
+    pub max_retries: usize,
+    /// Base delay between retries in milliseconds, doubled each attempt.
+    #[serde(default = "default_llm_retry_delay_ms")]
     pub retry_delay_ms: u64,
 }
 
@@ -372,6 +391,23 @@ impl AppConfig {
              remove the duplicates so the kb resolves to one endpoint"
         );
         Ok(llm)
+    }
+
+    /// Look up a reranker provider by the name `query --reranker` selects.
+    pub fn reranker_by_name(&self, name: &str) -> Result<&RerankConfig> {
+        self.model.rerankers.get(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "unknown reranker provider {name:?}; \
+                 model.rerankers defines: {}",
+                self.reranker_names().join(", ")
+            )
+        })
+    }
+
+    fn reranker_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.model.rerankers.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     fn llm_names(&self) -> Vec<&str> {

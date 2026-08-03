@@ -1,5 +1,6 @@
 use crate::config::QueryMode;
 use crate::pipeline::Pipeline;
+use crate::rerank::{RerankClient, rrf_fusion};
 use crate::{AppConfig, EmbedClient, EmbedModel, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -164,6 +165,9 @@ enum TopLevelCommand {
         mode: Option<QueryMode>,
         #[arg(long)]
         top_k: Option<usize>,
+        /// Re-rank retrieval candidates with a model.rerankers provider.
+        #[arg(long)]
+        reranker: Option<String>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -256,7 +260,8 @@ pub async fn run() -> Result<()> {
             text,
             mode,
             top_k,
-        } => run_query(&config, &pool, &kb, &text, mode, top_k).await,
+            reranker,
+        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref()).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -336,6 +341,7 @@ async fn run_query(
     query_text: &str,
     mode: Option<QueryMode>,
     top_k: Option<usize>,
+    reranker_name: Option<&str>,
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
     let semantic = meta.llm_config.is_some();
@@ -349,40 +355,52 @@ async fn run_query(
         );
     }
 
-    match effective_mode {
-        QueryMode::Vector => {
+    let reranker = match reranker_name {
+        Some(name) => Some(RerankClient::from_config(config.reranker_by_name(name)?)?),
+        None => None,
+    };
+    // A reranker sees a wider candidate pool, then re-ranks down to `top_k`.
+    let limit = if reranker.is_some() { top_k * 4 } else { top_k };
+
+    match (&reranker, effective_mode) {
+        (Some(reranker), _) => {
+            let candidates = retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+                .await?;
+            print_reranked(reranker, query_text, candidates, top_k).await?;
+        }
+        (None, QueryMode::Vector) => {
             let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let embedding = model.embed_query(query_text).await?;
-            let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
+            let results = postgres::query_chunks(pool, kb_name, &embedding, limit).await?;
             for result in &results {
                 println!("[{:.4}] {}", result.distance, result.text);
             }
         }
-        QueryMode::Marker => {
+        (None, QueryMode::Marker) => {
             let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let emb = embed_model.embed_query(query_text).await?;
-            let results = postgres::query_markers(pool, kb_name, &emb, top_k).await?;
+            let results = postgres::query_markers(pool, kb_name, &emb, limit).await?;
             for result in &results {
                 println!("[{:.4} marker] {}", result.marker_distance, result.text);
             }
         }
-        QueryMode::Hybrid => {
+        (None, QueryMode::Hybrid) => {
             let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let query_emb = embed_model.embed_query(query_text).await?;
 
             // Run marker and vector retrieval in parallel, sharing the query embedding.
             let (marker_results, vector_results) = tokio::join!(
                 async {
-                    postgres::query_markers(pool, kb_name, &query_emb, top_k).await
+                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
                 },
                 async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, top_k).await
+                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
                 },
             );
             let marker_results = marker_results?;
             let vector_results = vector_results?;
 
-            for entry in rrf_fusion(&marker_results, &vector_results, top_k) {
+            for entry in rrf_fusion(&marker_results, &vector_results, Some(top_k)) {
                 println!(
                     "[{:.4} rrf] [{}] {}",
                     entry.rrf_score,
@@ -397,6 +415,84 @@ async fn run_query(
         }
     }
 
+    Ok(())
+}
+
+/// Retrieve candidates for reranking: `limit` candidates per channel, fused
+/// into one list (hybrid mode fuses without truncation so the reranker sees
+/// every unique chunk).
+async fn retrieve_candidates(
+    config: &AppConfig,
+    pool: &sqlx::PgPool,
+    kb_name: &str,
+    meta: &postgres::KbMeta,
+    mode: QueryMode,
+    query_text: &str,
+    limit: usize,
+) -> Result<Vec<postgres::QueryResult>> {
+    match mode {
+        QueryMode::Vector => {
+            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let embedding = model.embed_query(query_text).await?;
+            Ok(postgres::query_chunks(pool, kb_name, &embedding, limit).await?)
+        }
+        QueryMode::Marker => {
+            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let embedding = model.embed_query(query_text).await?;
+            Ok(postgres::query_markers(pool, kb_name, &embedding, limit).await?)
+        }
+        QueryMode::Hybrid => {
+            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let query_emb = model.embed_query(query_text).await?;
+
+            let (marker_results, vector_results) = tokio::join!(
+                async {
+                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
+                },
+                async {
+                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
+                },
+            );
+
+            Ok(rrf_fusion(&marker_results?, &vector_results?, None)
+                .into_iter()
+                .map(|entry| entry.result.clone())
+                .collect())
+        }
+    }
+}
+
+/// Re-rank `candidates` against `query_text`, printing the top `top_k` by
+/// relevance score.
+async fn print_reranked(
+    reranker: &RerankClient,
+    query_text: &str,
+    candidates: Vec<postgres::QueryResult>,
+    top_k: usize,
+) -> Result<()> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let documents: Vec<String> = candidates.iter().map(|r| r.text.clone()).collect();
+    let reranked = reranker.rerank(query_text, &documents, top_k).await?;
+
+    // `index` refers to the candidate's position in `documents`; take by index
+    // so the candidates reorder according to the reranker's scores.
+    let mut taken: Vec<Option<postgres::QueryResult>> = candidates.into_iter().map(Some).collect();
+    let mut ordered: Vec<(f64, postgres::QueryResult)> = reranked
+        .into_iter()
+        .map(|rr| {
+            let result = taken[rr.index]
+                .take()
+                .expect("rerank API returned an out-of-range or duplicate index");
+            (rr.relevance_score, result)
+        })
+        .collect();
+    ordered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    for (score, result) in ordered {
+        println!("[{score:.4} rerank] {}", result.text);
+    }
     Ok(())
 }
 
@@ -420,64 +516,6 @@ async fn load_embed_model_for_kb(
         embed_model.dimension
     );
     Ok(embed_model)
-}
-
-struct RrfEntry<'a> {
-    result: &'a postgres::QueryResult,
-    source: &'static str,
-    rrf_score: f64,
-}
-
-/// Fuse marker and vector retrieval results using Reciprocal Rank Fusion.
-///
-/// Each result list contributes to the fused score as `1 / (k + rank)`, where
-/// `rank` is 1-based and `k = 60`. Chunks appearing in both lists accumulate
-/// scores from both channels. Results are sorted by RRF score descending and
-/// truncated to `top_k`.
-///
-/// A later reranker can consume `RrfEntry` directly — the RRF score and
-/// per-channel metadata are preserved.
-fn rrf_fusion<'a>(
-    marker_results: &'a [postgres::QueryResult],
-    vector_results: &'a [postgres::QueryResult],
-    top_k: usize,
-) -> Vec<RrfEntry<'a>> {
-    const RRF_K: f64 = 60.0;
-
-    let mut scores: std::collections::HashMap<(i64, String), f64> =
-        std::collections::HashMap::new();
-    let mut chunk_map: std::collections::HashMap<(i64, String), (&'a postgres::QueryResult, &'static str)> =
-        std::collections::HashMap::new();
-
-    for (rank, result) in marker_results.iter().enumerate() {
-        let key = (result.document_id, result.chunk_id.clone());
-        let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
-        *scores.entry(key.clone()).or_insert(0.0) += score;
-        chunk_map.entry(key).or_insert((result, "marker"));
-    }
-
-    for (rank, result) in vector_results.iter().enumerate() {
-        let key = (result.document_id, result.chunk_id.clone());
-        let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
-        *scores.entry(key.clone()).or_insert(0.0) += score;
-        chunk_map.entry(key).or_insert((result, "vector"));
-    }
-
-    let mut ranked: Vec<((i64, String), f64)> = scores.into_iter().collect();
-    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    ranked.truncate(top_k);
-
-    ranked
-        .into_iter()
-        .map(|(key, score)| {
-            let (result, source) = chunk_map.remove(&key).unwrap();
-            RrfEntry {
-                result,
-                source,
-                rrf_score: score,
-            }
-        })
-        .collect()
 }
 
 async fn run_doc_add(
@@ -631,26 +669,6 @@ async fn wait_all_done(pool: &sqlx::PgPool, kb_name: &str, progress: &Progress) 
 mod tests {
     use super::*;
 
-    fn make_query_result(
-        doc_id: i64,
-        chunk_id: &str,
-        text: &str,
-        marker_distance: f64,
-        distance: f64,
-    ) -> postgres::QueryResult {
-        postgres::QueryResult {
-            document_id: doc_id,
-            filename: String::new(),
-            frontmatter: serde_json::Value::Null,
-            chunk_id: chunk_id.to_string(),
-            text: text.to_string(),
-            embedding_text: String::new(),
-            markers: Vec::new(),
-            marker_distance,
-            distance,
-        }
-    }
-
     #[test]
     fn parses_kb_create_with_an_optional_config_path() {
         let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "recipe.yaml"]).unwrap();
@@ -664,90 +682,5 @@ mod tests {
                 },
             } if name == "books" && config_path == PathBuf::from("recipe.yaml")
         ));
-    }
-
-    #[test]
-    fn rrf_single_channel_returns_in_order() {
-        let marker = vec![
-            make_query_result(1, "a", "alpha", 5.0, 0.0),
-            make_query_result(1, "b", "beta", 3.0, 0.0),
-        ];
-        let vector = vec![];
-
-        let fused = rrf_fusion(&marker, &vector, 2);
-
-        assert_eq!(fused.len(), 2);
-        assert_eq!(fused[0].result.chunk_id, "a");
-        assert_eq!(fused[0].source, "marker");
-        assert_eq!(fused[1].result.chunk_id, "b");
-        // Higher rank (0 = 1st) gets higher RRF score.
-        assert!(fused[0].rrf_score > fused[1].rrf_score);
-    }
-
-    #[test]
-    fn rrf_overlapping_chunk_accumulates_score() {
-        let marker = vec![
-            make_query_result(1, "shared", "shared chunk", 3.0, 0.0),
-        ];
-        let vector = vec![
-            make_query_result(1, "shared", "shared chunk", 0.0, 0.12),
-        ];
-
-        let fused = rrf_fusion(&marker, &vector, 5);
-
-        assert_eq!(fused.len(), 1);
-        // Marker rank 1 -> 1/(60+1) = 1/61
-        // Vector rank 1 -> 1/(60+1) = 1/61
-        // Total = 2/61 ≈ 0.03279
-        assert_eq!(fused[0].result.chunk_id, "shared");
-        let expected = 1.0 / 61.0 + 1.0 / 61.0;
-        assert!((fused[0].rrf_score - expected).abs() < 1e-10);
-    }
-
-    #[test]
-    fn rrf_merges_two_channels_sorted_by_score() {
-        let marker = vec![
-            make_query_result(1, "m1", "marker only", 5.0, 0.0),
-            make_query_result(1, "both", "both channels", 3.0, 0.0),
-        ];
-        let vector = vec![
-            make_query_result(1, "v1", "vector only", 0.0, 0.05),
-            make_query_result(1, "both", "both channels", 0.0, 0.20),
-        ];
-
-        let fused = rrf_fusion(&marker, &vector, 3);
-
-        // "both" first (accumulated score from two channels).
-        assert_eq!(fused[0].result.chunk_id, "both");
-        assert!(fused[0].rrf_score > fused[1].rrf_score);
-        // "m1" and "v1" tie at 1/(60+1) each; both should appear.
-        let tail_ids: std::collections::HashSet<&str> = fused[1..]
-            .iter()
-            .map(|e| e.result.chunk_id.as_str())
-            .collect();
-        assert!(tail_ids.contains("m1"));
-        assert!(tail_ids.contains("v1"));
-        assert_eq!(fused.len(), 3);
-    }
-
-    #[test]
-    fn rrf_truncates_to_top_k() {
-        let marker = vec![
-            make_query_result(1, "a", "A", 5.0, 0.0),
-            make_query_result(1, "b", "B", 4.0, 0.0),
-        ];
-        let vector = vec![
-            make_query_result(1, "c", "C", 0.0, 0.1),
-        ];
-
-        let fused = rrf_fusion(&marker, &vector, 2);
-
-        assert_eq!(fused.len(), 2);
-    }
-
-    #[test]
-    fn rrf_empty_inputs() {
-        let fused = rrf_fusion(&[], &[], 5);
-        assert!(fused.is_empty());
     }
 }
