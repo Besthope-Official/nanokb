@@ -52,9 +52,9 @@ async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Resul
         r#"CREATE TABLE IF NOT EXISTS kb_meta (
             name         TEXT PRIMARY KEY,
             chunk_config JSONB NOT NULL,
-            embed_config JSONB,
+            embed_config JSONB NOT NULL,
             llm_config   JSONB,
-            dimension    INTEGER,
+            dimension    INTEGER NOT NULL,
             query_mode   TEXT NOT NULL,
             created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
         )"#,
@@ -362,15 +362,6 @@ pub async fn replace_document_chunks(
         document_kb == kb_name,
         "document {document_id} belongs to kb {document_kb}, not {kb_name}"
     );
-    // KBs with an embedding model have vector columns; the table shape is frozen in kb_meta.
-    let has_embeddings: bool = sqlx::query_scalar(
-        "SELECT embed_config IS NOT NULL FROM kb_meta WHERE name = $1",
-    )
-    .bind(kb_name)
-    .fetch_one(&mut *transaction)
-    .await
-    .with_context(|| format!("failed to load kb meta for {kb_name}"))?;
-
     let has_llm: bool = sqlx::query_scalar(
         "SELECT llm_config IS NOT NULL FROM kb_meta WHERE name = $1",
     )
@@ -394,7 +385,7 @@ pub async fn replace_document_chunks(
             .map(|c| Value::Array(c.markers.iter().map(|m| Value::String(m.clone())).collect()))
             .collect();
 
-        if has_embeddings && has_llm {
+        if has_llm {
             let embeddings: Vec<Vector> = chunks
                 .iter()
                 .map(|c| Vector::from(c.embedding.clone()))
@@ -425,7 +416,7 @@ pub async fn replace_document_chunks(
                         chunks.len()
                     )
                 })?;
-        } else if has_embeddings {
+        } else {
             let embeddings: Vec<Vector> = chunks
                 .iter()
                 .map(|c| Vector::from(c.embedding.clone()))
