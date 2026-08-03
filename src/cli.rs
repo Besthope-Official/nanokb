@@ -351,21 +351,7 @@ async fn run_query(
 
     match effective_mode {
         QueryMode::Vector => {
-            let stored_model = meta.embed_config
-                .get("model")
-                .and_then(|value| value.as_str())
-                .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-            let embedding_config = config.embedding_for_model(stored_model)?;
-            let model = EmbedClient::from_config(embedding_config)?
-                .dimension()
-                .await?;
-            anyhow::ensure!(
-                model.dimension == meta.dimension,
-                "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-                meta.dimension,
-                model.dimension
-            );
-
+            let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
             let embedding = model.embed_query(query_text).await?;
             let results = postgres::query_chunks(pool, kb_name, &embedding, top_k).await?;
             for result in &results {

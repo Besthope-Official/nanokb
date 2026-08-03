@@ -66,36 +66,6 @@ fn start_multi_mock_server(responses: Vec<(u16, &'static str)>) -> String {
 }
 
 #[tokio::test]
-async fn chat_sends_expected_request_shape() {
-    let response = r#"{"choices":[{"message":{"content":"marker1, marker2, marker3"}}]}"#;
-    let url = start_mock_server(response);
-
-    let client = LlmClient {
-        api_base: url,
-        api_key: "sk-test".into(),
-        model_name: "test-model".into(),
-        temperature: 0.2,
-        max_tokens: 100,
-        max_retries: 0,
-        retry_delay_ms: 100,
-        reasoning_effort: None,
-        prompt_tokens: AtomicU64::new(0),
-        completion_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
-    };
-
-    let result = client
-        .chat(&[
-            ChatMessage::system("You are a tester."),
-            ChatMessage::user("test input"),
-        ])
-        .await
-        .unwrap();
-
-    assert_eq!(result, "marker1, marker2, marker3");
-}
-
-#[tokio::test]
 async fn chat_json_parses_response() {
     let response = r#"{"choices":[{"message":{"content":"{\"markers\":[\"a\",\"b\",\"c\"]}"}}]}"#;
     let url = start_mock_server(response);
@@ -147,7 +117,10 @@ async fn chat_errors_on_empty_choices() {
         http: reqwest::Client::new(),
     };
 
-    let error = client.chat(&[ChatMessage::user("hi")]).await.unwrap_err();
+    let error: anyhow::Error = client
+        .chat_json::<serde_json::Value>(&[ChatMessage::user("hi")])
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("empty choices"),
         "{error:#}"

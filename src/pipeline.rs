@@ -204,13 +204,7 @@ impl Pipeline {
                 let batch_end = (batch_start + self.embed_batch_size.max(1)).min(total);
                 let marker_texts: Vec<String> = embedded[batch_start..batch_end]
                     .iter()
-                    .map(|c| {
-                        if c.markers.is_empty() {
-                            String::new()
-                        } else {
-                            c.markers.join(" ")
-                        }
-                    })
+                    .map(|c| c.markers.join(" "))
                     .collect();
                 let marker_embeddings = model.embed_batch(&marker_texts).await?;
                 for (i, me) in marker_embeddings.into_iter().enumerate() {

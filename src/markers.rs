@@ -22,15 +22,6 @@ fn marker_messages(embedding_text: &str) -> [ChatMessage; 2] {
     ]
 }
 
-/// Extract markers for one chunk via LLM.
-///
-/// Uses `chunk.embedding_text` as input, which carries the heading path for
-/// layered chunks — this is the paper's structural position **p**.
-pub async fn generate_chunk_markers(llm: &LlmClient, chunk: &Chunk) -> Result<Vec<String>> {
-    let response: Value = llm.chat_json(&marker_messages(&chunk.embedding_text)).await?;
-    parse_string_list(&response, "markers")
-}
-
 /// Generate markers for all chunks with bounded concurrency.
 ///
 /// Fail-fast: the first error aborts all remaining tasks.

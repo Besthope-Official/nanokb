@@ -385,11 +385,12 @@ pub async fn replace_document_chunks(
             .map(|c| Value::Array(c.markers.iter().map(|m| Value::String(m.clone())).collect()))
             .collect();
 
+        let embeddings: Vec<Vector> = chunks
+            .iter()
+            .map(|c| Vector::from(c.embedding.clone()))
+            .collect();
+
         if has_llm {
-            let embeddings: Vec<Vector> = chunks
-                .iter()
-                .map(|c| Vector::from(c.embedding.clone()))
-                .collect();
             let marker_embeddings: Vec<Vector> = chunks
                 .iter()
                 .map(|c| Vector::from(c.marker_embedding.clone()))
@@ -417,10 +418,6 @@ pub async fn replace_document_chunks(
                     )
                 })?;
         } else {
-            let embeddings: Vec<Vector> = chunks
-                .iter()
-                .map(|c| Vector::from(c.embedding.clone()))
-                .collect();
             let insert_sql = format!(
                 "INSERT INTO {table_name} (document_id, chunk_id, text, embedding_text, embedding, markers) \
                  SELECT $1, chunk_id, text, embedding_text, embedding, markers \

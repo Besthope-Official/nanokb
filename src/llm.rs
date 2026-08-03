@@ -59,56 +59,6 @@ impl LlmClient {
         })
     }
 
-    /// Send a chat completion request and return the first choice's text content.
-    pub async fn chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        let mut last_error = None;
-        for attempt in 0..=self.max_retries {
-            if attempt > 0 {
-                let delay_ms = self.retry_delay_ms * 2u64.pow(attempt as u32 - 1);
-                eprintln!(
-                    "[LLM] chat retry {attempt}/{} after {delay_ms}ms",
-                    self.max_retries
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            match self.try_chat(messages).await {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    eprintln!("[LLM] chat failed: {e:#}");
-                    last_error = Some(e);
-                }
-            }
-        }
-        Err(last_error.unwrap())
-    }
-
-    async fn try_chat(&self, messages: &[ChatMessage]) -> Result<String> {
-        let response = send_chat_request(
-            &self.http,
-            &self.api_base,
-            &self.api_key,
-            &self.model_name,
-            messages,
-            self.temperature,
-            self.max_tokens,
-            None,
-            self.reasoning_effort.as_deref(),
-        )
-        .await?;
-        if let Some(ref usage) = response.usage {
-            self.prompt_tokens
-                .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
-            self.completion_tokens
-                .fetch_add(usage.completion_tokens, Ordering::Relaxed);
-        }
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("LLM API returned empty choices"))?;
-        Ok(choice.message.content)
-    }
-
     /// Send a chat completion request with JSON response format and deserialize.
     pub async fn chat_json<T: serde::de::DeserializeOwned>(
         &self,
