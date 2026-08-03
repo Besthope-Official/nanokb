@@ -36,6 +36,9 @@ pub struct LlmClient {
     http: reqwest::Client,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+    cache_hit_tokens: AtomicU64,
+    cache_miss_tokens: AtomicU64,
+    reasoning_tokens: AtomicU64,
 }
 
 impl LlmClient {
@@ -56,6 +59,9 @@ impl LlmClient {
             http,
             prompt_tokens: AtomicU64::new(0),
             completion_tokens: AtomicU64::new(0),
+            cache_hit_tokens: AtomicU64::new(0),
+            cache_miss_tokens: AtomicU64::new(0),
+            reasoning_tokens: AtomicU64::new(0),
         })
     }
 
@@ -106,6 +112,12 @@ impl LlmClient {
                 .fetch_add(usage.prompt_tokens, Ordering::Relaxed);
             self.completion_tokens
                 .fetch_add(usage.completion_tokens, Ordering::Relaxed);
+            self.cache_hit_tokens
+                .fetch_add(usage.prompt_cache_hit_tokens, Ordering::Relaxed);
+            self.cache_miss_tokens
+                .fetch_add(usage.prompt_cache_miss_tokens, Ordering::Relaxed);
+            self.reasoning_tokens
+                .fetch_add(usage.reasoning(), Ordering::Relaxed);
         }
         let choice = response
             .choices
@@ -118,13 +130,14 @@ impl LlmClient {
     }
 
     /// Cumulative token consumption since this client was created.
-    ///
-    /// Returns `(prompt_tokens, completion_tokens)`.
-    pub fn token_usage(&self) -> (u64, u64) {
-        (
-            self.prompt_tokens.load(Ordering::Relaxed),
-            self.completion_tokens.load(Ordering::Relaxed),
-        )
+    pub fn token_usage(&self) -> TokenUsage {
+        TokenUsage {
+            prompt: self.prompt_tokens.load(Ordering::Relaxed),
+            completion: self.completion_tokens.load(Ordering::Relaxed),
+            cache_hit: self.cache_hit_tokens.load(Ordering::Relaxed),
+            cache_miss: self.cache_miss_tokens.load(Ordering::Relaxed),
+            reasoning: self.reasoning_tokens.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -187,10 +200,45 @@ struct Choice {
     message: ResponseMessage,
 }
 
+/// DeepSeek API `usage` object.
+///
+/// Cache fields are top-level (not nested under `prompt_tokens_details` like OpenAI).
+/// `reasoning_tokens` is nested under `completion_tokens_details`.
+///
+/// <https://api-docs.deepseek.com/>
 #[derive(Deserialize)]
 struct Usage {
     prompt_tokens: u64,
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_cache_hit_tokens: u64,
+    #[serde(default)]
+    prompt_cache_miss_tokens: u64,
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+impl Usage {
+    fn reasoning(&self) -> u64 {
+        self.completion_tokens_details
+            .as_ref()
+            .map_or(0, |d| d.reasoning_tokens)
+    }
+}
+
+#[derive(Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: u64,
+}
+
+/// Cumulative token consumption snapshot, returned by [`LlmClient::token_usage`].
+pub struct TokenUsage {
+    pub prompt: u64,
+    pub completion: u64,
+    pub cache_hit: u64,
+    pub cache_miss: u64,
+    pub reasoning: u64,
 }
 
 #[derive(Deserialize)]

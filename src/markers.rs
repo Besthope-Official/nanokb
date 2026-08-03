@@ -25,9 +25,6 @@ fn marker_messages(embedding_text: &str) -> [ChatMessage; 2] {
 /// Generate markers for all chunks with bounded concurrency.
 ///
 /// Fail-fast: the first error aborts all remaining tasks.
-///
-/// Returns the per-chunk marker lists and the cumulative LLM token usage
-/// `(prompt_tokens, completion_tokens)`.
 pub async fn generate_document_markers(
     llm: Arc<LlmClient>,
     chunks: &[Chunk],

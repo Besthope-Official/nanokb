@@ -161,10 +161,26 @@ impl Pipeline {
                     on_stage,
                 )
                 .await?;
-                let (prompt, completion) = llm.token_usage();
-                let total_m = (prompt + completion) as f64 / 1_000_000.0;
+                let usage = llm.token_usage();
+                let input_m = usage.prompt as f64 / 1_000_000.0;
+                let output = usage.completion.saturating_sub(usage.reasoning);
+                let output_m = output as f64 / 1_000_000.0;
+                let reasoning_m = usage.reasoning as f64 / 1_000_000.0;
+                let cache_line = if usage.prompt > 0 {
+                    let pct = usage.cache_hit as f64 / usage.prompt as f64 * 100.0;
+                    format!(" (cache {:.0}% hit)", pct)
+                } else {
+                    String::new()
+                };
+                let reasoning_line = if usage.reasoning > 0 {
+                    format!(
+                        "\n        {reasoning_m:.2} M reasoning + {output_m:.2} M output"
+                    )
+                } else {
+                    format!(" + {output_m:.2} M output")
+                };
                 on_info(format!(
-                    "marker tokens: {total_m:.2}M ({prompt} prompt + {completion} completion)"
+                    "tokens: {input_m:.2} M input{cache_line}{reasoning_line}"
                 ));
                 markers
             }

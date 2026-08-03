@@ -81,6 +81,9 @@ async fn chat_json_parses_response() {
         reasoning_effort: None,
         prompt_tokens: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
+        cache_hit_tokens: AtomicU64::new(0),
+        cache_miss_tokens: AtomicU64::new(0),
+        reasoning_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -114,6 +117,9 @@ async fn chat_errors_on_empty_choices() {
         reasoning_effort: None,
         prompt_tokens: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
+        cache_hit_tokens: AtomicU64::new(0),
+        cache_miss_tokens: AtomicU64::new(0),
+        reasoning_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -143,6 +149,9 @@ async fn chat_json_errors_on_invalid_json() {
         reasoning_effort: None,
         prompt_tokens: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
+        cache_hit_tokens: AtomicU64::new(0),
+        cache_miss_tokens: AtomicU64::new(0),
+        reasoning_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -180,6 +189,9 @@ async fn chat_json_retries_and_succeeds() {
         reasoning_effort: None,
         prompt_tokens: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
+        cache_hit_tokens: AtomicU64::new(0),
+        cache_miss_tokens: AtomicU64::new(0),
+        reasoning_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
@@ -218,6 +230,9 @@ async fn chat_json_exhausts_retries_and_fails() {
         reasoning_effort: None,
         prompt_tokens: AtomicU64::new(0),
         completion_tokens: AtomicU64::new(0),
+        cache_hit_tokens: AtomicU64::new(0),
+        cache_miss_tokens: AtomicU64::new(0),
+        reasoning_tokens: AtomicU64::new(0),
         http: reqwest::Client::new(),
     };
 
