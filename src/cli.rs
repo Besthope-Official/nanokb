@@ -197,17 +197,29 @@ enum KbCommand {
 #[derive(Subcommand)]
 enum DocCommand {
     #[command(about = "Ingest a file, or every supported file in a directory")]
-    Add { kb: String, source: String },
+    Add {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+        source: String,
+    },
     #[command(about = "Re-read a doc from path and rebuild its chunks")]
     Update {
+        #[arg(short = 'n', long = "name")]
         kb: String,
         doc_id: i64,
         path: String,
     },
     #[command(about = "Delete a doc and its chunks")]
-    Remove { kb: String, doc_id: i64 },
+    Remove {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+        doc_id: i64,
+    },
     #[command(about = "List the docs in a kb")]
-    List { kb: String },
+    List {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -765,6 +777,57 @@ mod tests {
         assert!(matches!(
             cli.command,
             TopLevelCommand::Query { expand: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_doc_add_with_n_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./ddia.pdf"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Add { ref kb, ref source },
+            } if kb == "books" && source == "./ddia.pdf"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_add_with_long_name_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./ddia.pdf"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Add { ref kb, ref source },
+            } if kb == "books" && source == "./ddia.pdf"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_list_with_n_flag() {
+        let cli = Cli::try_parse_from(["nanokb", "doc", "list", "-n", "books"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::List { ref kb },
+            } if kb == "books"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_remove_with_n_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "remove", "-n", "books", "42"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Remove { ref kb, doc_id: 42 },
+            } if kb == "books"
         ));
     }
 
