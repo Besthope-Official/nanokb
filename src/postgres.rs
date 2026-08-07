@@ -190,6 +190,12 @@ pub async fn create_kb(
         .execute(&mut *transaction)
         .await
         .with_context(|| format!("failed to create node table for kb {name}"))?;
+    sqlx::query(AssertSqlSafe(format!(
+        "CREATE INDEX IF NOT EXISTS {node_table}_parent_id_idx ON {node_table} (document_id, parent_id)"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .with_context(|| format!("failed to create node parent index for kb {name}"))?;
     sqlx::query(AssertSqlSafe(create_chunk_table))
         .execute(&mut *transaction)
         .await
@@ -773,7 +779,7 @@ pub async fn expand_neighbors(
         if frontier.is_empty() {
             break;
         }
-        frontier = query_nodes_by_parent(pool, &node_table, &frontier).await?;
+        frontier = query_parent_nodes(pool, &node_table, &frontier).await?;
         neighbors.extend(frontier.iter().cloned());
     }
 
@@ -782,8 +788,12 @@ pub async fn expand_neighbors(
     neighbors.extend(children);
 
     // Siblings: nodes sharing a hit node's parent, minus the hits themselves.
-    let siblings = query_sibling_nodes(pool, &node_table, &hit_nodes).await?;
-    neighbors.extend(siblings);
+    // A sibling is two hops away (up to the parent, back down), so it only
+    // joins once the ancestor walk reaches at least two levels.
+    if max_ancestor_depth >= 2 {
+        let siblings = query_sibling_nodes(pool, &node_table, &hit_nodes).await?;
+        neighbors.extend(siblings);
+    }
 
     if neighbors.is_empty() {
         return Ok(Vec::new());
@@ -792,9 +802,8 @@ pub async fn expand_neighbors(
     fetch_chunks_by_nodes(pool, &chunk_table, &node_table, &neighbors).await
 }
 
-/// Distinct nodes whose `parent_id` points at any of `nodes`. Used for both
-/// the leaf-to-root walk (hits → parents → grandparents) and root-to-leaves
-/// (hits → children), so the two directions share one query shape.
+/// Distinct nodes whose `parent_id` points at any of `nodes` — the direct
+/// children, used for the root-to-leaves expansion.
 async fn query_nodes_by_parent(
     pool: &PgPool,
     node_table: &str,
@@ -820,6 +829,37 @@ async fn query_nodes_by_parent(
         .collect())
 }
 
+/// Distinct nodes whose `node_id` is the `parent_id` of any of `nodes` — the
+/// direct parents, used for the leaf-to-root walk. The document root
+/// (`parent_id IS NULL`) is excluded: it spans the whole document, so it adds
+/// no structural context to a hit.
+async fn query_parent_nodes(
+    pool: &PgPool,
+    node_table: &str,
+    nodes: &[(i64, String)],
+) -> Result<Vec<(i64, String)>> {
+    let doc_ids: Vec<i64> = nodes.iter().map(|(doc, _)| *doc).collect();
+    let node_ids: Vec<String> = nodes.iter().map(|(_, node)| node.clone()).collect();
+    let sql = format!(
+        "SELECT DISTINCT n.document_id, n.node_id \
+         FROM {node_table} AS n \
+         JOIN {node_table} AS h ON n.document_id = h.document_id AND n.node_id = h.parent_id \
+         JOIN unnest($1::bigint[], $2::text[]) AS f(doc_id, node_id) \
+           ON h.document_id = f.doc_id AND h.node_id = f.node_id \
+         WHERE n.parent_id IS NOT NULL"
+    );
+    let rows = sqlx::query(AssertSqlSafe(sql))
+        .bind(doc_ids)
+        .bind(node_ids)
+        .fetch_all(pool)
+        .await
+        .context("failed to query parent nodes")?;
+    Ok(rows
+        .iter()
+        .map(|row| (row.get("document_id"), row.get("node_id")))
+        .collect())
+}
+
 /// Distinct nodes that share a parent with any of `nodes`, excluding `nodes`
 /// themselves. Root-level nodes have `parent_id IS NULL`, which never matches,
 /// so the document root has no siblings by construction.
@@ -836,7 +876,10 @@ async fn query_sibling_nodes(
          JOIN {node_table} AS h ON s.document_id = h.document_id AND s.parent_id = h.parent_id \
          JOIN unnest($1::bigint[], $2::text[]) AS hit(doc_id, node_id) \
            ON h.document_id = hit.doc_id AND h.node_id = hit.node_id \
-         WHERE NOT (s.document_id = hit.doc_id AND s.node_id = hit.node_id)"
+         WHERE NOT EXISTS ( \
+           SELECT 1 FROM unnest($1::bigint[], $2::text[]) AS ex(doc_id, node_id) \
+           WHERE ex.doc_id = s.document_id AND ex.node_id = s.node_id \
+         )"
     );
     let rows = sqlx::query(AssertSqlSafe(sql))
         .bind(doc_ids)

@@ -263,7 +263,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     assert_eq!(marker_hits[0].node_id, "intro");
     assert!(marker_hits[0].marker_distance >= 0.0, "marker distance should be non-negative");
     assert_eq!(marker_hits[0].markers, vec!["guide", "introduction"]);
-    let far_hits = query_markers(&pool, KB_NAME_MARKER, &[1.0, 1.0, 1.0], 5).await?;
+    let far_hits = query_markers(&pool, KB_NAME_MARKER, &[-1.0, -1.0, -1.0], 5).await?;
     assert!(far_hits[0].marker_distance > marker_hits[0].marker_distance,
         "farther embedding should have larger distance");
 
