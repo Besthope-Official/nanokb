@@ -34,12 +34,17 @@ model:
       api_key: "{BGE_M3_RERANKER_API_KEY}"
 
 pipeline:
+  chunk:
+    strategy: layered
+    max_chunk_tokens: 256
+    overlap_ratio: 0.1
   embedding: bge_m3
   llm: deepseek
-  query_mode: hybrid
+  retrieval:
+    mode: hybrid
+    top_k: 5
+    expand: false
+    expand_depth: 2
   worker_count: 4
-  top_k: 5
-  max_chunk_tokens: 256
-  chunk_overlap_ratio: 0.1
   worker_poll_timeout_secs: 30
   worker_error_retry_secs: 5

@@ -44,7 +44,7 @@ fn loads_placeholders_from_adjacent_dotenv() {
     )
     .unwrap();
 
-    let config = load_from_sources(&config_path, HashMap::new()).unwrap();
+    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
 
     assert_eq!(
         config.database.url,
@@ -74,7 +74,7 @@ fn process_environment_overrides_dotenv() {
         "postgres://from-process".to_string(),
     )]);
 
-    let config = load_from_sources(&config_path, process_environment).unwrap();
+    let config = load_from_sources(&config_path, &[], process_environment).unwrap();
 
     assert_eq!(config.database.url, "postgres://from-process");
 }
@@ -185,7 +185,7 @@ fn rejects_unknown_query_mode() {
 fn rejects_unknown_pipeline_query_mode() {
     let error = parse_config(
         &format!(
-            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  query_mode: keyword\n"
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  retrieval:\n    mode: keyword\n"
         ),
         &HashMap::new(),
     )

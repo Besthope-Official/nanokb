@@ -2,7 +2,7 @@ pub mod chunker;
 pub use chunker::{Block, BlockType, Chunk, ChunkStrategy, DocumentChunks, MetadataMode, NodeRow};
 
 pub mod config;
-pub use config::{AppConfig, DatabaseConfig, IndexConfig};
+pub use config::{AppConfig, ChunkConfig, DatabaseConfig, IndexConfig, RetrievalConfig};
 
 pub mod embed;
 pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};

@@ -52,13 +52,14 @@ async fn ensure_pgvector(transaction: &mut Transaction<'_, Postgres>) -> Result<
 async fn ensure_meta_table(transaction: &mut Transaction<'_, Postgres>) -> Result<()> {
     sqlx::query(
         r#"CREATE TABLE IF NOT EXISTS kb_meta (
-            name         TEXT PRIMARY KEY,
-            chunk_config JSONB NOT NULL,
-            embed_config JSONB NOT NULL,
-            llm_config   JSONB,
-            dimension    INTEGER NOT NULL,
-            query_mode   TEXT NOT NULL,
-            created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+            name             TEXT PRIMARY KEY,
+            chunk_config     JSONB NOT NULL,
+            embed_config     JSONB NOT NULL,
+            retrieval_config JSONB NOT NULL DEFAULT '{}',
+            llm_config       JSONB,
+            dimension        INTEGER NOT NULL,
+            query_mode       TEXT NOT NULL,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
         )"#,
     )
     .execute(&mut **transaction)
@@ -137,6 +138,7 @@ pub async fn create_kb(
     dimension: usize,
     chunk_config: &Value,
     embed_config: &Value,
+    retrieval_config: &Value,
     llm_config: Option<&Value>,
     query_mode: &str,
 ) -> Result<()> {
@@ -195,12 +197,13 @@ pub async fn create_kb(
 
     let inserted = sqlx::query(
         "INSERT INTO kb_meta \
-         (name, chunk_config, embed_config, llm_config, dimension, query_mode) \
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (name) DO NOTHING",
+         (name, chunk_config, embed_config, retrieval_config, llm_config, dimension, query_mode) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (name) DO NOTHING",
     )
     .bind(name)
     .bind(Json(chunk_config))
     .bind(Json(embed_config))
+    .bind(Json(retrieval_config))
     .bind(llm_config.map(Json))
     .bind(dimension as i32)
     .bind(query_mode)
@@ -221,6 +224,7 @@ pub struct KbMeta {
     pub name: String,
     pub chunk_config: Value,
     pub embed_config: Value,
+    pub retrieval_config: Value,
     pub llm_config: Option<Value>,
     pub dimension: usize,
     /// Default retrieval mode, snapshotted at create; `query` falls back to it.
@@ -238,7 +242,7 @@ pub struct KbMeta {
 pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
     validate_kb_name(kb_name)?;
     let row = sqlx::query(
-        "SELECT name, chunk_config, embed_config, llm_config, dimension, query_mode, \
+        "SELECT name, chunk_config, embed_config, retrieval_config, llm_config, dimension, query_mode, \
                 to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at \
          FROM kb_meta WHERE name = $1",
     )
@@ -253,6 +257,7 @@ pub async fn load_kb_meta(pool: &PgPool, kb_name: &str) -> Result<KbMeta> {
         name: row.get("name"),
         chunk_config: row.get("chunk_config"),
         embed_config: row.get("embed_config"),
+        retrieval_config: row.get("retrieval_config"),
         llm_config: row.get("llm_config"),
         dimension: dimension as usize,
         query_mode: row.get("query_mode"),

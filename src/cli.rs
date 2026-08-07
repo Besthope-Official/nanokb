@@ -2,7 +2,7 @@ use crate::chunker::ChunkStrategy;
 use crate::config::QueryMode;
 use crate::pipeline::Pipeline;
 use crate::rerank::RerankClient;
-use crate::retrieve::{self, MAX_ANCESTOR_DEPTH};
+use crate::retrieve;
 use crate::{AppConfig, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -174,6 +174,9 @@ enum TopLevelCommand {
         /// ancestors, children, and siblings join the candidate pool.
         #[arg(long)]
         expand: bool,
+        /// How many ancestor levels to walk (1 = direct parent, 2 = grandparent).
+        #[arg(long, default_value_t = 2)]
+        expand_depth: usize,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -181,10 +184,14 @@ enum TopLevelCommand {
 
 #[derive(Subcommand)]
 enum KbCommand {
-    #[command(about = "Create a kb from config.yaml or a provided config path")]
+    #[command(about = "Create a kb from config.yaml, optionally merged with overlay files")]
     Create {
         name: String,
+        #[arg(short = 'c', long = "config")]
         config_path: Option<PathBuf>,
+        /// Overlay files merged on top of the base config, Helm-style.
+        #[arg(short = 'f', long = "file")]
+        overlay_files: Vec<PathBuf>,
     },
     #[command(about = "Delete a kb with all its docs and chunks")]
     Delete { name: String },
@@ -235,11 +242,15 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         TopLevelCommand::Kb {
-            command: KbCommand::Create { name, config_path },
+            command: KbCommand::Create { name, config_path, overlay_files },
         } => {
-            let config_path = config_path.as_deref().unwrap_or(Path::new("config.yaml"));
-            let create_config = AppConfig::try_load_from(config_path)
-                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            let base = config_path.as_deref().unwrap_or(Path::new("config.yaml"));
+            let create_config = if overlay_files.is_empty() {
+                AppConfig::try_load_from(base)
+            } else {
+                AppConfig::try_load_with_overlays(base, &overlay_files)
+            }
+            .with_context(|| format!("failed to load config from {}", base.display()))?;
             Pipeline::create_kb(&pool, &create_config, &name).await?;
             println!("created kb '{name}'");
             Ok(())
@@ -280,7 +291,8 @@ pub async fn run() -> Result<()> {
             top_k,
             reranker,
             expand,
-        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand).await,
+            expand_depth,
+        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -362,10 +374,14 @@ async fn run_query(
     top_k: Option<usize>,
     reranker_name: Option<&str>,
     expand: bool,
+    expand_depth: usize,
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
+    let retrieval_defaults: crate::config::RetrievalConfig =
+        serde_json::from_value(meta.retrieval_config.clone())
+            .context("kb metadata has an unreadable retrieval_config")?;
     let semantic = meta.llm_config.is_some();
-    let top_k = top_k.unwrap_or(config.pipeline.top_k);
+    let top_k = top_k.unwrap_or(retrieval_defaults.top_k);
 
     let effective_mode = mode.unwrap_or(QueryMode::parse(&meta.query_mode)?);
 
@@ -398,7 +414,7 @@ async fn run_query(
                     .await?;
             if expand {
                 let neighbors =
-                    postgres::expand_neighbors(pool, kb_name, &candidates, MAX_ANCESTOR_DEPTH)
+                    postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth)
                         .await?;
                 candidates = retrieve::merge_with_neighbors(candidates, neighbors);
             }
@@ -450,7 +466,7 @@ async fn run_query(
                 retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
                     .await?;
             let neighbors =
-                postgres::expand_neighbors(pool, kb_name, &candidates, MAX_ANCESTOR_DEPTH).await?;
+                postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
             print_chunks(retrieve::merge_with_neighbors(candidates, neighbors).iter().map(|r| {
                 (format!("[{}] ", r.source), r)
             }));
@@ -637,7 +653,7 @@ mod tests {
 
     #[test]
     fn parses_kb_create_with_an_optional_config_path() {
-        let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "recipe.yaml"]).unwrap();
+        let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "-c", "recipe.yaml"]).unwrap();
 
         assert!(matches!(
             cli.command,
@@ -645,8 +661,9 @@ mod tests {
                 command: KbCommand::Create {
                     name,
                     config_path: Some(config_path),
+                    overlay_files,
                 },
-            } if name == "books" && config_path == PathBuf::from("recipe.yaml")
+            } if name == "books" && config_path == PathBuf::from("recipe.yaml") && overlay_files.is_empty()
         ));
     }
 

@@ -97,6 +97,8 @@ impl Pipeline {
         let embed_config = json!({"model": &model.model_name});
         let chunk_config = serde_json::to_value(&strategy)
             .context("failed to serialize the configured chunking strategy")?;
+        let retrieval_config = serde_json::to_value(&config.pipeline.retrieval)
+            .context("failed to serialize the configured retrieval defaults")?;
 
         let llm_config = if config.pipeline.llm.is_some() {
             let llm = config.llm()?;
@@ -105,7 +107,7 @@ impl Pipeline {
             None
         };
 
-        let query_mode = match config.pipeline.query_mode.as_deref() {
+        let query_mode = match config.pipeline.retrieval.mode.as_deref() {
             Some(mode) => QueryMode::parse(mode)?,
             None if llm_config.is_some() => QueryMode::Hybrid,
             None => QueryMode::Vector,
@@ -117,6 +119,7 @@ impl Pipeline {
             dimension,
             &chunk_config,
             &embed_config,
+            &retrieval_config,
             llm_config.as_ref(),
             query_mode.as_str(),
         )

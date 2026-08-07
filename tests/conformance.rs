@@ -45,6 +45,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         3,
         &chunk_config,
         &embed_config,
+        &json!({}),
         None,           // no LLM → vector-only kb
         "vector",
     )
@@ -206,6 +207,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
         3,
         &chunk_config,
         &embed_config,
+        &json!({}),
         Some(&llm_config),
         "hybrid",
     )
@@ -387,6 +389,7 @@ async fn expand_neighbors_returns_tree_context_in_document_order() -> Result<()>
         3,
         &json!({"strategy": "layered"}),
         &json!({"model": "conformance", "dimension": 3}),
+        &json!({}),
         None,
         "vector",
     )
