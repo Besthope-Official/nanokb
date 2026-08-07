@@ -24,6 +24,11 @@ pub use postgres::{query_chunks, query_markers, QueryResult};
 pub mod rerank;
 pub use rerank::{RerankClient, RerankResult, RrfEntry, rrf_fusion};
 
+pub mod retrieve;
+pub use retrieve::{
+    load_embed_model_for_kb, merge_with_neighbors, rerank_ordered, retrieve_candidates,
+};
+
 pub mod task;
 
 pub mod pipeline;

@@ -1,11 +1,11 @@
 use crate::chunker::ChunkStrategy;
 use crate::config::QueryMode;
 use crate::pipeline::Pipeline;
-use crate::rerank::{RerankClient, rrf_fusion};
-use crate::{AppConfig, EmbedClient, EmbedModel, postgres, task};
+use crate::rerank::RerankClient;
+use crate::retrieve::{self, MAX_ANCESTOR_DEPTH};
+use crate::{AppConfig, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::collections::HashSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -394,34 +394,34 @@ async fn run_query(
     match (&reranker, effective_mode, expand) {
         (Some(reranker), _, _) => {
             let mut candidates =
-                retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+                retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
                     .await?;
             if expand {
                 let neighbors =
                     postgres::expand_neighbors(pool, kb_name, &candidates, MAX_ANCESTOR_DEPTH)
                         .await?;
-                candidates = merge_with_neighbors(candidates, neighbors);
+                candidates = retrieve::merge_with_neighbors(candidates, neighbors);
             }
-            let ordered = rerank_ordered(reranker, query_text, candidates, top_k).await?;
+            let ordered = retrieve::rerank_ordered(reranker, query_text, candidates, top_k).await?;
             print_chunks(ordered.iter().map(|(score, result)| {
                 (format!("[{score:.4} RERANK] [{}] ", result.source), result)
             }));
         }
         (None, QueryMode::Vector, false) => {
-            let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
             let embedding = model.embed_query(query_text).await?;
             let results = postgres::query_chunks(pool, kb_name, &embedding, limit).await?;
             print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.distance, r.source), r)));
         }
         (None, QueryMode::Marker, false) => {
-            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let emb = embed_model.embed_query(query_text).await?;
-            let results = postgres::query_markers(pool, kb_name, &emb, limit).await?;
+            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let embedding = model.embed_query(query_text).await?;
+            let results = postgres::query_markers(pool, kb_name, &embedding, limit).await?;
             print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.marker_distance, r.source), r)));
         }
         (None, QueryMode::Hybrid, false) => {
-            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let query_emb = embed_model.embed_query(query_text).await?;
+            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
+            let query_emb = model.embed_query(query_text).await?;
 
             // Run marker and vector retrieval in parallel, sharing the query embedding.
             let (marker_results, vector_results) = tokio::join!(
@@ -435,7 +435,7 @@ async fn run_query(
             let marker_results = marker_results?;
             let vector_results = vector_results?;
 
-            let entries = rrf_fusion(&marker_results, &vector_results, Some(top_k));
+            let entries = crate::rerank::rrf_fusion(&marker_results, &vector_results, Some(top_k));
             print_chunks(entries.iter().map(|entry| {
                 let inner = if entry.result.source == "MARKER" {
                     format!("{:.4} MARKER", entry.result.marker_distance)
@@ -447,41 +447,17 @@ async fn run_query(
         }
         (None, _, true) => {
             let candidates =
-                retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+                retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
                     .await?;
             let neighbors =
                 postgres::expand_neighbors(pool, kb_name, &candidates, MAX_ANCESTOR_DEPTH).await?;
-            print_chunks(merge_with_neighbors(candidates, neighbors).iter().map(|r| {
+            print_chunks(retrieve::merge_with_neighbors(candidates, neighbors).iter().map(|r| {
                 (format!("[{}] ", r.source), r)
             }));
         }
     }
 
     Ok(())
-}
-
-/// TreeRAG leaf-to-root walk depth: a hit at 2.1.1 reaches 2.1 and Chapter 2.
-const MAX_ANCESTOR_DEPTH: usize = 2;
-
-/// Merge entry hits with expanded neighbors into one deduplicated list in
-/// document order, so the tree context reads structurally. Sorting before a
-/// rerank is harmless — the reranker reorders by its own scores.
-fn merge_with_neighbors(
-    mut candidates: Vec<postgres::QueryResult>,
-    neighbors: Vec<postgres::QueryResult>,
-) -> Vec<postgres::QueryResult> {
-    let mut seen: HashSet<(i64, String, i32)> = candidates
-        .iter()
-        .map(|c| (c.document_id, c.node_id.clone(), c.chunk_seq))
-        .collect();
-    for neighbor in neighbors {
-        let key = (neighbor.document_id, neighbor.node_id.clone(), neighbor.chunk_seq);
-        if seen.insert(key) {
-            candidates.push(neighbor);
-        }
-    }
-    candidates.sort_by_key(|c| (c.document_id, c.sort_order, c.chunk_seq));
-    candidates
 }
 
 /// Render query results as self-describing chunk elements: every chunk is
@@ -506,102 +482,6 @@ fn print_chunks<'a>(rows: impl IntoIterator<Item = (String, &'a postgres::QueryR
     for line in chunk_lines(rows) {
         println!("{line}");
     }
-}
-
-/// Retrieve candidates for reranking: `limit` candidates per channel, fused
-/// into one list (hybrid mode fuses without truncation so the reranker sees
-/// every unique chunk).
-async fn retrieve_candidates(
-    config: &AppConfig,
-    pool: &sqlx::PgPool,
-    kb_name: &str,
-    meta: &postgres::KbMeta,
-    mode: QueryMode,
-    query_text: &str,
-    limit: usize,
-) -> Result<Vec<postgres::QueryResult>> {
-    match mode {
-        QueryMode::Vector => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_chunks(pool, kb_name, &embedding, limit).await?)
-        }
-        QueryMode::Marker => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_markers(pool, kb_name, &embedding, limit).await?)
-        }
-        QueryMode::Hybrid => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let query_emb = model.embed_query(query_text).await?;
-
-            let (marker_results, vector_results) = tokio::join!(
-                async {
-                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
-                },
-                async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
-                },
-            );
-
-            Ok(rrf_fusion(&marker_results?, &vector_results?, None)
-                .into_iter()
-                .map(|entry| entry.result.clone())
-                .collect())
-        }
-    }
-}
-
-/// Re-rank `candidates` against `query_text`, returning the top `top_k`
-/// ordered by relevance score (highest first).
-async fn rerank_ordered(
-    reranker: &RerankClient,
-    query_text: &str,
-    candidates: Vec<postgres::QueryResult>,
-    top_k: usize,
-) -> Result<Vec<(f64, postgres::QueryResult)>> {
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    let documents: Vec<String> = candidates.iter().map(|r| r.text.clone()).collect();
-    let reranked = reranker.rerank(query_text, &documents, top_k).await?;
-
-    // `index` refers to the candidate's position in `documents`; take by index
-    // so the candidates reorder according to the reranker's scores.
-    let mut taken: Vec<Option<postgres::QueryResult>> = candidates.into_iter().map(Some).collect();
-    let mut ordered: Vec<(f64, postgres::QueryResult)> = reranked
-        .into_iter()
-        .map(|rr| {
-            let result = taken[rr.index]
-                .take()
-                .expect("rerank API returned an out-of-range or duplicate index");
-            (rr.relevance_score, result)
-        })
-        .collect();
-    ordered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    Ok(ordered)
-}
-
-async fn load_embed_model_for_kb(
-    config: &AppConfig,
-    meta: &postgres::KbMeta,
-    kb_name: &str,
-) -> Result<EmbedModel> {
-    let stored_model = meta.embed_config
-        .get("model")
-        .and_then(|value| value.as_str())
-        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-    let embedding_config = config.embedding_for_model(stored_model)?;
-    let embed_model = EmbedClient::from_config(embedding_config)?
-        .dimension()
-        .await?;
-    anyhow::ensure!(
-        embed_model.dimension == meta.dimension,
-        "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-        meta.dimension,
-        embed_model.dimension
-    );
-    Ok(embed_model)
 }
 
 async fn run_doc_add(
@@ -831,10 +711,6 @@ mod tests {
         ));
     }
 
-    fn make_result(node_id: &str, chunk_seq: i32, sort_order: i32) -> postgres::QueryResult {
-        make_result_in(node_id, chunk_seq, sort_order, 1, Vec::new(), "")
-    }
-
     fn make_result_in(
         node_id: &str,
         chunk_seq: i32,
@@ -857,35 +733,6 @@ mod tests {
             marker_distance: 0.0,
             distance: 0.0,
         }
-    }
-
-    #[test]
-    fn merge_with_neighbors_dedupes_and_sorts_structural() {
-        let candidates = vec![make_result("b", 0, 2), make_result("d", 0, 4)];
-        // The b entry appears again as a neighbor; it must be dropped, and
-        // everything lands in document order regardless of entry order.
-        let neighbors = vec![
-            make_result("c", 0, 3),
-            make_result("b", 0, 2),
-            make_result("a", 0, 1),
-        ];
-
-        let merged = merge_with_neighbors(candidates, neighbors);
-
-        let nodes: Vec<&str> = merged.iter().map(|r| r.node_id.as_str()).collect();
-        assert_eq!(nodes, vec!["a", "b", "c", "d"]);
-    }
-
-    #[test]
-    fn merge_with_neighbors_keeps_all_chunks_of_one_section() {
-        // A section with two chunks: both survive, ordered by chunk_seq.
-        let candidates = vec![make_result("s", 1, 3)];
-        let neighbors = vec![make_result("s", 0, 3), make_result("t", 0, 5)];
-
-        let merged = merge_with_neighbors(candidates, neighbors);
-
-        let keys: Vec<(i32, i32)> = merged.iter().map(|r| (r.chunk_seq, r.sort_order)).collect();
-        assert_eq!(keys, vec![(0, 3), (1, 3), (0, 5)]);
     }
 
     #[test]
