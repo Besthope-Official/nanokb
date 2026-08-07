@@ -25,7 +25,7 @@ async fn rejects_zero_dimension_before_connecting() {
     let pool = PgPool::connect_lazy("postgres://nanokb:nanokb@127.0.0.1/nanokb").unwrap();
     let config = serde_json::json!({});
 
-    let error = create_kb(&pool, "docs", 0, &config, &config, None, "vector")
+    let error = create_kb(&pool, "docs", 0, &config, &config, &config, None, "vector")
         .await
         .unwrap_err();
 

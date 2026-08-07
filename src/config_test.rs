@@ -44,7 +44,7 @@ fn loads_placeholders_from_adjacent_dotenv() {
     )
     .unwrap();
 
-    let config = load_from_sources(&config_path, HashMap::new()).unwrap();
+    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
 
     assert_eq!(
         config.database.url,
@@ -74,7 +74,7 @@ fn process_environment_overrides_dotenv() {
         "postgres://from-process".to_string(),
     )]);
 
-    let config = load_from_sources(&config_path, process_environment).unwrap();
+    let config = load_from_sources(&config_path, &[], process_environment).unwrap();
 
     assert_eq!(config.database.url, "postgres://from-process");
 }
@@ -185,7 +185,7 @@ fn rejects_unknown_query_mode() {
 fn rejects_unknown_pipeline_query_mode() {
     let error = parse_config(
         &format!(
-            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  query_mode: keyword\n"
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  retrieval:\n    mode: keyword\n"
         ),
         &HashMap::new(),
     )
@@ -385,4 +385,145 @@ fn database_config_without_index_defaults() {
             assert_eq!(ef_search, 40);
         }
     }
+}
+
+// -----------------------------------------------------------------
+// merge_values
+// -----------------------------------------------------------------
+
+#[test]
+fn merge_scalar_overlay_replaces_base() {
+    let mut base = yaml_serde::from_str("a: 1\nb: 2").unwrap();
+    let overlay = yaml_serde::from_str("b: 3").unwrap();
+    merge_values(&mut base, &overlay);
+    let merged: HashMap<String, i32> = yaml_serde::from_value(base).unwrap();
+    assert_eq!(merged["a"], 1);
+    assert_eq!(merged["b"], 3);
+}
+
+#[test]
+fn merge_adds_new_top_level_key() {
+    let mut base = yaml_serde::from_str("a: 1").unwrap();
+    let overlay = yaml_serde::from_str("b: 2").unwrap();
+    merge_values(&mut base, &overlay);
+    let merged: HashMap<String, i32> = yaml_serde::from_value(base).unwrap();
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged["a"], 1);
+    assert_eq!(merged["b"], 2);
+}
+
+#[test]
+fn merge_recurses_into_nested_mappings() {
+    let mut base = yaml_serde::from_str(
+        &format!(
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  chunk:\n    strategy: layered\n    max_chunk_tokens: 256"
+        ),
+    )
+    .unwrap();
+    let overlay = yaml_serde::from_str(
+        "pipeline:\n  chunk:\n    strategy: fixed\n  retrieval:\n    expand: true",
+    )
+    .unwrap();
+    merge_values(&mut base, &overlay);
+
+    let config: AppConfig = yaml_serde::from_value(base).unwrap();
+    assert_eq!(config.pipeline.chunk.strategy, "fixed");
+    assert_eq!(config.pipeline.chunk.max_chunk_tokens, 256); // preserved
+    assert!(config.pipeline.retrieval.expand);
+}
+
+#[test]
+fn merge_sequence_overlay_replaces() {
+    let mut base = yaml_serde::from_str("items:\n  - a\n  - b").unwrap();
+    let overlay = yaml_serde::from_str("items:\n  - c").unwrap();
+    merge_values(&mut base, &overlay);
+    let merged: HashMap<String, Vec<String>> = yaml_serde::from_value(base).unwrap();
+    assert_eq!(merged["items"], vec!["c"]);
+}
+
+// -----------------------------------------------------------------
+// try_load_with_overlays
+// -----------------------------------------------------------------
+
+#[test]
+fn try_load_with_single_overlay() {
+    let directory = TestDirectory::new();
+    let base_path = directory.path().join("config.yaml");
+    let overlay_path = directory.path().join("expand.yaml");
+    fs::write(
+        &base_path,
+        format!(
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  chunk:\n    strategy: layered\n    max_chunk_tokens: 128\n  embedding: default\n  retrieval:\n    top_k: 5\n    expand: false\n",
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &overlay_path,
+        "pipeline:\n  retrieval:\n    expand: true\n    expand_depth: 3\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::try_load_with_overlays(&base_path, &[overlay_path]).unwrap();
+
+    assert_eq!(config.pipeline.chunk.max_chunk_tokens, 128);
+    assert_eq!(config.pipeline.retrieval.top_k, 5);
+    assert!(config.pipeline.retrieval.expand);
+    assert_eq!(config.pipeline.retrieval.expand_depth, 3);
+}
+
+#[test]
+fn try_load_last_overlay_wins() {
+    let directory = TestDirectory::new();
+    let base_path = directory.path().join("config.yaml");
+    let first = directory.path().join("a.yaml");
+    let second = directory.path().join("b.yaml");
+    fs::write(
+        &base_path,
+        format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(
+        &first,
+        "pipeline:\n  chunk:\n    max_chunk_tokens: 64\n    strategy: fixed\n",
+    )
+    .unwrap();
+    fs::write(
+        &second,
+        "pipeline:\n  chunk:\n    max_chunk_tokens: 512\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::try_load_with_overlays(&base_path, &[first, second]).unwrap();
+
+    assert_eq!(config.pipeline.chunk.strategy, "fixed"); // from first
+    assert_eq!(config.pipeline.chunk.max_chunk_tokens, 512); // second won
+}
+
+#[test]
+fn try_load_overlay_with_placeholders() {
+    let directory = TestDirectory::new();
+    let base_path = directory.path().join("config.yaml");
+    let overlay_path = directory.path().join("prod.yaml");
+    fs::write(
+        &base_path,
+        format!("database:\n  url: \"{{DATABASE_URL}}\"\n{MODEL_BLOCK}"),
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join(".env"),
+        "DATABASE_URL=postgres://from-dotenv\n",
+    )
+    .unwrap();
+    // Overlay url replaces the base; placeholders in the overlay file are
+    // resolved against the same dotenv + process-env pool after the merge.
+    fs::write(
+        &overlay_path,
+        "database:\n  url: \"postgres://production-host/nanokb\"\n",
+    )
+    .unwrap();
+
+    let config = AppConfig::try_load_with_overlays(&base_path, &[overlay_path]).unwrap();
+
+    // Overlay value wins over both the dotenv placeholder and the base url.
+    assert_eq!(config.database.url, "postgres://production-host/nanokb");
 }

@@ -1,6 +1,6 @@
 use crate::chunker::{ChunkStrategy, MetadataMode};
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
@@ -17,70 +17,112 @@ pub struct AppConfig {
     pub pipeline: PipelineConfig,
 }
 
-#[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PipelineConfig {
-    /// Embedding provider for the vector index. Required — every kb depends on it.
-    #[serde(default)]
-    pub embedding: Option<String>,
-    /// LLM provider for the semantic marker index. Absent -> vector-only kb.
-    #[serde(default)]
-    pub llm: Option<String>,
-    /// Default retrieval mode for `query`; snapshotted into the kb at create time.
-    #[serde(default)]
-    pub query_mode: Option<String>,
-    #[serde(default = "default_worker_count")]
-    pub worker_count: usize,
-    #[serde(default = "default_top_k")]
-    pub top_k: usize,
+/// Chunking parameters picked at kb-creation time and frozen into kb_meta.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ChunkConfig {
+    #[serde(default = "default_chunk_strategy_name")]
+    pub strategy: String,
     #[serde(default = "default_max_chunk_tokens")]
     pub max_chunk_tokens: usize,
     #[serde(default = "default_chunk_overlap_ratio")]
-    pub chunk_overlap_ratio: f32,
-    #[serde(default = "default_worker_poll_timeout_secs")]
-    pub worker_poll_timeout_secs: u64,
-    #[serde(default = "default_worker_error_retry_secs")]
-    pub worker_error_retry_secs: u64,
-    #[serde(default = "default_chunk_strategy_name")]
-    pub chunk_strategy: String,
+    pub overlap_ratio: f32,
     #[serde(default = "default_chunk_size")]
     pub chunk_size: usize,
     #[serde(default = "default_chunk_overlap")]
     pub chunk_overlap: usize,
 }
 
-impl Default for PipelineConfig {
+impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            embedding: None,
-            llm: None,
-            query_mode: None,
-            worker_count: default_worker_count(),
-            top_k: default_top_k(),
+            strategy: default_chunk_strategy_name(),
             max_chunk_tokens: default_max_chunk_tokens(),
-            chunk_overlap_ratio: default_chunk_overlap_ratio(),
-            worker_poll_timeout_secs: default_worker_poll_timeout_secs(),
-            worker_error_retry_secs: default_worker_error_retry_secs(),
-            chunk_strategy: default_chunk_strategy_name(),
+            overlap_ratio: default_chunk_overlap_ratio(),
             chunk_size: default_chunk_size(),
             chunk_overlap: default_chunk_overlap(),
         }
     }
 }
 
+/// Default retrieval behaviour snapshotted into the kb; every
+/// field is individually overridable by CLI flags at query time.
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct RetrievalConfig {
+    pub mode: Option<String>,
+    #[serde(default = "default_top_k")]
+    pub top_k: usize,
+    #[serde(default)]
+    pub expand: bool,
+    #[serde(default = "default_expand_depth")]
+    pub expand_depth: usize,
+    #[serde(default)]
+    pub reranker: Option<String>,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            top_k: default_top_k(),
+            expand: false,
+            expand_depth: default_expand_depth(),
+            reranker: None,
+        }
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PipelineConfig {
+    #[serde(default)]
+    pub chunk: ChunkConfig,
+    /// Embedding provider for the vector index. Required — every kb depends on it.
+    #[serde(default)]
+    pub embedding: Option<String>,
+    /// LLM provider for the semantic marker index. Absent -> vector-only kb.
+    #[serde(default)]
+    pub llm: Option<String>,
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+    #[serde(default = "default_worker_poll_timeout_secs")]
+    pub worker_poll_timeout_secs: u64,
+    #[serde(default = "default_worker_error_retry_secs")]
+    pub worker_error_retry_secs: u64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            chunk: ChunkConfig::default(),
+            embedding: None,
+            llm: None,
+            retrieval: RetrievalConfig::default(),
+            worker_count: default_worker_count(),
+            worker_poll_timeout_secs: default_worker_poll_timeout_secs(),
+            worker_error_retry_secs: default_worker_error_retry_secs(),
+        }
+    }
+}
+
 impl PipelineConfig {
     pub fn chunk_strategy(&self) -> ChunkStrategy {
-        match self.chunk_strategy.as_str() {
+        match self.chunk.strategy.as_str() {
             "fixed" => ChunkStrategy::Fixed {
-                chunk_size: self.chunk_size,
-                overlap_tokens: self.chunk_overlap,
+                chunk_size: self.chunk.chunk_size,
+                overlap_tokens: self.chunk.chunk_overlap,
             },
             "layered" => ChunkStrategy::Layered {
-                max_chunk_tokens: self.max_chunk_tokens,
-                overlap_ratio: self.chunk_overlap_ratio,
+                max_chunk_tokens: self.chunk.max_chunk_tokens,
+                overlap_ratio: self.chunk.overlap_ratio,
                 metadata_mode: MetadataMode::Path,
             },
-            other => panic!("unknown pipeline.chunk_strategy {other:?}; expected \"fixed\" or \"layered\""),
+            other => panic!(
+                "unknown pipeline.chunk.strategy {other:?}; expected \"fixed\" or \"layered\""
+            ),
         }
     }
 }
@@ -123,6 +165,10 @@ fn default_chunk_size() -> usize {
 
 fn default_chunk_overlap() -> usize {
     25
+}
+
+fn default_expand_depth() -> usize {
+    2
 }
 
 #[derive(Clone, Deserialize)]
@@ -416,11 +462,26 @@ impl AppConfig {
         names
     }
 
+    /// Load the base config from `path` with optional overlay files merged
+    /// in order (last wins), Helm-style.  Environment interpolation runs once
+    /// after all overlays have been applied.
     pub fn try_load_from(path: impl AsRef<Path>) -> Result<Self> {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(path.as_ref(), process_environment)
+        load_from_sources(path.as_ref(), &[], process_environment)
+    }
+
+    /// Load the base config then merge each overlay file (in order) on top
+    /// before interpolating placeholders and deserializing.
+    pub fn try_load_with_overlays(
+        base: impl AsRef<Path>,
+        overlays: &[PathBuf],
+    ) -> Result<Self> {
+        let process_environment = env::vars_os()
+            .map(unicode_environment_variable)
+            .collect::<Result<HashMap<_, _>>>()?;
+        load_from_sources(base.as_ref(), overlays, process_environment)
     }
 }
 
@@ -435,16 +496,55 @@ fn unicode_environment_variable(variable: (OsString, OsString)) -> Result<(Strin
     Ok((key, value))
 }
 
+/// Deep-merge `overlay` into `base` in-place.  Scalars and sequences are
+/// replaced; mappings are recursed into so that a sparse overlay file only
+/// needs to carry the keys it overrides.
+fn merge_values(base: &mut Value, overlay: &Value) {
+    match (base, overlay) {
+        (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                match base_map.get_mut(key) {
+                    Some(base_val) => merge_values(base_val, overlay_val),
+                    None => {
+                        base_map.insert(key.clone(), overlay_val.clone());
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay.clone(),
+    }
+}
+
 fn load_from_sources(
     config_path: &Path,
+    overlays: &[PathBuf],
     process_environment: HashMap<String, String>,
 ) -> Result<AppConfig> {
-    let yaml = fs::read_to_string(config_path).with_context(|| {
-        format!(
-            "failed to read configuration file {}",
-            config_path.display()
+    let mut value: Value = yaml_serde::from_str(
+        &fs::read_to_string(config_path).with_context(|| {
+            format!(
+                "failed to read configuration file {}",
+                config_path.display()
+            )
+        })?,
+    )
+    .context("failed to parse application configuration YAML")?;
+
+    for overlay_path in overlays {
+        let overlay: Value = yaml_serde::from_str(
+            &fs::read_to_string(overlay_path).with_context(|| {
+                format!("failed to read overlay file {}", overlay_path.display())
+            })?,
         )
-    })?;
+        .with_context(|| {
+            format!(
+                "failed to parse overlay configuration {}",
+                overlay_path.display()
+            )
+        })?;
+        merge_values(&mut value, &overlay);
+    }
+
     let dotenv_path = dotenv_path(config_path);
     let mut variables = if dotenv_path
         .try_exists()
@@ -455,7 +555,16 @@ fn load_from_sources(
         HashMap::new()
     };
     variables.extend(process_environment);
-    parse_config(&yaml, &variables)
+    interpolate_value(&mut value, &variables);
+    if let Some(name) = unresolved_placeholder(&value) {
+        bail!("unresolved configuration placeholder: {name}");
+    }
+    let config: AppConfig = yaml_serde::from_value(value)
+        .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))?;
+    if let Some(mode) = &config.pipeline.retrieval.mode {
+        QueryMode::parse(mode)?;
+    }
+    Ok(config)
 }
 
 fn dotenv_path(config_path: &Path) -> PathBuf {
@@ -477,6 +586,7 @@ fn read_dotenv(path: &Path) -> Result<HashMap<String, String>> {
     Ok(variables)
 }
 
+#[cfg(test)]
 fn parse_config(yaml: &str, variables: &HashMap<String, String>) -> Result<AppConfig> {
     let mut value: Value =
         yaml_serde::from_str(yaml).context("failed to parse application configuration YAML")?;
@@ -486,7 +596,7 @@ fn parse_config(yaml: &str, variables: &HashMap<String, String>) -> Result<AppCo
     }
     let config: AppConfig = yaml_serde::from_value(value)
         .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))?;
-    if let Some(mode) = &config.pipeline.query_mode {
+    if let Some(mode) = &config.pipeline.retrieval.mode {
         QueryMode::parse(mode)?;
     }
     Ok(config)

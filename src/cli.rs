@@ -1,7 +1,9 @@
+use crate::chunker::ChunkStrategy;
 use crate::config::QueryMode;
 use crate::pipeline::Pipeline;
-use crate::rerank::{RerankClient, rrf_fusion};
-use crate::{AppConfig, EmbedClient, EmbedModel, postgres, task};
+use crate::rerank::RerankClient;
+use crate::retrieve;
+use crate::{AppConfig, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -168,6 +170,13 @@ enum TopLevelCommand {
         /// Re-rank retrieval candidates with a model.rerankers provider.
         #[arg(long)]
         reranker: Option<String>,
+        /// Expand hits bidirectionally through the section tree (TreeRAG):
+        /// ancestors, children, and siblings join the candidate pool.
+        #[arg(long)]
+        expand: bool,
+        /// How many ancestor levels to walk (1 = direct parent, 2 = grandparent).
+        #[arg(long)]
+        expand_depth: Option<usize>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -175,10 +184,14 @@ enum TopLevelCommand {
 
 #[derive(Subcommand)]
 enum KbCommand {
-    #[command(about = "Create a kb from config.yaml or a provided config path")]
+    #[command(about = "Create a kb from config.yaml, optionally merged with overlay files")]
     Create {
         name: String,
+        #[arg(short = 'c', long = "config")]
         config_path: Option<PathBuf>,
+        /// Overlay files merged on top of the base config, Helm-style.
+        #[arg(short = 'f', long = "file")]
+        overlay_files: Vec<PathBuf>,
     },
     #[command(about = "Delete a kb with all its docs and chunks")]
     Delete { name: String },
@@ -191,17 +204,29 @@ enum KbCommand {
 #[derive(Subcommand)]
 enum DocCommand {
     #[command(about = "Ingest a file, or every supported file in a directory")]
-    Add { kb: String, source: String },
+    Add {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+        source: String,
+    },
     #[command(about = "Re-read a doc from path and rebuild its chunks")]
     Update {
+        #[arg(short = 'n', long = "name")]
         kb: String,
         doc_id: i64,
         path: String,
     },
     #[command(about = "Delete a doc and its chunks")]
-    Remove { kb: String, doc_id: i64 },
+    Remove {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+        doc_id: i64,
+    },
     #[command(about = "List the docs in a kb")]
-    List { kb: String },
+    List {
+        #[arg(short = 'n', long = "name")]
+        kb: String,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -217,11 +242,15 @@ pub async fn run() -> Result<()> {
 
     match cli.command {
         TopLevelCommand::Kb {
-            command: KbCommand::Create { name, config_path },
+            command: KbCommand::Create { name, config_path, overlay_files },
         } => {
-            let config_path = config_path.as_deref().unwrap_or(Path::new("config.yaml"));
-            let create_config = AppConfig::try_load_from(config_path)
-                .with_context(|| format!("failed to load config from {}", config_path.display()))?;
+            let base = config_path.as_deref().unwrap_or(Path::new("config.yaml"));
+            let create_config = if overlay_files.is_empty() {
+                AppConfig::try_load_from(base)
+            } else {
+                AppConfig::try_load_with_overlays(base, &overlay_files)
+            }
+            .with_context(|| format!("failed to load config from {}", base.display()))?;
             Pipeline::create_kb(&pool, &create_config, &name).await?;
             println!("created kb '{name}'");
             Ok(())
@@ -261,7 +290,9 @@ pub async fn run() -> Result<()> {
             mode,
             top_k,
             reranker,
-        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref()).await,
+            expand,
+            expand_depth,
+        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -342,16 +373,33 @@ async fn run_query(
     mode: Option<QueryMode>,
     top_k: Option<usize>,
     reranker_name: Option<&str>,
+    expand: bool,
+    expand_depth: Option<usize>,
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
+    let retrieval_defaults: crate::config::RetrievalConfig =
+        serde_json::from_value(meta.retrieval_config.clone())
+            .context("kb metadata has an unreadable retrieval_config")?;
     let semantic = meta.llm_config.is_some();
-    let top_k = top_k.unwrap_or(config.pipeline.top_k);
+    let top_k = top_k.unwrap_or(retrieval_defaults.top_k);
+    let expand = expand || retrieval_defaults.expand;
+    let expand_depth = expand_depth.unwrap_or(retrieval_defaults.expand_depth);
+    let reranker_name = reranker_name.or(retrieval_defaults.reranker.as_deref());
 
     let effective_mode = mode.unwrap_or(QueryMode::parse(&meta.query_mode)?);
 
     if matches!(effective_mode, QueryMode::Marker | QueryMode::Hybrid) && !semantic {
         anyhow::bail!(
             "kb '{kb_name}' has no semantic index; it was created without pipeline.llm"
+        );
+    }
+
+    if expand {
+        let strategy: ChunkStrategy = serde_json::from_value(meta.chunk_config.clone())
+            .with_context(|| format!("kb '{kb_name}' has an unreadable chunk_config"))?;
+        anyhow::ensure!(
+            matches!(strategy, ChunkStrategy::Layered { .. }),
+            "kb '{kb_name}' was chunked with {strategy:?}; --expand needs the layered section tree"
         );
     }
 
@@ -362,160 +410,60 @@ async fn run_query(
     // A reranker sees a wider candidate pool, then re-ranks down to `top_k`.
     let limit = if reranker.is_some() { top_k * 4 } else { top_k };
 
-    match (&reranker, effective_mode) {
-        (Some(reranker), _) => {
-            let candidates = retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
-                .await?;
-            print_reranked(reranker, query_text, candidates, top_k).await?;
-        }
-        (None, QueryMode::Vector) => {
-            let model = load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            let results = postgres::query_chunks(pool, kb_name, &embedding, limit).await?;
-            for result in &results {
-                println!("[{:.4}] {}", result.distance, result.text);
-            }
-        }
-        (None, QueryMode::Marker) => {
-            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let emb = embed_model.embed_query(query_text).await?;
-            let results = postgres::query_markers(pool, kb_name, &emb, limit).await?;
-            for result in &results {
-                println!("[{:.4} marker] {}", result.marker_distance, result.text);
-            }
-        }
-        (None, QueryMode::Hybrid) => {
-            let embed_model = load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let query_emb = embed_model.embed_query(query_text).await?;
+    let mut candidates =
+        retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+            .await?;
+    if expand {
+        let neighbors =
+            postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
+        candidates = retrieve::merge_with_neighbors(candidates, neighbors);
+    }
 
-            // Run marker and vector retrieval in parallel, sharing the query embedding.
-            let (marker_results, vector_results) = tokio::join!(
-                async {
-                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
-                },
-                async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
-                },
-            );
-            let marker_results = marker_results?;
-            let vector_results = vector_results?;
-
-            for entry in rrf_fusion(&marker_results, &vector_results, Some(top_k)) {
-                println!(
-                    "[{:.4} rrf] [{}] {}",
-                    entry.rrf_score,
-                    if entry.source == "marker" {
-                        format!("{:.4} marker", entry.result.marker_distance)
-                    } else {
-                        format!("{:.4} vec", entry.result.distance)
-                    },
-                    entry.result.text
-                );
+    match &reranker {
+        Some(reranker) => {
+            let ordered = retrieve::rerank_ordered(reranker, query_text, candidates, top_k).await?;
+            print_chunks(ordered.iter().map(|(score, result)| {
+                (format!("[{score:.4} RERANK] [{}] ", result.source), result)
+            }));
+        }
+        None => {
+            // Hybrid fusion can yield more unique chunks than `limit`; plain
+            // queries already return at most `limit`. Expansion output keeps
+            // every neighbor instead of truncating.
+            if !expand {
+                candidates.truncate(top_k);
             }
+            print_chunks(candidates.iter().map(|r| {
+                (format!("[{:.4} {}] ", r.distance, r.source), r)
+            }));
         }
     }
 
     Ok(())
 }
 
-/// Retrieve candidates for reranking: `limit` candidates per channel, fused
-/// into one list (hybrid mode fuses without truncation so the reranker sees
-/// every unique chunk).
-async fn retrieve_candidates(
-    config: &AppConfig,
-    pool: &sqlx::PgPool,
-    kb_name: &str,
-    meta: &postgres::KbMeta,
-    mode: QueryMode,
-    query_text: &str,
-    limit: usize,
-) -> Result<Vec<postgres::QueryResult>> {
-    match mode {
-        QueryMode::Vector => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_chunks(pool, kb_name, &embedding, limit).await?)
+/// Render query results as self-describing chunk elements: every chunk is
+/// wrapped in `<chunk>` tags, with a `[HEADER]` line carrying its heading
+/// path and one content line. The path never touches the chunk text itself.
+fn chunk_lines<'a>(
+    rows: impl IntoIterator<Item = (String, &'a postgres::QueryResult)>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (prefix, result) in rows {
+        lines.push("<chunk>".to_string());
+        if !result.heading_path.is_empty() {
+            lines.push(format!("[HEADER] {}", result.heading_path.join(" > ")));
         }
-        QueryMode::Marker => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_markers(pool, kb_name, &embedding, limit).await?)
-        }
-        QueryMode::Hybrid => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
-            let query_emb = model.embed_query(query_text).await?;
-
-            let (marker_results, vector_results) = tokio::join!(
-                async {
-                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
-                },
-                async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
-                },
-            );
-
-            Ok(rrf_fusion(&marker_results?, &vector_results?, None)
-                .into_iter()
-                .map(|entry| entry.result.clone())
-                .collect())
-        }
+        lines.push(format!("{prefix}{}", result.text));
+        lines.push("</chunk>".to_string());
     }
+    lines
 }
 
-/// Re-rank `candidates` against `query_text`, printing the top `top_k` by
-/// relevance score.
-async fn print_reranked(
-    reranker: &RerankClient,
-    query_text: &str,
-    candidates: Vec<postgres::QueryResult>,
-    top_k: usize,
-) -> Result<()> {
-    if candidates.is_empty() {
-        return Ok(());
+fn print_chunks<'a>(rows: impl IntoIterator<Item = (String, &'a postgres::QueryResult)>) {
+    for line in chunk_lines(rows) {
+        println!("{line}");
     }
-    let documents: Vec<String> = candidates.iter().map(|r| r.text.clone()).collect();
-    let reranked = reranker.rerank(query_text, &documents, top_k).await?;
-
-    // `index` refers to the candidate's position in `documents`; take by index
-    // so the candidates reorder according to the reranker's scores.
-    let mut taken: Vec<Option<postgres::QueryResult>> = candidates.into_iter().map(Some).collect();
-    let mut ordered: Vec<(f64, postgres::QueryResult)> = reranked
-        .into_iter()
-        .map(|rr| {
-            let result = taken[rr.index]
-                .take()
-                .expect("rerank API returned an out-of-range or duplicate index");
-            (rr.relevance_score, result)
-        })
-        .collect();
-    ordered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    for (score, result) in ordered {
-        println!("[{score:.4} rerank] {}", result.text);
-    }
-    Ok(())
-}
-
-async fn load_embed_model_for_kb(
-    config: &AppConfig,
-    meta: &postgres::KbMeta,
-    kb_name: &str,
-) -> Result<EmbedModel> {
-    let stored_model = meta.embed_config
-        .get("model")
-        .and_then(|value| value.as_str())
-        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-    let embedding_config = config.embedding_for_model(stored_model)?;
-    let embed_model = EmbedClient::from_config(embedding_config)?
-        .dimension()
-        .await?;
-    anyhow::ensure!(
-        embed_model.dimension == meta.dimension,
-        "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-        meta.dimension,
-        embed_model.dimension
-    );
-    Ok(embed_model)
 }
 
 async fn run_doc_add(
@@ -671,7 +619,7 @@ mod tests {
 
     #[test]
     fn parses_kb_create_with_an_optional_config_path() {
-        let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "recipe.yaml"]).unwrap();
+        let cli = Cli::try_parse_from(["nanokb", "kb", "create", "books", "-c", "recipe.yaml"]).unwrap();
 
         assert!(matches!(
             cli.command,
@@ -679,8 +627,146 @@ mod tests {
                 command: KbCommand::Create {
                     name,
                     config_path: Some(config_path),
+                    overlay_files,
                 },
-            } if name == "books" && config_path == PathBuf::from("recipe.yaml")
+            } if name == "books" && config_path == PathBuf::from("recipe.yaml") && overlay_files.is_empty()
         ));
+    }
+
+    #[test]
+    fn parses_query_with_expand_flag() {
+        let cli = Cli::try_parse_from(["nanokb", "query", "books", "indexing", "--expand"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Query { expand: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_doc_add_with_n_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./ddia.pdf"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Add { ref kb, ref source },
+            } if kb == "books" && source == "./ddia.pdf"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_add_with_long_name_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./ddia.pdf"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Add { ref kb, ref source },
+            } if kb == "books" && source == "./ddia.pdf"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_list_with_n_flag() {
+        let cli = Cli::try_parse_from(["nanokb", "doc", "list", "-n", "books"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::List { ref kb },
+            } if kb == "books"
+        ));
+    }
+
+    #[test]
+    fn parses_doc_remove_with_n_flag() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "doc", "remove", "-n", "books", "42"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Doc {
+                command: DocCommand::Remove { ref kb, doc_id: 42 },
+            } if kb == "books"
+        ));
+    }
+
+    fn make_result_in(
+        node_id: &str,
+        chunk_seq: i32,
+        sort_order: i32,
+        document_id: i64,
+        heading_path: Vec<&str>,
+        text: &str,
+    ) -> postgres::QueryResult {
+        postgres::QueryResult {
+            document_id,
+            filename: String::new(),
+            frontmatter: serde_json::Value::Null,
+            node_id: node_id.to_string(),
+            chunk_seq,
+            heading_path: heading_path.into_iter().map(String::from).collect(),
+            sort_order,
+            source: postgres::QueryChannel::Vec,
+            text: text.to_string(),
+            markers: Vec::new(),
+            distance: 0.0,
+        }
+    }
+
+    #[test]
+    fn chunk_lines_wraps_every_chunk_with_header_and_content() {
+        let path = vec!["Chapter 1", "1.1"];
+        let first = make_result_in("a", 0, 0, 1, path.clone(), "first");
+        let second = make_result_in("a", 1, 0, 1, path, "second");
+        let rows = vec![(String::new(), &first), (String::new(), &second)];
+
+        let lines = chunk_lines(rows);
+
+        // Every chunk is self-describing: its own [HEADER] line inside the
+        // tags, even when a sibling chunk shares the same section.
+        assert_eq!(
+            lines,
+            vec![
+                "<chunk>",
+                "[HEADER] Chapter 1 > 1.1",
+                "first",
+                "</chunk>",
+                "<chunk>",
+                "[HEADER] Chapter 1 > 1.1",
+                "second",
+                "</chunk>",
+            ]
+        );
+    }
+
+    #[test]
+    fn chunk_lines_keeps_prefix_off_the_text() {
+        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "plain text");
+        let lines = chunk_lines(vec![("[0.1200 RERANK] ".to_string(), &result)]);
+
+        assert_eq!(
+            lines,
+            vec!["<chunk>", "[HEADER] Guide", "[0.1200 RERANK] plain text", "</chunk>"]
+        );
+    }
+
+    #[test]
+    fn chunk_lines_omits_header_for_root_level_chunks() {
+        let root = make_result_in("root", 0, 0, 1, Vec::new(), "preface");
+        let lines = chunk_lines(vec![(String::new(), &root)]);
+
+        assert_eq!(lines, vec!["<chunk>", "preface", "</chunk>"]);
+    }
+
+    #[test]
+    fn chunk_lines_keeps_multiline_text_inside_one_element() {
+        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "line one\nline two");
+        let lines = chunk_lines(vec![(String::new(), &result)]);
+
+        assert_eq!(lines, vec!["<chunk>", "[HEADER] Guide", "line one\nline two", "</chunk>"]);
     }
 }

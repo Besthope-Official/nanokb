@@ -34,21 +34,8 @@ impl Pipeline {
         let strategy: ChunkStrategy = serde_json::from_value(meta.chunk_config.clone())
             .with_context(|| format!("kb {kb_name} has an unreadable chunk_config"))?;
 
-        let stored_model = meta.embed_config
-            .get("model")
-            .and_then(|value| value.as_str())
-            .with_context(|| {
-                format!("kb {kb_name} metadata is missing embed_config.model")
-            })?;
-        let embedding = config.embedding_for_model(stored_model)?;
-        let model = EmbedClient::from_config(embedding)?.dimension().await?;
-        anyhow::ensure!(
-            model.dimension == meta.dimension,
-            "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-            meta.dimension,
-            model.dimension
-        );
-        let embed_batch_size = embedding.batch_size;
+        let model = crate::embed::embed_model_for_kb(config, &meta).await?;
+        let embed_batch_size = model.batch_size;
 
         let (llm, llm_concurrency) = match &meta.llm_config {
             Some(cfg) => {
@@ -97,6 +84,8 @@ impl Pipeline {
         let embed_config = json!({"model": &model.model_name});
         let chunk_config = serde_json::to_value(&strategy)
             .context("failed to serialize the configured chunking strategy")?;
+        let retrieval_config = serde_json::to_value(&config.pipeline.retrieval)
+            .context("failed to serialize the configured retrieval defaults")?;
 
         let llm_config = if config.pipeline.llm.is_some() {
             let llm = config.llm()?;
@@ -105,7 +94,7 @@ impl Pipeline {
             None
         };
 
-        let query_mode = match config.pipeline.query_mode.as_deref() {
+        let query_mode = match config.pipeline.retrieval.mode.as_deref() {
             Some(mode) => QueryMode::parse(mode)?,
             None if llm_config.is_some() => QueryMode::Hybrid,
             None => QueryMode::Vector,
@@ -117,6 +106,7 @@ impl Pipeline {
             dimension,
             &chunk_config,
             &embed_config,
+            &retrieval_config,
             llm_config.as_ref(),
             query_mode.as_str(),
         )
@@ -155,7 +145,8 @@ impl Pipeline {
 
         // Stage 2: Chunk
         on_stage("chunking".to_string());
-        let chunks = document.into_chunks(&self.strategy);
+        let doc_chunks = document.into_chunks(&self.strategy);
+        let chunks = &doc_chunks.chunks;
         let total = chunks.len();
 
         // Stage 3: Markers
@@ -187,9 +178,10 @@ impl Pipeline {
             for (i, (chunk, embedding)) in batch.iter().zip(embeddings).enumerate() {
                 let chunk_idx = current + i;
                 embedded.push(EmbeddedChunk {
-                    chunk_id: chunk.chunk_id.clone(),
+                    node_id: chunk.node_id.clone(),
+                    chunk_seq: chunk.chunk_seq,
                     text: chunk.text.clone(),
-                    embedding_text: chunk.embedding_text.clone(),
+                    blocks: chunk.blocks.clone(),
                     embedding,
                     marker_embedding: Vec::new(),
                     markers: markers[chunk_idx].clone(),
@@ -222,9 +214,12 @@ impl Pipeline {
 
         // Stage 5: Store
         on_stage(format!("storing {total} chunks"));
-        EmbeddedChunks { chunks: embedded }
-            .store(pool, input.kb_name, input.document_id)
-            .await?;
+        EmbeddedChunks {
+            nodes: doc_chunks.nodes,
+            chunks: embedded,
+        }
+        .store(pool, input.kb_name, input.document_id)
+        .await?;
 
         Ok(())
     }

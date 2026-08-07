@@ -1,4 +1,5 @@
-use crate::config::EmbeddingConfig;
+use crate::chunker::{Block, NodeRow};
+use crate::config::{AppConfig, EmbeddingConfig};
 use crate::postgres::{self, ChunkRow};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -8,6 +9,7 @@ pub struct EmbedClient {
     api_base: String,
     api_key: String,
     model_name: String,
+    batch_size: usize,
     max_retries: usize,
     retry_delay_ms: u64,
     http: reqwest::Client,
@@ -23,6 +25,7 @@ impl EmbedClient {
             api_base: config.api_base.clone(),
             api_key: config.api_key.clone(),
             model_name: config.model_name.clone(),
+            batch_size: config.batch_size,
             max_retries: config.max_retries,
             retry_delay_ms: config.retry_delay_ms,
             http,
@@ -40,6 +43,7 @@ impl EmbedClient {
             api_base: self.api_base,
             api_key: self.api_key,
             model_name: self.model_name,
+            batch_size: self.batch_size,
             dimension: 0, // placeholder, filled below
             max_retries,
             retry_delay_ms,
@@ -58,9 +62,31 @@ pub struct EmbedModel {
     api_base: String,
     api_key: String,
     pub(crate) model_name: String,
+    pub batch_size: usize,
     pub dimension: usize,
     max_retries: usize,
     retry_delay_ms: u64,
+}
+
+/// Build an [`EmbedModel`] from a kb's stored configuration, verifying that
+/// the live model's dimension still matches the kb.
+pub async fn embed_model_for_kb(config: &AppConfig, meta: &postgres::KbMeta) -> Result<EmbedModel> {
+    let stored_model = meta
+        .embed_config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .with_context(|| format!("kb {} metadata is missing embed_config.model", meta.name))?;
+    let embed_model = EmbedClient::from_config(config.embedding_for_model(stored_model)?)?
+        .dimension()
+        .await?;
+    anyhow::ensure!(
+        embed_model.dimension == meta.dimension,
+        "kb {} stores {}d vectors but {stored_model} now returns {}d",
+        meta.name,
+        meta.dimension,
+        embed_model.dimension
+    );
+    Ok(embed_model)
 }
 
 impl EmbedModel {
@@ -112,37 +138,40 @@ impl EmbedModel {
 }
 
 pub struct EmbeddedChunk {
-    pub chunk_id: String,
+    pub node_id: String,
+    pub chunk_seq: usize,
     pub text: String,
-    pub embedding_text: String,
+    pub blocks: Vec<Block>,
     pub embedding: Vec<f32>,
     pub marker_embedding: Vec<f32>,
     pub markers: Vec<String>,
 }
 
 pub struct EmbeddedChunks {
+    pub nodes: Vec<NodeRow>,
     pub chunks: Vec<EmbeddedChunk>,
 }
 
 impl EmbeddedChunks {
-    /// Replace this document's chunks in an existing knowledge base.
+    /// Replace this document's nodes and chunks in an existing knowledge base.
     ///
-    /// The table, its metadata, and the vector index are created once per build
-    /// by `Pipeline::prepare_kb`.
+    /// The tables, their metadata, and the vector index are created once per
+    /// build by `Pipeline::prepare_kb`.
     pub async fn store(self, pool: &PgPool, kb_name: &str, document_id: i64) -> Result<()> {
         let rows: Vec<ChunkRow> = self
             .chunks
             .into_iter()
             .map(|c| ChunkRow {
-                chunk_id: c.chunk_id,
+                node_id: c.node_id,
+                chunk_seq: c.chunk_seq as i32,
                 text: c.text,
-                embedding_text: c.embedding_text,
+                blocks: c.blocks,
                 embedding: c.embedding,
                 marker_embedding: c.marker_embedding,
                 markers: c.markers,
             })
             .collect();
-        postgres::replace_document_chunks(pool, kb_name, document_id, &rows).await
+        postgres::replace_document_chunks(pool, kb_name, document_id, &self.nodes, &rows).await
     }
 }
 
