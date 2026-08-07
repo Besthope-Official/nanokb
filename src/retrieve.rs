@@ -1,12 +1,10 @@
 use crate::config::QueryMode;
+use crate::embed::embed_model_for_kb;
 use crate::postgres;
 use crate::rerank::{RerankClient, rrf_fusion};
-use crate::{AppConfig, EmbedClient, EmbedModel};
+use crate::AppConfig;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-
-/// TreeRAG leaf-to-root walk depth: a hit at 2.1.1 reaches 2.1 and Chapter 2.
-pub const MAX_ANCESTOR_DEPTH: usize = 2;
 
 /// Merge entry hits with expanded neighbors into one deduplicated list in
 /// document order, so the tree context reads structurally. Sorting before a
@@ -43,17 +41,17 @@ pub async fn retrieve_candidates(
 ) -> Result<Vec<postgres::QueryResult>> {
     match mode {
         QueryMode::Vector => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let model = embed_model_for_kb(config, meta).await?;
             let embedding = model.embed_query(query_text).await?;
             Ok(postgres::query_chunks(pool, kb_name, &embedding, limit).await?)
         }
         QueryMode::Marker => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let model = embed_model_for_kb(config, meta).await?;
             let embedding = model.embed_query(query_text).await?;
             Ok(postgres::query_markers(pool, kb_name, &embedding, limit).await?)
         }
         QueryMode::Hybrid => {
-            let model = load_embed_model_for_kb(config, meta, kb_name).await?;
+            let model = embed_model_for_kb(config, meta).await?;
             let query_emb = model.embed_query(query_text).await?;
 
             let (marker_results, vector_results) = tokio::join!(
@@ -90,42 +88,18 @@ pub async fn rerank_ordered(
     // `index` refers to the candidate's position in `documents`; take by index
     // so the candidates reorder according to the reranker's scores.
     let mut taken: Vec<Option<postgres::QueryResult>> = candidates.into_iter().map(Some).collect();
-    let mut ordered: Vec<(f64, postgres::QueryResult)> = reranked
-        .into_iter()
-        .map(|rr| {
-            let result = taken[rr.index]
-                .take()
-                .expect("rerank API returned an out-of-range or duplicate index");
-            (rr.relevance_score, result)
-        })
-        .collect();
+    let mut ordered: Vec<(f64, postgres::QueryResult)> = Vec::with_capacity(reranked.len());
+    for rr in reranked {
+        let result = taken
+            .get_mut(rr.index)
+            .and_then(Option::take)
+            .with_context(|| {
+                format!("rerank API returned an out-of-range or duplicate index {}", rr.index)
+            })?;
+        ordered.push((rr.relevance_score, result));
+    }
     ordered.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     Ok(ordered)
-}
-
-/// Build an [`EmbedModel`] from a kb's stored configuration, verifying that
-/// the live model's dimension still matches the kb.
-pub async fn load_embed_model_for_kb(
-    config: &AppConfig,
-    meta: &postgres::KbMeta,
-    kb_name: &str,
-) -> Result<EmbedModel> {
-    let stored_model = meta
-        .embed_config
-        .get("model")
-        .and_then(|value| value.as_str())
-        .with_context(|| format!("kb {kb_name} metadata is missing embed_config.model"))?;
-    let embedding_config = config.embedding_for_model(stored_model)?;
-    let embed_model = EmbedClient::from_config(embedding_config)?
-        .dimension()
-        .await?;
-    anyhow::ensure!(
-        embed_model.dimension == meta.dimension,
-        "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-        meta.dimension,
-        embed_model.dimension
-    );
-    Ok(embed_model)
 }
 
 #[cfg(test)]

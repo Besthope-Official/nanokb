@@ -410,68 +410,31 @@ async fn run_query(
     // A reranker sees a wider candidate pool, then re-ranks down to `top_k`.
     let limit = if reranker.is_some() { top_k * 4 } else { top_k };
 
-    match (&reranker, effective_mode, expand) {
-        (Some(reranker), _, _) => {
-            let mut candidates =
-                retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
-                    .await?;
-            if expand {
-                let neighbors =
-                    postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth)
-                        .await?;
-                candidates = retrieve::merge_with_neighbors(candidates, neighbors);
-            }
+    let mut candidates =
+        retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+            .await?;
+    if expand {
+        let neighbors =
+            postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
+        candidates = retrieve::merge_with_neighbors(candidates, neighbors);
+    }
+
+    match &reranker {
+        Some(reranker) => {
             let ordered = retrieve::rerank_ordered(reranker, query_text, candidates, top_k).await?;
             print_chunks(ordered.iter().map(|(score, result)| {
                 (format!("[{score:.4} RERANK] [{}] ", result.source), result)
             }));
         }
-        (None, QueryMode::Vector, false) => {
-            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            let results = postgres::query_chunks(pool, kb_name, &embedding, limit).await?;
-            print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.distance, r.source), r)));
-        }
-        (None, QueryMode::Marker, false) => {
-            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let embedding = model.embed_query(query_text).await?;
-            let results = postgres::query_markers(pool, kb_name, &embedding, limit).await?;
-            print_chunks(results.iter().map(|r| (format!("[{:.4} {}] ", r.marker_distance, r.source), r)));
-        }
-        (None, QueryMode::Hybrid, false) => {
-            let model = retrieve::load_embed_model_for_kb(config, &meta, kb_name).await?;
-            let query_emb = model.embed_query(query_text).await?;
-
-            // Run marker and vector retrieval in parallel, sharing the query embedding.
-            let (marker_results, vector_results) = tokio::join!(
-                async {
-                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
-                },
-                async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
-                },
-            );
-            let marker_results = marker_results?;
-            let vector_results = vector_results?;
-
-            let entries = crate::rerank::rrf_fusion(&marker_results, &vector_results, Some(top_k));
-            print_chunks(entries.iter().map(|entry| {
-                let inner = if entry.result.source == "MARKER" {
-                    format!("{:.4} MARKER", entry.result.marker_distance)
-                } else {
-                    format!("{:.4} VEC", entry.result.distance)
-                };
-                (format!("[{:.4} RRF] [{inner}] ", entry.rrf_score), entry.result)
-            }));
-        }
-        (None, _, true) => {
-            let candidates =
-                retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
-                    .await?;
-            let neighbors =
-                postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
-            print_chunks(retrieve::merge_with_neighbors(candidates, neighbors).iter().map(|r| {
-                (format!("[{}] ", r.source), r)
+        None => {
+            // Hybrid fusion can yield more unique chunks than `limit`; plain
+            // queries already return at most `limit`. Expansion output keeps
+            // every neighbor instead of truncating.
+            if !expand {
+                candidates.truncate(top_k);
+            }
+            print_chunks(candidates.iter().map(|r| {
+                (format!("[{:.4} {}] ", r.distance, r.source), r)
             }));
         }
     }
@@ -747,10 +710,9 @@ mod tests {
             chunk_seq,
             heading_path: heading_path.into_iter().map(String::from).collect(),
             sort_order,
-            source: "VEC".to_string(),
+            source: postgres::QueryChannel::Vec,
             text: text.to_string(),
             markers: Vec::new(),
-            marker_distance: 0.0,
             distance: 0.0,
         }
     }

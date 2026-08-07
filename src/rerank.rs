@@ -117,7 +117,6 @@ pub struct RerankResult {
 
 pub struct RrfEntry<'a> {
     pub result: &'a QueryResult,
-    pub source: &'static str,
     pub rrf_score: f64,
 }
 
@@ -137,21 +136,21 @@ pub fn rrf_fusion<'a>(
 
     let mut scores: std::collections::HashMap<(i64, String, i32), f64> =
         std::collections::HashMap::new();
-    let mut chunk_map: std::collections::HashMap<(i64, String, i32), (&'a QueryResult, &'static str)> =
+    let mut chunk_map: std::collections::HashMap<(i64, String, i32), &'a QueryResult> =
         std::collections::HashMap::new();
 
     for (rank, result) in marker_results.iter().enumerate() {
         let key = (result.document_id, result.node_id.clone(), result.chunk_seq);
         let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
         *scores.entry(key.clone()).or_insert(0.0) += score;
-        chunk_map.entry(key).or_insert((result, "marker"));
+        chunk_map.entry(key).or_insert(result);
     }
 
     for (rank, result) in vector_results.iter().enumerate() {
         let key = (result.document_id, result.node_id.clone(), result.chunk_seq);
         let score = 1.0 / (RRF_K + (rank as f64 + 1.0));
         *scores.entry(key.clone()).or_insert(0.0) += score;
-        chunk_map.entry(key).or_insert((result, "vector"));
+        chunk_map.entry(key).or_insert(result);
     }
 
     let mut ranked: Vec<((i64, String, i32), f64)> = scores.into_iter().collect();
@@ -163,10 +162,9 @@ pub fn rrf_fusion<'a>(
     ranked
         .into_iter()
         .map(|(key, score)| {
-            let (result, source) = chunk_map.remove(&key).unwrap();
+            let result = chunk_map.remove(&key).unwrap();
             RrfEntry {
                 result,
-                source,
                 rrf_score: score,
             }
         })
@@ -182,8 +180,6 @@ mod tests {
         node_id: &str,
         chunk_seq: i32,
         text: &str,
-        marker_distance: f64,
-        distance: f64,
     ) -> QueryResult {
         QueryResult {
             document_id: doc_id,
@@ -193,11 +189,10 @@ mod tests {
             chunk_seq,
             heading_path: Vec::new(),
             sort_order: 0,
-            source: "VEC".to_string(),
+            source: crate::postgres::QueryChannel::Vec,
             text: text.to_string(),
             markers: Vec::new(),
-            marker_distance,
-            distance,
+            distance: 0.0,
         }
     }
 
@@ -222,8 +217,8 @@ mod tests {
     #[test]
     fn rrf_single_channel_returns_in_order() {
         let marker = vec![
-            make_query_result(1, "a", 0, "alpha", 5.0, 0.0),
-            make_query_result(1, "b", 0, "beta", 3.0, 0.0),
+            make_query_result(1, "a", 0, "alpha"),
+            make_query_result(1, "b", 0, "beta"),
         ];
         let vector = vec![];
 
@@ -231,7 +226,6 @@ mod tests {
 
         assert_eq!(fused.len(), 2);
         assert_eq!(fused[0].result.node_id, "a");
-        assert_eq!(fused[0].source, "marker");
         assert_eq!(fused[1].result.node_id, "b");
         // Higher rank (0 = 1st) gets higher RRF score.
         assert!(fused[0].rrf_score > fused[1].rrf_score);
@@ -239,8 +233,8 @@ mod tests {
 
     #[test]
     fn rrf_overlapping_chunk_accumulates_score() {
-        let marker = vec![make_query_result(1, "shared", 0, "shared chunk", 3.0, 0.0)];
-        let vector = vec![make_query_result(1, "shared", 0, "shared chunk", 0.0, 0.12)];
+        let marker = vec![make_query_result(1, "shared", 0, "shared chunk")];
+        let vector = vec![make_query_result(1, "shared", 0, "shared chunk")];
 
         let fused = rrf_fusion(&marker, &vector, Some(5));
 
@@ -256,12 +250,12 @@ mod tests {
     #[test]
     fn rrf_merges_two_channels_sorted_by_score() {
         let marker = vec![
-            make_query_result(1, "m1", 0, "marker only", 5.0, 0.0),
-            make_query_result(1, "both", 0, "both channels", 3.0, 0.0),
+            make_query_result(1, "m1", 0, "marker only"),
+            make_query_result(1, "both", 0, "both channels"),
         ];
         let vector = vec![
-            make_query_result(1, "v1", 0, "vector only", 0.0, 0.05),
-            make_query_result(1, "both", 0, "both channels", 0.0, 0.20),
+            make_query_result(1, "v1", 0, "vector only"),
+            make_query_result(1, "both", 0, "both channels"),
         ];
 
         let fused = rrf_fusion(&marker, &vector, Some(3));
@@ -282,10 +276,10 @@ mod tests {
     #[test]
     fn rrf_truncates_to_top_k() {
         let marker = vec![
-            make_query_result(1, "a", 0, "A", 5.0, 0.0),
-            make_query_result(1, "b", 0, "B", 4.0, 0.0),
+            make_query_result(1, "a", 0, "A"),
+            make_query_result(1, "b", 0, "B"),
         ];
-        let vector = vec![make_query_result(1, "c", 0, "C", 0.0, 0.1)];
+        let vector = vec![make_query_result(1, "c", 0, "C")];
 
         let fused = rrf_fusion(&marker, &vector, Some(2));
 
@@ -295,10 +289,10 @@ mod tests {
     #[test]
     fn rrf_without_truncation_returns_all_entries() {
         let marker = vec![
-            make_query_result(1, "a", 0, "A", 5.0, 0.0),
-            make_query_result(1, "b", 0, "B", 4.0, 0.0),
+            make_query_result(1, "a", 0, "A"),
+            make_query_result(1, "b", 0, "B"),
         ];
-        let vector = vec![make_query_result(1, "c", 0, "C", 0.0, 0.1)];
+        let vector = vec![make_query_result(1, "c", 0, "C")];
 
         let fused = rrf_fusion(&marker, &vector, None);
 

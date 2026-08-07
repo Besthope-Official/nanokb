@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use nanokb::chunker::NodeRow;
 use nanokb::postgres::{
-    ChunkRow, QueryResult, connect, create_index, create_kb, create_marker_index,
+    ChunkRow, QueryChannel, QueryResult, connect, create_index, create_kb, create_marker_index,
     expand_neighbors, fetch_and_lock_pending, initialize, insert_task, mark_document_parsed,
     query_markers, register_document, replace_document_chunks,
 };
@@ -261,10 +261,10 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     let marker_hits = query_markers(&pool, KB_NAME_MARKER, &query_emb, 5).await?;
     assert_eq!(marker_hits.len(), 1);
     assert_eq!(marker_hits[0].node_id, "intro");
-    assert!(marker_hits[0].marker_distance >= 0.0, "marker distance should be non-negative");
+    assert!(marker_hits[0].distance >= 0.0, "marker distance should be non-negative");
     assert_eq!(marker_hits[0].markers, vec!["guide", "introduction"]);
     let far_hits = query_markers(&pool, KB_NAME_MARKER, &[-1.0, -1.0, -1.0], 5).await?;
-    assert!(far_hits[0].marker_distance > marker_hits[0].marker_distance,
+    assert!(far_hits[0].distance > marker_hits[0].distance,
         "farther embedding should have larger distance");
 
     create_marker_index(
@@ -357,10 +357,9 @@ fn tree_hit(document_id: i64, node_id: &str, chunk_seq: usize) -> QueryResult {
         chunk_seq: chunk_seq as i32,
         heading_path: Vec::new(),
         sort_order: 0,
-        source: "VEC".to_string(),
+        source: QueryChannel::Vec,
         text: String::new(),
         markers: Vec::new(),
-        marker_distance: 0.0,
         distance: 0.0,
     }
 }

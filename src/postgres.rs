@@ -486,58 +486,41 @@ pub async fn replace_document_chunks(
             .map(|c| Vector::from(c.embedding.clone()))
             .collect();
 
-        if has_llm {
-            let marker_embeddings: Vec<Vector> = chunks
-                .iter()
-                .map(|c| Vector::from(c.marker_embedding.clone()))
-                .collect();
-            let insert_sql = format!(
-                "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers) \
-                 SELECT $1, node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers \
-                 FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[], $7::vector[], $8::jsonb[]) \
-                 AS batch(node_id, chunk_seq, text, blocks, embedding, marker_embedding, markers)"
-            );
-            sqlx::query(AssertSqlSafe(insert_sql))
-                .bind(document_id)
-                .bind(&node_ids)
-                .bind(&chunk_seqs)
-                .bind(&texts)
-                .bind(&blocks_json)
-                .bind(&embeddings)
-                .bind(&marker_embeddings)
-                .bind(&markers_json)
-                .execute(&mut *transaction)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to insert {} chunks for document {document_id}",
-                        chunks.len()
-                    )
-                })?;
+        // The marker_embedding column exists only for llm-enabled kbs.
+        let (marker_col, marker_arr, markers_idx) =
+            if has_llm { (", marker_embedding", ", $7::vector[]", 8) } else { ("", "", 7) };
+        let insert_sql = format!(
+            "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding{marker_col}, markers) \
+             SELECT $1, node_id, chunk_seq, text, blocks, embedding{marker_col}, markers \
+             FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[]{marker_arr}, ${markers_idx}::jsonb[]) \
+             AS batch(node_id, chunk_seq, text, blocks, embedding{marker_col}, markers)"
+        );
+        let marker_embeddings: Vec<Vector> = chunks
+            .iter()
+            .map(|c| Vector::from(c.marker_embedding.clone()))
+            .collect();
+        let insert = sqlx::query(AssertSqlSafe(insert_sql))
+            .bind(document_id)
+            .bind(&node_ids)
+            .bind(&chunk_seqs)
+            .bind(&texts)
+            .bind(&blocks_json)
+            .bind(&embeddings);
+        let insert = if has_llm {
+            insert.bind(&marker_embeddings)
         } else {
-            let insert_sql = format!(
-                "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding, markers) \
-                 SELECT $1, node_id, chunk_seq, text, blocks, embedding, markers \
-                 FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[], $7::jsonb[]) \
-                 AS batch(node_id, chunk_seq, text, blocks, embedding, markers)"
-            );
-            sqlx::query(AssertSqlSafe(insert_sql))
-                .bind(document_id)
-                .bind(&node_ids)
-                .bind(&chunk_seqs)
-                .bind(&texts)
-                .bind(&blocks_json)
-                .bind(&embeddings)
-                .bind(&markers_json)
-                .execute(&mut *transaction)
-                .await
-                .with_context(|| {
-                    format!(
-                        "failed to insert {} chunks for document {document_id}",
-                        chunks.len()
-                    )
-                })?;
-        }
+            insert
+        };
+        insert
+            .bind(&markers_json)
+            .execute(&mut *transaction)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to insert {} chunks for document {document_id}",
+                    chunks.len()
+                )
+            })?;
     }
     transaction
         .commit()
@@ -574,6 +557,25 @@ pub async fn create_index(pool: &PgPool, kb_name: &str, index_config: &IndexConf
     Ok(())
 }
 
+/// Retrieval channel that produced a [`QueryResult`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryChannel {
+    Vec,
+    Marker,
+    /// Structural expansion neighbor (TreeRAG).
+    Tree,
+}
+
+impl std::fmt::Display for QueryChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            QueryChannel::Vec => "VEC",
+            QueryChannel::Marker => "MARKER",
+            QueryChannel::Tree => "TREE",
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryResult {
     pub document_id: i64,
@@ -584,13 +586,11 @@ pub struct QueryResult {
     pub heading_path: Vec<String>,
     /// Document-order index of the chunk's node; structural output sorts by it.
     pub sort_order: i32,
-    /// Retrieval channel that produced this row: `VEC`, `MARKER`, or `TREE`
-    /// for structural expansion neighbors.
-    pub source: String,
+    pub source: QueryChannel,
     pub text: String,
     pub markers: Vec<String>,
-    /// Cosine distance of the chunk's marker embedding against the query vector.
-    pub marker_distance: f64,
+    /// Cosine distance of the producing channel's embedding against the query
+    /// vector; `0.0` for structural neighbors, which have no score.
     pub distance: f64,
 }
 
@@ -634,13 +634,12 @@ pub async fn query_chunks(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
-            source: "VEC".to_string(),
+            source: QueryChannel::Vec,
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
-            marker_distance: 0.0,
             distance: row.get("distance"),
         })
         .collect())
@@ -729,14 +728,13 @@ pub async fn query_markers(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
-            source: "MARKER".to_string(),
+            source: QueryChannel::Marker,
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
-            marker_distance: row.get("marker_distance"),
-            distance: 0.0,
+            distance: row.get("marker_distance"),
         })
         .collect())
 }
@@ -900,13 +898,15 @@ async fn fetch_chunks_by_nodes(
     node_table: &str,
     nodes: &HashSet<(i64, String)>,
 ) -> Result<Vec<QueryResult>> {
-    let doc_ids: Vec<i64> = nodes.iter().map(|(doc, _)| *doc).collect();
-    let node_ids: Vec<String> = nodes.iter().map(|(_, node)| node.clone()).collect();
+    let (doc_ids, node_ids): (Vec<i64>, Vec<String>) = nodes
+        .iter()
+        .map(|(doc, node)| (*doc, node.clone()))
+        .unzip();
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
                 chunk.text, chunk.markers, \
-                0.0 AS distance, 0.0 AS marker_distance \
+                0.0 AS distance \
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
          JOIN document ON document.id = chunk.document_id \
@@ -933,13 +933,12 @@ async fn fetch_chunks_by_nodes(
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
             sort_order: row.get("sort_order"),
-            source: "TREE".to_string(),
+            source: QueryChannel::Tree,
             text: row.get("text"),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
                 .unwrap_or_default(),
-            marker_distance: 0.0,
             distance: 0.0,
         })
         .collect())

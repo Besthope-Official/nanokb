@@ -34,21 +34,8 @@ impl Pipeline {
         let strategy: ChunkStrategy = serde_json::from_value(meta.chunk_config.clone())
             .with_context(|| format!("kb {kb_name} has an unreadable chunk_config"))?;
 
-        let stored_model = meta.embed_config
-            .get("model")
-            .and_then(|value| value.as_str())
-            .with_context(|| {
-                format!("kb {kb_name} metadata is missing embed_config.model")
-            })?;
-        let embedding = config.embedding_for_model(stored_model)?;
-        let model = EmbedClient::from_config(embedding)?.dimension().await?;
-        anyhow::ensure!(
-            model.dimension == meta.dimension,
-            "kb {kb_name} stores {}d vectors but {stored_model} now returns {}d",
-            meta.dimension,
-            model.dimension
-        );
-        let embed_batch_size = embedding.batch_size;
+        let model = crate::embed::embed_model_for_kb(config, &meta).await?;
+        let embed_batch_size = model.batch_size;
 
         let (llm, llm_concurrency) = match &meta.llm_config {
             Some(cfg) => {

@@ -20,10 +20,9 @@ fn make_result_in(
         chunk_seq,
         heading_path: heading_path.into_iter().map(String::from).collect(),
         sort_order,
-        source: "VEC".to_string(),
+        source: postgres::QueryChannel::Vec,
         text: text.to_string(),
         markers: Vec::new(),
-        marker_distance: 0.0,
         distance: 0.0,
     }
 }
