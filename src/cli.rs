@@ -175,8 +175,8 @@ enum TopLevelCommand {
         #[arg(long)]
         expand: bool,
         /// How many ancestor levels to walk (1 = direct parent, 2 = grandparent).
-        #[arg(long, default_value_t = 2)]
-        expand_depth: usize,
+        #[arg(long)]
+        expand_depth: Option<usize>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -374,7 +374,7 @@ async fn run_query(
     top_k: Option<usize>,
     reranker_name: Option<&str>,
     expand: bool,
-    expand_depth: usize,
+    expand_depth: Option<usize>,
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
     let retrieval_defaults: crate::config::RetrievalConfig =
@@ -382,6 +382,9 @@ async fn run_query(
             .context("kb metadata has an unreadable retrieval_config")?;
     let semantic = meta.llm_config.is_some();
     let top_k = top_k.unwrap_or(retrieval_defaults.top_k);
+    let expand = expand || retrieval_defaults.expand;
+    let expand_depth = expand_depth.unwrap_or(retrieval_defaults.expand_depth);
+    let reranker_name = reranker_name.or(retrieval_defaults.reranker.as_deref());
 
     let effective_mode = mode.unwrap_or(QueryMode::parse(&meta.query_mode)?);
 
