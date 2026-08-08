@@ -546,7 +546,7 @@ fn bpe_tokenizer() -> &'static Tokenizer {
 }
 
 /// Counting skips offset tracking; use [`bpe_encode`] when spans are needed.
-fn bpe_token_count(text: &str) -> usize {
+pub fn bpe_token_count(text: &str) -> usize {
     bpe_tokenizer()
         .encode_fast(text, false)
         .unwrap_or_else(|error| panic!("BPE token counting failed: {error}"))

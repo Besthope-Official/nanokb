@@ -522,7 +522,7 @@ async fn run_doc_update(
 }
 
 /// Run a worker pool until every queued task for `kb_name` is done.
-async fn drain_tasks(
+pub(crate) async fn drain_tasks(
     config: &AppConfig,
     pool: &sqlx::PgPool,
     kb_name: &str,
@@ -561,6 +561,17 @@ async fn drain_tasks(
     if completed_normally {
         if let Some(usage) = pipeline.token_usage() {
             eprintln!("{usage}");
+        }
+        // drain only waits for pending+running to clear; surface failed docs
+        // instead of exiting 0 with a partially processed batch.
+        let failed = postgres::failed_tasks(pool, kb_name).await?;
+        if !failed.is_empty() {
+            let details = failed
+                .iter()
+                .map(|(filename, error)| format!("{filename}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            anyhow::bail!("{} doc(s) failed — {details}", failed.len());
         }
     }
 

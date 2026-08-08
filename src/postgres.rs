@@ -1164,6 +1164,31 @@ pub async fn mark_task_failed(pool: &PgPool, task_id: i64, error_message: &str) 
     Ok(())
 }
 
+/// Docs whose *latest* task failed, as (filename, error message). A doc that
+/// failed once but was later re-ingested successfully does not count.
+pub async fn failed_tasks(pool: &PgPool, kb_name: &str) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT document.filename, task.error_message \
+         FROM task JOIN document ON document.id = task.document_id \
+         WHERE document.kb_name = $1 AND task.status = 'failed' \
+           AND task.id = (SELECT MAX(t2.id) FROM task t2 WHERE t2.document_id = document.id) \
+         ORDER BY task.id",
+    )
+    .bind(kb_name)
+    .fetch_all(pool)
+    .await
+    .context("failed to list failed tasks")?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("filename"),
+                row.get::<Option<String>, _>("error_message").unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
 pub async fn cancel_all_running(pool: &PgPool, kb_name: &str) -> Result<u64> {
     let result = sqlx::query(
         "UPDATE task SET status = 'canceled', updated_at = now() \
