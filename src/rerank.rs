@@ -191,6 +191,7 @@ mod tests {
             sort_order: 0,
             source: crate::postgres::QueryChannel::Vec,
             text: text.to_string(),
+            figures: Vec::new(),
             markers: Vec::new(),
             distance: 0.0,
         }

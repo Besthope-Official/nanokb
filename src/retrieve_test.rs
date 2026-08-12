@@ -22,6 +22,7 @@ fn make_result_in(
         sort_order,
         source: postgres::QueryChannel::Vec,
         text: text.to_string(),
+        figures: Vec::new(),
         markers: Vec::new(),
         distance: 0.0,
     }

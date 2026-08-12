@@ -1,5 +1,6 @@
 use crate::chunker::{Block, NodeRow};
 use crate::config::IndexConfig;
+use crate::parser::Figure;
 use anyhow::{Context, Result};
 use pgvector::Vector;
 use serde_json::Value;
@@ -104,6 +105,7 @@ async fn ensure_document_table(transaction: &mut Transaction<'_, Postgres>) -> R
             id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             kb_name     TEXT NOT NULL REFERENCES kb_meta(name) ON DELETE CASCADE,
             filename    TEXT NOT NULL,
+            source_dir  TEXT NOT NULL DEFAULT '',
             content     TEXT NOT NULL,
             frontmatter JSONB NOT NULL DEFAULT '{}'::jsonb,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -177,6 +179,7 @@ pub async fn create_kb(
             chunk_seq       INTEGER NOT NULL,
             text            TEXT NOT NULL,
             blocks          JSONB NOT NULL DEFAULT '[]',
+            figures         JSONB NOT NULL DEFAULT '[]',
             embedding       vector({dimension}) NOT NULL,
             {marker_col}
             markers         JSONB NOT NULL DEFAULT '[]',
@@ -380,6 +383,7 @@ pub struct ChunkRow {
     pub chunk_seq: i32,
     pub text: String,
     pub blocks: Vec<Block>,
+    pub figures: Vec<Figure>,
     pub embedding: Vec<f32>,
     pub marker_embedding: Vec<f32>,
     pub markers: Vec<String>,
@@ -476,6 +480,10 @@ pub async fn replace_document_chunks(
             .iter()
             .map(|c| serde_json::to_value(&c.blocks).context("failed to serialize chunk blocks"))
             .collect::<Result<_>>()?;
+        let figures_json: Vec<Value> = chunks
+            .iter()
+            .map(|c| serde_json::to_value(&c.figures).context("failed to serialize chunk figures"))
+            .collect::<Result<_>>()?;
         let markers_json: Vec<Value> = chunks
             .iter()
             .map(|c| Value::Array(c.markers.iter().map(|m| Value::String(m.clone())).collect()))
@@ -488,12 +496,12 @@ pub async fn replace_document_chunks(
 
         // The marker_embedding column exists only for llm-enabled kbs.
         let (marker_col, marker_arr, markers_idx) =
-            if has_llm { (", marker_embedding", ", $7::vector[]", 8) } else { ("", "", 7) };
+            if has_llm { (", marker_embedding", ", $8::vector[]", 9) } else { ("", "", 8) };
         let insert_sql = format!(
-            "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, embedding{marker_col}, markers) \
-             SELECT $1, node_id, chunk_seq, text, blocks, embedding{marker_col}, markers \
-             FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::vector[]{marker_arr}, ${markers_idx}::jsonb[]) \
-             AS batch(node_id, chunk_seq, text, blocks, embedding{marker_col}, markers)"
+            "INSERT INTO {chunk_table} (document_id, node_id, chunk_seq, text, blocks, figures, embedding{marker_col}, markers) \
+             SELECT $1, node_id, chunk_seq, text, blocks, figures, embedding{marker_col}, markers \
+             FROM UNNEST($2::text[], $3::int[], $4::text[], $5::jsonb[], $6::jsonb[], $7::vector[]{marker_arr}, ${markers_idx}::jsonb[]) \
+             AS batch(node_id, chunk_seq, text, blocks, figures, embedding{marker_col}, markers)"
         );
         let marker_embeddings: Vec<Vector> = chunks
             .iter()
@@ -505,6 +513,7 @@ pub async fn replace_document_chunks(
             .bind(&chunk_seqs)
             .bind(&texts)
             .bind(&blocks_json)
+            .bind(&figures_json)
             .bind(&embeddings);
         let insert = if has_llm {
             insert.bind(&marker_embeddings)
@@ -588,6 +597,7 @@ pub struct QueryResult {
     pub sort_order: i32,
     pub source: QueryChannel,
     pub text: String,
+    pub figures: Vec<Figure>,
     pub markers: Vec<String>,
     /// Cosine distance of the producing channel's embedding against the query
     /// vector; `0.0` for structural neighbors, which have no score.
@@ -606,7 +616,7 @@ pub async fn query_chunks(
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
-                chunk.text, chunk.markers, \
+                chunk.text, chunk.figures, chunk.markers, \
                 chunk.embedding <=> $1::vector AS distance \
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
@@ -636,6 +646,7 @@ pub async fn query_chunks(
             sort_order: row.get("sort_order"),
             source: QueryChannel::Vec,
             text: row.get("text"),
+            figures: parse_figures(&row.get::<Value, _>("figures")),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
@@ -651,6 +662,10 @@ fn parse_string_array(value: &Value) -> Option<Vec<String>> {
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect()
     })
+}
+
+fn parse_figures(value: &Value) -> Vec<Figure> {
+    serde_json::from_value(value.clone()).unwrap_or_default()
 }
 
 /// Create an HNSW index on the marker_embedding column for dense vector marker search.
@@ -700,7 +715,7 @@ pub async fn query_markers(
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
-                chunk.text, chunk.markers, \
+                chunk.text, chunk.figures, chunk.markers, \
                 chunk.marker_embedding <=> $1::vector AS marker_distance \
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
@@ -730,6 +745,7 @@ pub async fn query_markers(
             sort_order: row.get("sort_order"),
             source: QueryChannel::Marker,
             text: row.get("text"),
+            figures: parse_figures(&row.get::<Value, _>("figures")),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
@@ -905,7 +921,7 @@ async fn fetch_chunks_by_nodes(
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
-                chunk.text, chunk.markers, \
+                chunk.text, chunk.figures, chunk.markers, \
                 0.0 AS distance \
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
@@ -935,6 +951,7 @@ async fn fetch_chunks_by_nodes(
             sort_order: row.get("sort_order"),
             source: QueryChannel::Tree,
             text: row.get("text"),
+            figures: parse_figures(&row.get::<Value, _>("figures")),
             markers: row
                 .get::<Option<Value>, _>("markers")
                 .and_then(|v| parse_string_array(&v))
@@ -950,6 +967,7 @@ pub struct TaskRow {
     pub document_id: i64,
     pub filename: String,
     pub content: String,
+    pub source_dir: String,
     pub kb_name: String,
     pub status: String,
     pub error_message: Option<String>,
@@ -960,16 +978,18 @@ pub async fn register_document(
     kb_name: &str,
     content: &str,
     filename: &str,
+    source_dir: &str,
 ) -> Result<i64> {
     let row = sqlx::query(
-        "INSERT INTO document (kb_name, filename, content) VALUES ($1, $2, $3) \
+        "INSERT INTO document (kb_name, filename, content, source_dir) VALUES ($1, $2, $3, $4) \
          ON CONFLICT (kb_name, filename) DO UPDATE \
-         SET content = EXCLUDED.content, updated_at = now() \
+         SET content = EXCLUDED.content, source_dir = EXCLUDED.source_dir, updated_at = now() \
          RETURNING id",
     )
     .bind(kb_name)
     .bind(filename)
     .bind(content)
+    .bind(source_dir)
     .fetch_one(pool)
     .await
     .context("failed to register document")?;
@@ -1051,14 +1071,17 @@ pub async fn replace_document_content(
     kb_name: &str,
     document_id: i64,
     content: &str,
+    source_dir: &str,
 ) -> Result<()> {
     validate_kb_name(kb_name)?;
     let result = sqlx::query(
-        "UPDATE document SET content = $3, updated_at = now() WHERE id = $1 AND kb_name = $2",
+        "UPDATE document SET content = $3, source_dir = $4, updated_at = now() \
+         WHERE id = $1 AND kb_name = $2",
     )
     .bind(document_id)
     .bind(kb_name)
     .bind(content)
+    .bind(source_dir)
     .execute(pool)
     .await
     .with_context(|| format!("failed to update document {document_id}"))?;
@@ -1103,8 +1126,8 @@ pub async fn fetch_and_lock_pending(pool: &PgPool, kb_name: &str) -> Result<Opti
     let mut tx = pool.begin().await.context("failed to begin transaction")?;
 
     let row = sqlx::query(
-        "SELECT task.id, task.document_id, document.filename, document.content, document.kb_name,
-                task.status, task.error_message
+        "SELECT task.id, task.document_id, document.filename, document.content, document.source_dir,
+                document.kb_name, task.status, task.error_message
          FROM task
          JOIN document ON document.id = task.document_id
          WHERE task.status = 'pending' AND document.kb_name = $1
@@ -1124,6 +1147,7 @@ pub async fn fetch_and_lock_pending(pool: &PgPool, kb_name: &str) -> Result<Opti
                 document_id: row.get("document_id"),
                 filename: row.get("filename"),
                 content: row.get("content"),
+                source_dir: row.get("source_dir"),
                 kb_name: row.get("kb_name"),
                 status: row.get("status"),
                 error_message: row.get("error_message"),

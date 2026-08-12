@@ -1238,6 +1238,7 @@ dependencies = [
  "annotate-snippets",
  "anstream 0.6.21",
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "dotenvy",
  "pgvector",

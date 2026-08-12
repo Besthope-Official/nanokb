@@ -109,6 +109,72 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
     assert_eq!(strip_frontmatter(input), None);
 }
 
+#[test]
+fn standalone_image_becomes_a_figure_node() {
+    let document = parse("![Figure 1. Diagram](fig/one.png \"A diagram of ETL\")");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Figure {
+            src: "fig/one.png".into(),
+            caption: "Figure 1. Diagram".into(),
+            description: Some("A diagram of ETL".into()),
+        }]
+    );
+}
+
+#[test]
+fn image_after_an_html_anchor_is_still_standalone() {
+    let document = parse("<a id=\"fig_x\"></a>\n![Figure 1](fig/one.png)");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Figure {
+            src: "fig/one.png".into(),
+            caption: "Figure 1".into(),
+            description: None,
+        }]
+    );
+}
+
+#[test]
+fn image_without_title_has_no_description() {
+    let document = parse("![Figure 1](fig/one.png)");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Figure {
+            src: "fig/one.png".into(),
+            caption: "Figure 1".into(),
+            description: None,
+        }]
+    );
+}
+
+#[test]
+fn inline_image_alt_stays_in_paragraph_text() {
+    let document = parse("See the diagram: ![Figure 1](fig/one.png) for details.");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "See the diagram: Figure 1 for details.".into(),
+        }]
+    );
+}
+
+#[test]
+fn leading_image_alt_is_prepended_to_the_paragraph() {
+    let document = parse("![Figure 1](fig/one.png) shows the ETL flow.");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "Figure 1 shows the ETL flow.".into(),
+        }]
+    );
+}
+
 fn parse(content: &str) -> StructuredDocument {
     Document::from_content(content, "math.md")
         .unwrap()

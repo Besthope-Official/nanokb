@@ -53,6 +53,17 @@ fn paragraph(text: &str) -> Node {
     }
 }
 
+fn figure(src: &str, caption: &str, description: Option<&str>) -> Node {
+    Node {
+        kind: NodeKind::Figure {
+            src: src.into(),
+            caption: caption.into(),
+            description: description.map(String::from),
+        },
+        children: vec![],
+    }
+}
+
 fn code_block(text: &str) -> Node {
     Node {
         kind: NodeKind::CodeBlock { text: text.into() },
@@ -636,14 +647,40 @@ fn code_block_and_paragraph_mixed() {
                 block_index: 0,
                 block_type: BlockType::Paragraph,
                 text: "before".into(),
+                figures: Vec::new(),
             },
             Block {
                 block_index: 1,
                 block_type: BlockType::CodeBlock,
                 text: "fn main() {}".into(),
+                figures: Vec::new(),
             },
         ]
     );
+}
+
+#[test]
+fn figure_blocks_carry_figures_into_their_chunk() {
+    // 0: Root -> [1, 2]
+    let doc = make_doc(vec![
+        root(vec![NodeId(1), NodeId(2)]),
+        paragraph("The write path is shown below."),
+        figure("fig/a.png", "Figure 1. Write path", Some("memtable and WAL")),
+    ]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None).chunks;
+
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0].figures,
+        vec![Figure {
+            src: "fig/a.png".into(),
+            caption: "Figure 1. Write path".into(),
+            description: Some("memtable and WAL".into()),
+            blob: None,
+        }]
+    );
+    assert!(chunks[0].text.contains("Figure 1. Write path"));
+    assert!(chunks[0].text.contains("memtable and WAL"));
 }
 
 #[test]
@@ -665,21 +702,25 @@ fn blocks_have_correct_types() {
                 block_index: 0,
                 block_type: BlockType::Paragraph,
                 text: "para".into(),
+                figures: Vec::new(),
             },
             Block {
                 block_index: 1,
                 block_type: BlockType::CodeBlock,
                 text: "code".into(),
+                figures: Vec::new(),
             },
             Block {
                 block_index: 2,
                 block_type: BlockType::MathBlock,
                 text: "math".into(),
+                figures: Vec::new(),
             },
             Block {
                 block_index: 3,
                 block_type: BlockType::Table,
                 text: "table".into(),
+                figures: Vec::new(),
             },
         ]
     );
