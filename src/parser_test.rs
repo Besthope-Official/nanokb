@@ -204,6 +204,29 @@ fn paragraph_with_multiple_display_formulas_stays_a_paragraph() {
 }
 
 #[test]
+fn table_renders_as_readable_markdown_table() {
+    let document = parse(
+        "| Category | Self-hosted systems | Cloud-native systems |\n\
+         |----------|---------------------|---------------------|\n\
+         | Operational/OLTP | MySQL, PostgreSQL, MongoDB | AWS Aurora, Azure SQL DB Hyperscale |\n\
+         | Analytical/OLAP | Teradata, ClickHouse, Spark | Snowflake, BigQuery, Azure Synapse |\n",
+    );
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Table {
+            text: concat!(
+                "| Category | Self-hosted systems | Cloud-native systems |\n",
+                "| --- | --- | --- |\n",
+                "| Operational/OLTP | MySQL, PostgreSQL, MongoDB | AWS Aurora, Azure SQL DB Hyperscale |\n",
+                "| Analytical/OLAP | Teradata, ClickHouse, Spark | Snowflake, BigQuery, Azure Synapse |"
+            )
+            .into()
+        }]
+    );
+}
+
+#[test]
 fn structured_document_returns_node_by_id() {
     let document = StructuredDocument {
         metadata: DocumentMetadata {

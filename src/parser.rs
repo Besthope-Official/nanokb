@@ -164,6 +164,9 @@ impl Document {
         // A paragraph holding one display formula and nothing else is a math block.
         let mut display_math_count = 0usize;
         let mut has_prose = false;
+        let mut table_rows: Vec<String> = Vec::new();
+        let mut table_cells: Vec<String> = Vec::new();
+        let mut table_col_count = 0usize;
 
         tree.push(Node {
             kind: NodeKind::Root,
@@ -205,9 +208,16 @@ impl Document {
                         Tag::CodeBlock(_) => NodeKind::CodeBlock {
                             text: String::new(),
                         },
-                        Tag::Table(_) => NodeKind::Table {
-                            text: String::new(),
-                        },
+                        Tag::Table(alignments) => {
+                            table_rows.clear();
+                            table_cells.clear();
+                            table_col_count = alignments.len();
+                            NodeKind::Table { text: String::new() }
+                        }
+                        Tag::TableCell => {
+                            table_cells.push(String::new());
+                            continue;
+                        }
                         _ => continue,
                     };
                     let node = Node {
@@ -231,35 +241,48 @@ impl Document {
                     if !text.trim().is_empty() {
                         has_prose = true;
                     }
-                    node_text.push_str(&text);
+                    append_node_text(&mut node_text, &mut table_cells, &text);
                 }
 
                 // Math delimiters are dropped by the parser; restore them so the
                 // text stays valid markdown for downstream embedding.
                 Event::InlineMath(text) => {
                     has_prose = true;
-                    node_text.push('$');
-                    node_text.push_str(&text);
-                    node_text.push('$');
+                    append_node_text(&mut node_text, &mut table_cells, &format!("${text}$"));
                 }
                 Event::DisplayMath(text) => {
                     display_math_count += 1;
-                    node_text.push_str("$$");
-                    node_text.push_str(&text);
-                    node_text.push_str("$$");
+                    append_node_text(&mut node_text, &mut table_cells, &format!("$${text}$$"));
                 }
-                Event::SoftBreak => node_text.push(' '),
-                Event::HardBreak => node_text.push('\n'),
+                Event::SoftBreak => append_node_text(&mut node_text, &mut table_cells, " "),
+                Event::HardBreak => append_node_text(&mut node_text, &mut table_cells, "\n"),
 
                 Event::End(tag_end) => match tag_end {
-                    TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock | TagEnd::Table => {
+                    TagEnd::TableHead | TagEnd::TableRow => {
+                        if !table_cells.is_empty() {
+                            let row = table_cells
+                                .iter()
+                                .map(|cell| cell.trim())
+                                .collect::<Vec<_>>()
+                                .join(" | ");
+                            table_rows.push(row);
+                            table_cells.clear();
+                        }
+                    }
+                    TagEnd::Table => {
+                        if let Some(node_id) = node_path.pop()
+                            && let NodeKind::Table { text } = &mut tree[node_id.0].kind
+                        {
+                            *text = render_markdown_table(&table_rows, table_col_count);
+                        }
+                    }
+                    TagEnd::Paragraph | TagEnd::Item | TagEnd::CodeBlock => {
                         if let Some(node_id) = node_path.pop() {
                             let standalone_math =
                                 matches!(tag_end, TagEnd::Paragraph) && !has_prose;
                             match &mut tree[node_id.0].kind {
                                 NodeKind::Paragraph { text }
-                                | NodeKind::CodeBlock { text }
-                                | NodeKind::Table { text } => {
+                                | NodeKind::CodeBlock { text } => {
                                     *text = std::mem::take(&mut node_text);
                                 }
                                 _ => {}
@@ -293,6 +316,35 @@ impl Document {
             root,
         }
     }
+}
+
+/// Route inline text into the current table cell when parsing a table,
+/// otherwise into the node's plain text buffer.
+fn append_node_text(node_text: &mut String, table_cells: &mut [String], text: &str) {
+    match table_cells.last_mut() {
+        Some(cell) => cell.push_str(text),
+        None => node_text.push_str(text),
+    }
+}
+
+/// Rebuild a readable, valid markdown table from the collected rows.  Cells are
+/// joined with single spaces and no column-width padding; only the header
+/// separator line is added.
+fn render_markdown_table(rows: &[String], col_count: usize) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let col_count = if col_count == 0 {
+        rows[0].split('|').count()
+    } else {
+        col_count
+    };
+    let separator = format!("|{}", " --- |".repeat(col_count));
+    let mut lines = Vec::with_capacity(rows.len() + 1);
+    lines.push(format!("| {} |", rows[0]));
+    lines.push(separator);
+    lines.extend(rows[1..].iter().map(|row| format!("| {} |", row)));
+    lines.join("\n")
 }
 
 fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
