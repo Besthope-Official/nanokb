@@ -9,6 +9,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,7 +56,7 @@ enum EvalCommand {
         #[command(flatten)]
         common: CommonArgs,
     },
-    // New benchmarks
+    // New benchmarks go here.
 }
 
 #[derive(Subcommand)]
@@ -282,6 +285,12 @@ async fn ensure_no_failed_tasks(pool: &PgPool, kb_name: &str) -> Result<()> {
     bail!("kb '{kb_name}' has {} failed doc(s) — {details}", failed.len())
 }
 
+async fn kb_exists(pool: &PgPool, kb_name: &str) -> Result<bool> {
+    Ok(postgres::list_kbs(pool).await?.iter().any(|kb| kb.name == kb_name))
+}
+
+/// An arm is a group of subjects receiving a particular treatment.
+/// The word is used in clinical trial or A/B test, used here for aliasing config group.
 struct Arm {
     name: &'static str,
     mode: QueryMode,
@@ -390,7 +399,7 @@ async fn retrieve_arm(
     expand_depth: usize,
 ) -> Result<Vec<RunChunk>> {
     let mut candidates =
-        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode.clone(), query_text, limit)
+        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode, query_text, limit)
             .await?;
     if arm.expand {
         let neighbors = postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
@@ -610,8 +619,46 @@ fn summarize(
     report
 }
 
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn write_jsonl(path: &Path, records: &[RunRecord]) -> Result<()> {
+    let mut buf = String::new();
+    for record in records {
+        buf.push_str(&serde_json::to_string(record)?);
+        buf.push('\n');
+    }
+    std::fs::write(path, buf).with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn read_jsonl(path: &Path) -> Result<Vec<RunRecord>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    text.lines()
+        .map(|line| serde_json::from_str(line).with_context(|| format!("bad line in {}", path.display())))
+        .collect()
+}
+
+fn complete_run(path: &Path, query_count: usize) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(text.lines().count() == query_count)
+}
+
 struct MultiHopRag;
 
+/// Schema for `corpus.json` — one document per entry.
 #[derive(Deserialize)]
 struct CorpusDoc {
     title: String,
@@ -623,6 +670,7 @@ struct CorpusDoc {
     body: String,
 }
 
+/// Schema for `MultiHopRAG.json` — one query per entry.
 #[derive(Deserialize)]
 struct RawQuery {
     query: String,
@@ -636,26 +684,7 @@ struct Evidence {
     fact: String,
 }
 
-struct XorShift64(u64);
-
-impl XorShift64 {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-    }
-
-    fn shuffle<T>(&mut self, items: &mut [T]) {
-        for i in (1..items.len()).rev() {
-            let j = (self.next() % (i as u64 + 1)) as usize;
-            items.swap(i, j);
-        }
-    }
-}
-
+/// Stratified sample over `question_type`, excluding null queries.
 fn stratified_sample(raw: &[RawQuery], total: usize, seed: u64) -> Result<Vec<EvalQuery>> {
     let mut strata: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, query) in raw.iter().enumerate() {
@@ -683,11 +712,11 @@ fn stratified_sample(raw: &[RawQuery], total: usize, seed: u64) -> Result<Vec<Ev
         quota.1 += 1;
     }
 
-    let mut rng = XorShift64(seed.max(1));
+    let mut rng = StdRng::seed_from_u64(seed.max(1));
     let mut sampled: Vec<EvalQuery> = Vec::with_capacity(total);
     for (ty, quota, _) in quotas {
         let mut ids = strata[ty].clone();
-        rng.shuffle(&mut ids);
+        ids.shuffle(&mut rng);
         for id in ids.into_iter().take(quota) {
             let query = &raw[id];
             sampled.push(EvalQuery {
@@ -702,6 +731,7 @@ fn stratified_sample(raw: &[RawQuery], total: usize, seed: u64) -> Result<Vec<Ev
     Ok(sampled)
 }
 
+/// URL-safe slug from a title, used for markdown filenames.
 fn slug(title: &str) -> String {
     let mut out = String::with_capacity(title.len().min(48));
     let mut last_dash = true;
@@ -725,6 +755,7 @@ fn doc_filename(index: usize, title: &str) -> String {
     format!("{index:03}-{}.md", slug(title))
 }
 
+/// Render a CorpusDoc as markdown with YAML frontmatter.
 fn doc_markdown(doc: &CorpusDoc) -> String {
     let mut out = String::from("---\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(&doc.title)));
@@ -770,47 +801,6 @@ impl EvalDataset for MultiHopRag {
     }
 }
 
-async fn kb_exists(pool: &PgPool, kb_name: &str) -> Result<bool> {
-    Ok(postgres::list_kbs(pool).await?.iter().any(|kb| kb.name == kb_name))
-}
-
-fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let text = serde_json::to_string_pretty(value)?;
-    std::fs::write(path, text).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn write_jsonl(path: &Path, records: &[RunRecord]) -> Result<()> {
-    let mut buf = String::new();
-    for record in records {
-        buf.push_str(&serde_json::to_string(record)?);
-        buf.push('\n');
-    }
-    std::fs::write(path, buf).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn read_jsonl(path: &Path) -> Result<Vec<RunRecord>> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    text.lines()
-        .map(|line| serde_json::from_str(line).with_context(|| format!("bad line in {}", path.display())))
-        .collect()
-}
-
-fn complete_run(path: &Path, query_count: usize) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(text.lines().count() == query_count)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,15 +812,6 @@ mod tests {
             evidence_list: (0..fact_count)
                 .map(|i| Evidence { fact: format!("fact {i} of {id_type}") })
                 .collect(),
-        }
-    }
-
-    #[test]
-    fn xorshift_is_deterministic() {
-        let mut a = XorShift64(42);
-        let mut b = XorShift64(42);
-        for _ in 0..100 {
-            assert_eq!(a.next(), b.next());
         }
     }
 
@@ -927,5 +908,4 @@ mod tests {
         assert_eq!(paper.hit4, 1.0);
         assert_eq!(paper.hit10, 1.0);
     }
-
 }
