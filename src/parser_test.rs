@@ -175,6 +175,53 @@ fn leading_image_alt_is_prepended_to_the_paragraph() {
     );
 }
 
+#[test]
+fn table_cell_image_alt_lands_in_the_cell() {
+    let document = parse("| col |\n| --- |\n| ![Fig 1](a.png) |");
+
+    assert!(matches!(
+        &kinds(&document)[0],
+        NodeKind::Table { text } if text.contains("Fig 1")
+    ));
+}
+
+#[test]
+fn heading_image_alt_becomes_the_title() {
+    let document = parse("# ![Logo](fig/logo.png)");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Heading {
+            level: 1,
+            title: "Logo".into(),
+        }]
+    );
+}
+
+#[test]
+fn adjacent_images_are_joined_with_a_separator() {
+    let document = parse("![a](1.png)\n![b](2.png)");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "a b".into(),
+        }]
+    );
+}
+
+#[test]
+fn image_immediately_followed_by_text_gets_a_space() {
+    let document = parse("![A](x.png)text");
+
+    assert_eq!(
+        kinds(&document),
+        vec![NodeKind::Paragraph {
+            text: "A text".into(),
+        }]
+    );
+}
+
 fn parse(content: &str) -> StructuredDocument {
     Document::from_content(content, "math.md")
         .unwrap()

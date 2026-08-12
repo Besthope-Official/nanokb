@@ -196,7 +196,7 @@ impl Document {
         let mut image_count = 0usize;
         let mut image_alt = String::new();
         let mut last_figure: Option<Figure> = None;
-        let mut caption_pending = false;
+        let mut pending: Option<String> = None;
 
         tree.push(Node {
             kind: NodeKind::Root,
@@ -249,13 +249,7 @@ impl Document {
                             continue;
                         }
                         Tag::Image { dest_url, title, .. } => {
-                            if caption_pending {
-                                if let Some(fig) = last_figure.take() {
-                                    has_prose = true;
-                                    node_text.push_str(&fig.caption);
-                                }
-                                caption_pending = false;
-                            }
+                            flush_pending_caption(&mut pending, &mut node_text, "image");
                             image_count += 1;
                             image_alt.clear();
                             in_image = true;
@@ -280,7 +274,7 @@ impl Document {
                     image_count = 0;
                     image_alt.clear();
                     last_figure = None;
-                    caption_pending = false;
+                    pending = None;
                     let node_id = NodeId(tree.len());
                     tree.push(node);
 
@@ -295,6 +289,7 @@ impl Document {
                     if in_image {
                         image_alt.push_str(&text);
                     } else {
+                        flush_pending_caption(&mut pending, &mut node_text, &text);
                         if !text.trim().is_empty() {
                             has_prose = true;
                         }
@@ -306,27 +301,40 @@ impl Document {
                 // text stays valid markdown for downstream embedding.
                 Event::InlineMath(text) => {
                     has_prose = true;
-                    append_node_text(&mut node_text, &mut table_cells, &format!("${text}$"));
+                    let math = format!("${text}$");
+                    flush_pending_caption(&mut pending, &mut node_text, &math);
+                    append_node_text(&mut node_text, &mut table_cells, &math);
                 }
                 Event::DisplayMath(text) => {
                     display_math_count += 1;
-                    append_node_text(&mut node_text, &mut table_cells, &format!("$${text}$$"));
+                    let math = format!("$${text}$$");
+                    flush_pending_caption(&mut pending, &mut node_text, &math);
+                    append_node_text(&mut node_text, &mut table_cells, &math);
                 }
-                Event::SoftBreak => append_node_text(&mut node_text, &mut table_cells, " "),
-                Event::HardBreak => append_node_text(&mut node_text, &mut table_cells, "\n"),
+                Event::SoftBreak => {
+                    flush_pending_caption(&mut pending, &mut node_text, " ");
+                    append_node_text(&mut node_text, &mut table_cells, " ");
+                }
+                Event::HardBreak => {
+                    flush_pending_caption(&mut pending, &mut node_text, "\n");
+                    append_node_text(&mut node_text, &mut table_cells, "\n");
+                }
 
                 Event::End(tag_end) => match tag_end {
                     TagEnd::Image => {
                         in_image = false;
                         let alt = std::mem::take(&mut image_alt);
-                        if prose_without_html(&node_text) {
+                        if let Some(fig) = last_figure.as_mut() {
+                            fig.caption = alt.clone();
+                        }
+                        if !table_cells.is_empty() {
+                            last_figure = None;
+                            append_node_text(&mut node_text, &mut table_cells, &alt);
+                        } else if prose_without_html(&node_text) {
                             has_prose = true;
                             node_text.push_str(&alt);
                         } else {
-                            caption_pending = true;
-                        }
-                        if let Some(fig) = last_figure.as_mut() {
-                            fig.caption = alt;
+                            pending = Some(alt);
                         }
                     }
                     TagEnd::TableHead | TagEnd::TableRow => {
@@ -371,21 +379,17 @@ impl Document {
                                 && image_count == 1
                                 && let Some(fig) = last_figure.take()
                             {
-                                caption_pending = false;
+                                pending = None;
                                 tree[node_id.0].kind = NodeKind::Figure {
                                     src: fig.src,
                                     caption: fig.caption,
                                     description: fig.description,
                                 };
-                            } else if caption_pending
-                                && let Some(fig) = last_figure.take()
-                                && let NodeKind::Paragraph { text } = &mut tree[node_id.0].kind
-                            {
-                                text.insert_str(0, &fig.caption);
                             }
                         }
                     }
                     TagEnd::Heading(_) => {
+                        flush_pending_caption(&mut pending, &mut node_text, " ");
                         if let Some(&node_id) = node_path.last()
                             && let NodeKind::Heading { title, .. } = &mut tree[node_id.0].kind
                         {
@@ -429,6 +433,22 @@ fn prose_without_html(text: &str) -> bool {
         }
     }
     false
+}
+
+/// Flush a held-back image caption into the node text at the position where
+/// the next inline content follows it, joining with a space when neither side
+/// carries one.
+fn flush_pending_caption(pending: &mut Option<String>, node_text: &mut String, following: &str) {
+    let Some(caption) = pending.take() else {
+        return;
+    };
+    node_text.push_str(&caption);
+    let needs_space = !caption.is_empty()
+        && !caption.ends_with(char::is_whitespace)
+        && !following.starts_with(char::is_whitespace);
+    if needs_space {
+        node_text.push(' ');
+    }
 }
 
 /// Rebuild a readable, valid markdown table from the collected rows.  Cells are

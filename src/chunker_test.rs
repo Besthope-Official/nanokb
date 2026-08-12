@@ -684,6 +684,15 @@ fn figure_blocks_carry_figures_into_their_chunk() {
 }
 
 #[test]
+fn figure_without_caption_or_description_is_skipped() {
+    // 0: Root -> [1]
+    let doc = make_doc(vec![root(vec![NodeId(1)]), figure("a.png", "", None)]);
+    let chunks = layered_chunks(&doc, 512, 0.0, MetadataMode::None).chunks;
+
+    assert!(chunks.is_empty());
+}
+
+#[test]
 fn blocks_have_correct_types() {
     // 0: Root -> [1, 2, 3, 4]
     let doc = make_doc(vec![

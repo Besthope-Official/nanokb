@@ -223,7 +223,11 @@ fn chunk_children(
                 );
             }
             NodeKind::Figure { src, caption, description } => {
-                block_texts.push(figure_text(caption, description));
+                let text = figure_text(caption, description);
+                if text.is_empty() {
+                    continue;
+                }
+                block_texts.push(text);
                 block_types.push(BlockType::Figure);
                 block_figures.push(vec![Figure {
                     src: src.clone(),

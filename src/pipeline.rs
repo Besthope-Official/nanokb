@@ -159,6 +159,18 @@ impl Pipeline {
                     .figures
                     .iter()
                     .map(|figure| {
+                        if figure.src.starts_with("http://") || figure.src.starts_with("https://") {
+                            on_info(format!(
+                                "[{}] remote figure kept without blob: {}",
+                                input.filename, figure.src
+                            ));
+                            return Ok(Figure {
+                                src: figure.src.clone(),
+                                caption: figure.caption.clone(),
+                                description: figure.description.clone(),
+                                blob: None,
+                            });
+                        }
                         let path = Path::new(input.source_dir).join(&figure.src);
                         let bytes = std::fs::read(&path)
                             .with_context(|| format!("failed to read figure {}", path.display()))?;

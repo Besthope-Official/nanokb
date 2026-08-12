@@ -631,29 +631,30 @@ pub async fn query_chunks(
         .await
         .with_context(|| format!("failed to query kb {kb_name}"))?;
 
-    Ok(rows
-        .iter()
-        .map(|row| QueryResult {
-            document_id: row.get("document_id"),
-            filename: row.get("filename"),
-            frontmatter: row.get("frontmatter"),
-            node_id: row.get("node_id"),
-            chunk_seq: row.get("chunk_seq"),
-            heading_path: row
-                .get::<Option<Value>, _>("heading_path")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            sort_order: row.get("sort_order"),
-            source: QueryChannel::Vec,
-            text: row.get("text"),
-            figures: parse_figures(&row.get::<Value, _>("figures")),
-            markers: row
-                .get::<Option<Value>, _>("markers")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            distance: row.get("distance"),
+    rows.iter()
+        .map(|row| {
+            Ok(QueryResult {
+                document_id: row.get("document_id"),
+                filename: row.get("filename"),
+                frontmatter: row.get("frontmatter"),
+                node_id: row.get("node_id"),
+                chunk_seq: row.get("chunk_seq"),
+                heading_path: row
+                    .get::<Option<Value>, _>("heading_path")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                sort_order: row.get("sort_order"),
+                source: QueryChannel::Vec,
+                text: row.get("text"),
+                figures: parse_figures(row.get("figures"))?,
+                markers: row
+                    .get::<Option<Value>, _>("markers")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                distance: row.get("distance"),
+            })
         })
-        .collect())
+        .collect()
 }
 
 fn parse_string_array(value: &Value) -> Option<Vec<String>> {
@@ -664,8 +665,8 @@ fn parse_string_array(value: &Value) -> Option<Vec<String>> {
     })
 }
 
-fn parse_figures(value: &Value) -> Vec<Figure> {
-    serde_json::from_value(value.clone()).unwrap_or_default()
+fn parse_figures(value: Value) -> Result<Vec<Figure>> {
+    serde_json::from_value(value).context("chunk figures JSON is not a figure array")
 }
 
 /// Create an HNSW index on the marker_embedding column for dense vector marker search.
@@ -730,29 +731,30 @@ pub async fn query_markers(
         .await
         .with_context(|| format!("failed to query markers in kb {kb_name}"))?;
 
-    Ok(rows
-        .iter()
-        .map(|row| QueryResult {
-            document_id: row.get("document_id"),
-            filename: row.get("filename"),
-            frontmatter: row.get("frontmatter"),
-            node_id: row.get("node_id"),
-            chunk_seq: row.get("chunk_seq"),
-            heading_path: row
-                .get::<Option<Value>, _>("heading_path")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            sort_order: row.get("sort_order"),
-            source: QueryChannel::Marker,
-            text: row.get("text"),
-            figures: parse_figures(&row.get::<Value, _>("figures")),
-            markers: row
-                .get::<Option<Value>, _>("markers")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            distance: row.get("marker_distance"),
+    rows.iter()
+        .map(|row| {
+            Ok(QueryResult {
+                document_id: row.get("document_id"),
+                filename: row.get("filename"),
+                frontmatter: row.get("frontmatter"),
+                node_id: row.get("node_id"),
+                chunk_seq: row.get("chunk_seq"),
+                heading_path: row
+                    .get::<Option<Value>, _>("heading_path")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                sort_order: row.get("sort_order"),
+                source: QueryChannel::Marker,
+                text: row.get("text"),
+                figures: parse_figures(row.get("figures"))?,
+                markers: row
+                    .get::<Option<Value>, _>("markers")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                distance: row.get("marker_distance"),
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Expand a set of hit chunks to their structural tree neighbors.
@@ -936,29 +938,30 @@ async fn fetch_chunks_by_nodes(
         .fetch_all(pool)
         .await
         .context("failed to fetch neighbor chunks")?;
-    Ok(rows
-        .iter()
-        .map(|row| QueryResult {
-            document_id: row.get("document_id"),
-            filename: row.get("filename"),
-            frontmatter: row.get("frontmatter"),
-            node_id: row.get("node_id"),
-            chunk_seq: row.get("chunk_seq"),
-            heading_path: row
-                .get::<Option<Value>, _>("heading_path")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            sort_order: row.get("sort_order"),
-            source: QueryChannel::Tree,
-            text: row.get("text"),
-            figures: parse_figures(&row.get::<Value, _>("figures")),
-            markers: row
-                .get::<Option<Value>, _>("markers")
-                .and_then(|v| parse_string_array(&v))
-                .unwrap_or_default(),
-            distance: 0.0,
+    rows.iter()
+        .map(|row| {
+            Ok(QueryResult {
+                document_id: row.get("document_id"),
+                filename: row.get("filename"),
+                frontmatter: row.get("frontmatter"),
+                node_id: row.get("node_id"),
+                chunk_seq: row.get("chunk_seq"),
+                heading_path: row
+                    .get::<Option<Value>, _>("heading_path")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                sort_order: row.get("sort_order"),
+                source: QueryChannel::Tree,
+                text: row.get("text"),
+                figures: parse_figures(row.get("figures"))?,
+                markers: row
+                    .get::<Option<Value>, _>("markers")
+                    .and_then(|v| parse_string_array(&v))
+                    .unwrap_or_default(),
+                distance: 0.0,
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Debug)]
