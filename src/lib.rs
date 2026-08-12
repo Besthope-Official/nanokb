@@ -33,3 +33,5 @@ pub mod pipeline;
 pub use pipeline::Pipeline;
 
 pub mod cli;
+
+pub mod eval;

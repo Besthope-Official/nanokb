@@ -5,19 +5,37 @@ use serde_json::Value;
 use std::sync::Arc;
 use tokio::task::JoinSet;
 
+// One call carries exactly one block; the wording stays singular on purpose.
+// An earlier "for each block" phrasing led the model to wrap its answer in a
+// {"blocks": [...]} envelope that parse_string_list rejects.
 const MARKER_SYSTEM_PROMPT: &str =
-    "You are a semantic indexer for a knowledge base. A document is split into \
-     semantic blocks, each with a structural position (heading path) and content. \
-     For each block produce 3-8 semantic markers: short keywords or phrases (1-4 words) \
-     that a user search query about this block would plausibly contain. Prefer terms \
-     that are specific, reusable across blocks, and stable.";
+    "You are a semantic indexer for a knowledge base. You are given one text block \
+     from a document, with its structural position (heading path) and content. \
+     Produce 3-8 semantic markers for this block: short keywords or phrases (1-4 words) \
+     that a user search query about the block would plausibly contain. Prefer terms \
+     that are specific, reusable, and stable.";
+
+// The chat-completions endpoint only supports JSON mode (no json_schema
+// enforcement), so the contract travels inside the prompt as a string.
+const MARKER_RESPONSE_SCHEMA: &str = r#"{
+  "type": "object",
+  "properties": {
+    "markers": {
+      "type": "array",
+      "items": {"type": "string"},
+      "minItems": 3,
+      "maxItems": 8
+    }
+  },
+  "required": ["markers"],
+  "additionalProperties": false
+}"#;
 
 fn marker_messages(embedding_text: &str) -> [ChatMessage; 2] {
     [
         ChatMessage::system(MARKER_SYSTEM_PROMPT),
         ChatMessage::user(format!(
-            "{}\n\nRespond with JSON: {{\"markers\": [...]}}. Only the JSON object.",
-            embedding_text
+            "{embedding_text}\n\nRespond with a JSON object conforming to this schema:\n{MARKER_RESPONSE_SCHEMA}\nOutput only the JSON object.",
         )),
     ]
 }
