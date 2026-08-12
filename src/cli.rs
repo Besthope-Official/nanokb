@@ -529,6 +529,9 @@ pub(crate) async fn drain_tasks(
     pipeline: Arc<Pipeline>,
     document_count: usize,
 ) -> Result<()> {
+    // Read before workers spawn: failures are attributed to this drain only
+    // if they happen after this moment.
+    let drain_started = postgres::server_now(pool).await?;
     let worker_count = config.pipeline.worker_count.min(document_count);
     eprintln!("kb '{kb_name}' · {document_count} documents · {worker_count} workers");
 
@@ -562,9 +565,9 @@ pub(crate) async fn drain_tasks(
         if let Some(usage) = pipeline.token_usage() {
             eprintln!("{usage}");
         }
-        // drain only waits for pending+running to clear; surface failed docs
-        // instead of exiting 0 with a partially processed batch.
-        let failed = postgres::failed_tasks(pool, kb_name).await?;
+        // drain only waits for pending+running to clear; surface the docs
+        // this drain failed instead of exiting 0 with a partial batch.
+        let failed = postgres::failed_tasks(pool, kb_name, Some(&drain_started)).await?;
         if !failed.is_empty() {
             let details = failed
                 .iter()

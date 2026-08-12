@@ -1164,17 +1164,34 @@ pub async fn mark_task_failed(pool: &PgPool, task_id: i64, error_message: &str) 
     Ok(())
 }
 
+/// Server clock as text, so callers can compare task timestamps without a
+/// chrono/time dependency.
+pub async fn server_now(pool: &PgPool) -> Result<String> {
+    sqlx::query_scalar("SELECT now()::text")
+        .fetch_one(pool)
+        .await
+        .context("failed to read the database clock")
+}
+
 /// Docs whose *latest* task failed, as (filename, error message). A doc that
-/// failed once but was later re-ingested successfully does not count.
-pub async fn failed_tasks(pool: &PgPool, kb_name: &str) -> Result<Vec<(String, String)>> {
+/// failed once but was later re-ingested successfully does not count. `since`
+/// (a `server_now` reading) scopes the report to tasks that failed after that
+/// moment, so stale failures elsewhere in the kb don't leak in.
+pub async fn failed_tasks(
+    pool: &PgPool,
+    kb_name: &str,
+    since: Option<&str>,
+) -> Result<Vec<(String, String)>> {
     let rows = sqlx::query(
         "SELECT document.filename, task.error_message \
          FROM task JOIN document ON document.id = task.document_id \
          WHERE document.kb_name = $1 AND task.status = 'failed' \
            AND task.id = (SELECT MAX(t2.id) FROM task t2 WHERE t2.document_id = document.id) \
+           AND ($2::timestamptz IS NULL OR task.updated_at >= $2::timestamptz) \
          ORDER BY task.id",
     )
     .bind(kb_name)
+    .bind(since)
     .fetch_all(pool)
     .await
     .context("failed to list failed tasks")?;
