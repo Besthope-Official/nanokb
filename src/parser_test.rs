@@ -110,6 +110,41 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
 }
 
 #[test]
+fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
+    let frontmatter = parse_frontmatter(
+        "---\ntype: chapter\ntitle: Guide\ndescription: A short guide.\n\
+         resource: https://example.com/guide\ntags: [kb, rust]\ntimestamp: 2026-08-13\n\
+         book: ddia\n---\nbody",
+    )
+    .unwrap();
+
+    assert_eq!(frontmatter.okf_type(), Some("chapter"));
+    assert_eq!(frontmatter.title(), Some("Guide"));
+    assert_eq!(frontmatter.description(), Some("A short guide."));
+    assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
+    assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
+    assert_eq!(frontmatter.timestamp(), Some("2026-08-13"));
+    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
+}
+
+#[test]
+fn frontmatter_ext_tolerates_scalar_tags() {
+    let frontmatter = parse_frontmatter("---\ntags: rust, kb\n---\nbody").unwrap();
+
+    assert!(frontmatter.tags().is_empty());
+}
+
+#[test]
+fn frontmatter_ext_defaults_missing_fields() {
+    let frontmatter = parse_frontmatter("---\n---\nbody").unwrap();
+
+    assert_eq!(frontmatter.okf_type(), None);
+    assert_eq!(frontmatter.title(), None);
+    assert!(frontmatter.tags().is_empty());
+    assert_eq!(frontmatter.timestamp(), None);
+}
+
+#[test]
 fn standalone_image_becomes_a_figure_node() {
     let document = parse("![Figure 1. Diagram](fig/one.png \"A diagram of ETL\")");
 

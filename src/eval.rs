@@ -755,17 +755,20 @@ fn doc_filename(index: usize, title: &str) -> String {
     format!("{index:03}-{}.md", slug(title))
 }
 
-/// Render a CorpusDoc as markdown with YAML frontmatter.
+/// Render a CorpusDoc as markdown with okf frontmatter: `url` becomes the
+/// okf `resource` and `published_at` the okf `timestamp`; the rest stays as
+/// custom keys.
 fn doc_markdown(doc: &CorpusDoc) -> String {
     let mut out = String::from("---\n");
+    out.push_str("type: article\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(&doc.title)));
     if let Some(author) = &doc.author {
         out.push_str(&format!("author: {}\n", yaml_quoted(author)));
     }
+    out.push_str(&format!("resource: {}\n", yaml_quoted(&doc.url)));
+    out.push_str(&format!("timestamp: {}\n", yaml_quoted(&doc.published_at)));
     out.push_str(&format!("source: {}\n", yaml_quoted(&doc.source)));
     out.push_str(&format!("category: {}\n", yaml_quoted(&doc.category)));
-    out.push_str(&format!("published_at: {}\n", yaml_quoted(&doc.published_at)));
-    out.push_str(&format!("url: {}\n", yaml_quoted(&doc.url)));
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n\n{}\n", doc.title.replace('\n', " "), doc.body));
     out

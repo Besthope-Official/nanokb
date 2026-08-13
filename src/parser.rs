@@ -2,6 +2,62 @@ use anyhow::Result;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::{collections::BTreeMap, fmt, path::Path};
 
+/// Typed accessors for the okf-defined fields of a frontmatter map.
+///
+/// Frontmatter stays a flat yaml map so custom keys survive untouched; this
+/// trait lifts the [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+/// fields (`type`, `title`, `description`, `resource`, `tags`, `timestamp`)
+/// out of it. Consumers tolerate a missing or malformed field: accessors fall
+/// back to `None` / empty rather than failing the document parse.
+pub trait FrontmatterExt {
+    /// The concept kind (`book`, `chapter`, `paper`, ...).
+    fn okf_type(&self) -> Option<&str>;
+    /// Human-readable display name.
+    fn title(&self) -> Option<&str>;
+    /// One-sentence summary.
+    fn description(&self) -> Option<&str>;
+    /// Canonical uri identifying the underlying asset.
+    fn resource(&self) -> Option<&str>;
+    /// Cross-cutting categorization; non-list values yield an empty list.
+    fn tags(&self) -> Vec<String>;
+    /// Iso 8601 timestamp of the last meaningful change.
+    fn timestamp(&self) -> Option<&str>;
+}
+
+impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
+    fn okf_type(&self) -> Option<&str> {
+        self.get("type").and_then(|v| v.as_str())
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.get("title").and_then(|v| v.as_str())
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.get("description").and_then(|v| v.as_str())
+    }
+
+    fn resource(&self) -> Option<&str> {
+        self.get("resource").and_then(|v| v.as_str())
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.get("tags")
+            .and_then(|v| v.as_sequence())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn timestamp(&self) -> Option<&str> {
+        self.get("timestamp").and_then(|v| v.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentMetadata {
     pub filename: String,
@@ -489,8 +545,17 @@ fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
     let closing_len = closing_len?;
     let yaml_section = &remains[..yaml_len];
     let _body = &remains[yaml_len + closing_len..];
-    match yaml_serde::from_str(yaml_section) {
-        Ok(m) => Some(m),
+    match yaml_serde::from_str::<BTreeMap<String, yaml_serde::Value>>(yaml_section) {
+        Ok(metadata) => {
+            if !metadata
+                .get("type")
+                .and_then(|v| v.as_str())
+                .is_some_and(|t| !t.is_empty())
+            {
+                eprintln!("[WARN] frontmatter missing the required okf 'type' field");
+            }
+            Some(metadata)
+        }
         Err(e) => {
             eprintln!("[WARN] invalid frontmatter yaml, skipping metadata: {e}");
             None
