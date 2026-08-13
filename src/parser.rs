@@ -26,6 +26,27 @@ pub enum NodeKind {
     CodeBlock { text: String },
     MathBlock { text: String },
     Table { text: String },
+    Figure {
+        src: String,
+        caption: String,
+        description: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Figure {
+    pub src: String,
+    pub caption: String,
+    pub description: Option<String>,
+    pub blob: Option<String>,
+}
+
+
+pub fn figure_text(caption: &str, description: &Option<String>) -> String {
+    match description {
+        Some(desc) if !desc.is_empty() => format!("{caption}\n\n{desc}"),
+        _ => caption.to_string(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +115,7 @@ impl fmt::Display for NodeKind {
         let (label, text) = match self {
             Self::Root => return f.write_str("Root"),
             Self::Heading { level, title } => return write!(f, "H{level} {title}"),
+            Self::Figure { src, .. } => return write!(f, "Figure \"{src}\""),
             Self::Paragraph { text } => ("Paragraph", text),
             Self::CodeBlock { text } => ("CodeBlock", text),
             Self::MathBlock { text } => ("MathBlock", text),
@@ -125,6 +147,9 @@ fn collect_content_texts(
                     | NodeKind::CodeBlock { text }
                     | NodeKind::MathBlock { text }
                     | NodeKind::Table { text } => text.clone(),
+                    NodeKind::Figure { caption, description, .. } => {
+                        figure_text(caption, description)
+                    }
                     _ => String::new(),
                 };
                 if !text.is_empty() {
@@ -167,6 +192,11 @@ impl Document {
         let mut table_rows: Vec<String> = Vec::new();
         let mut table_cells: Vec<String> = Vec::new();
         let mut table_col_count = 0usize;
+        let mut in_image = false;
+        let mut image_count = 0usize;
+        let mut image_alt = String::new();
+        let mut last_figure: Option<Figure> = None;
+        let mut pending: Option<String> = None;
 
         tree.push(Node {
             kind: NodeKind::Root,
@@ -218,6 +248,19 @@ impl Document {
                             table_cells.push(String::new());
                             continue;
                         }
+                        Tag::Image { dest_url, title, .. } => {
+                            flush_pending_caption(&mut pending, &mut node_text, "image");
+                            image_count += 1;
+                            image_alt.clear();
+                            in_image = true;
+                            last_figure = Some(Figure {
+                                src: dest_url.into_string(),
+                                caption: String::new(),
+                                description: (!title.is_empty()).then(|| title.into_string()),
+                                blob: None,
+                            });
+                            continue;
+                        }
                         _ => continue,
                     };
                     let node = Node {
@@ -227,6 +270,11 @@ impl Document {
                     node_text.clear();
                     display_math_count = 0;
                     has_prose = false;
+                    in_image = false;
+                    image_count = 0;
+                    image_alt.clear();
+                    last_figure = None;
+                    pending = None;
                     let node_id = NodeId(tree.len());
                     tree.push(node);
 
@@ -238,26 +286,57 @@ impl Document {
 
                 Event::Text(text) | Event::Code(text) | Event::Html(text)
                 | Event::InlineHtml(text) => {
-                    if !text.trim().is_empty() {
-                        has_prose = true;
+                    if in_image {
+                        image_alt.push_str(&text);
+                    } else {
+                        flush_pending_caption(&mut pending, &mut node_text, &text);
+                        if !text.trim().is_empty() {
+                            has_prose = true;
+                        }
+                        append_node_text(&mut node_text, &mut table_cells, &text);
                     }
-                    append_node_text(&mut node_text, &mut table_cells, &text);
                 }
 
                 // Math delimiters are dropped by the parser; restore them so the
                 // text stays valid markdown for downstream embedding.
                 Event::InlineMath(text) => {
                     has_prose = true;
-                    append_node_text(&mut node_text, &mut table_cells, &format!("${text}$"));
+                    let math = format!("${text}$");
+                    flush_pending_caption(&mut pending, &mut node_text, &math);
+                    append_node_text(&mut node_text, &mut table_cells, &math);
                 }
                 Event::DisplayMath(text) => {
                     display_math_count += 1;
-                    append_node_text(&mut node_text, &mut table_cells, &format!("$${text}$$"));
+                    let math = format!("$${text}$$");
+                    flush_pending_caption(&mut pending, &mut node_text, &math);
+                    append_node_text(&mut node_text, &mut table_cells, &math);
                 }
-                Event::SoftBreak => append_node_text(&mut node_text, &mut table_cells, " "),
-                Event::HardBreak => append_node_text(&mut node_text, &mut table_cells, "\n"),
+                Event::SoftBreak => {
+                    flush_pending_caption(&mut pending, &mut node_text, " ");
+                    append_node_text(&mut node_text, &mut table_cells, " ");
+                }
+                Event::HardBreak => {
+                    flush_pending_caption(&mut pending, &mut node_text, "\n");
+                    append_node_text(&mut node_text, &mut table_cells, "\n");
+                }
 
                 Event::End(tag_end) => match tag_end {
+                    TagEnd::Image => {
+                        in_image = false;
+                        let alt = std::mem::take(&mut image_alt);
+                        if let Some(fig) = last_figure.as_mut() {
+                            fig.caption = alt.clone();
+                        }
+                        if !table_cells.is_empty() {
+                            last_figure = None;
+                            append_node_text(&mut node_text, &mut table_cells, &alt);
+                        } else if prose_without_html(&node_text) {
+                            has_prose = true;
+                            node_text.push_str(&alt);
+                        } else {
+                            pending = Some(alt);
+                        }
+                    }
                     TagEnd::TableHead | TagEnd::TableRow => {
                         if !table_cells.is_empty() {
                             let row = table_cells
@@ -280,6 +359,7 @@ impl Document {
                         if let Some(node_id) = node_path.pop() {
                             let standalone_math =
                                 matches!(tag_end, TagEnd::Paragraph) && !has_prose;
+                            let no_prose = !prose_without_html(&node_text);
                             match &mut tree[node_id.0].kind {
                                 NodeKind::Paragraph { text }
                                 | NodeKind::CodeBlock { text } => {
@@ -294,9 +374,22 @@ impl Document {
                                 let text = text.clone();
                                 tree[node_id.0].kind = NodeKind::MathBlock { text };
                             }
+                            if no_prose
+                                && matches!(tag_end, TagEnd::Paragraph | TagEnd::Item)
+                                && image_count == 1
+                                && let Some(fig) = last_figure.take()
+                            {
+                                pending = None;
+                                tree[node_id.0].kind = NodeKind::Figure {
+                                    src: fig.src,
+                                    caption: fig.caption,
+                                    description: fig.description,
+                                };
+                            }
                         }
                     }
                     TagEnd::Heading(_) => {
+                        flush_pending_caption(&mut pending, &mut node_text, " ");
                         if let Some(&node_id) = node_path.last()
                             && let NodeKind::Heading { title, .. } = &mut tree[node_id.0].kind
                         {
@@ -324,6 +417,37 @@ fn append_node_text(node_text: &mut String, table_cells: &mut [String], text: &s
     match table_cells.last_mut() {
         Some(cell) => cell.push_str(text),
         None => node_text.push_str(text),
+    }
+}
+
+/// HTML anchors and other inline tags are structural noise, not prose: a
+/// paragraph holding only `<a id="x"></a>` next to an image is still a figure.
+fn prose_without_html(text: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in text.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            _ if depth == 0 && !ch.is_whitespace() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Flush a held-back image caption into the node text at the position where
+/// the next inline content follows it, joining with a space when neither side
+/// carries one.
+fn flush_pending_caption(pending: &mut Option<String>, node_text: &mut String, following: &str) {
+    let Some(caption) = pending.take() else {
+        return;
+    };
+    node_text.push_str(&caption);
+    let needs_space = !caption.is_empty()
+        && !caption.ends_with(char::is_whitespace)
+        && !following.starts_with(char::is_whitespace);
+    if needs_space {
+        node_text.push(' ');
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::parser::{Figure, figure_text};
 use crate::{Node, NodeKind, StructuredDocument};
 use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
 use std::collections::hash_map::DefaultHasher;
@@ -18,6 +19,8 @@ pub enum BlockType {
     MathBlock,
     #[serde(rename = "table")]
     Table,
+    #[serde(rename = "figure")]
+    Figure,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -26,6 +29,8 @@ pub struct Block {
     pub block_index: usize,
     pub block_type: BlockType,
     pub text: String,
+    #[serde(skip)]
+    pub figures: Vec<Figure>,
 }
 
 pub struct NodeRow {
@@ -47,6 +52,7 @@ pub struct Chunk {
     pub embedding_text: String,
     pub heading_path: Vec<String>,
     pub blocks: Vec<Block>,
+    pub figures: Vec<Figure>,
 }
 
 pub struct DocumentChunks {
@@ -156,6 +162,7 @@ fn chunk_children(
 ) {
     let mut block_texts: Vec<String> = Vec::new();
     let mut block_types: Vec<BlockType> = Vec::new();
+    let mut block_figures: Vec<Vec<Figure>> = Vec::new();
     let mut block_offset = 0;
     let mut chunk_counter = 0;
 
@@ -166,6 +173,7 @@ fn chunk_children(
                 flush_content_blocks(
                     &block_texts,
                     &block_types,
+                    &block_figures,
                     block_offset,
                     heading_path,
                     node_id,
@@ -178,6 +186,7 @@ fn chunk_children(
                 block_offset += block_texts.len();
                 block_texts.clear();
                 block_types.clear();
+                block_figures.clear();
 
                 let mut sub_path = heading_path.to_vec();
                 sub_path.push(title.clone());
@@ -213,11 +222,26 @@ fn chunk_children(
                     chunks,
                 );
             }
+            NodeKind::Figure { src, caption, description } => {
+                let text = figure_text(caption, description);
+                if text.is_empty() {
+                    continue;
+                }
+                block_texts.push(text);
+                block_types.push(BlockType::Figure);
+                block_figures.push(vec![Figure {
+                    src: src.clone(),
+                    caption: caption.clone(),
+                    description: description.clone(),
+                    blob: None,
+                }]);
+            }
             _ => {
                 let text = content_block_text(&child.kind);
                 if !text.is_empty() {
                     block_texts.push(text);
                     block_types.push(block_type_of(&child.kind));
+                    block_figures.push(Vec::new());
                 }
             }
         }
@@ -226,6 +250,7 @@ fn chunk_children(
     flush_content_blocks(
         &block_texts,
         &block_types,
+        &block_figures,
         block_offset,
         heading_path,
         node_id,
@@ -261,6 +286,7 @@ fn content_block_text(kind: &NodeKind) -> String {
 fn flush_content_blocks(
     block_texts: &[String],
     block_types: &[BlockType],
+    block_figures: &[Vec<Figure>],
     block_offset: usize,
     heading_path: &[String],
     node_id: &str,
@@ -290,6 +316,7 @@ fn flush_content_blocks(
                     block_index: block_offset + i,
                     block_type: block_types[i],
                     text: text.clone(),
+                    figures: block_figures[i].clone(),
                 })
                 .collect(),
         ));
@@ -343,6 +370,7 @@ fn flush_content_blocks(
                 block_index: block_offset + idx,
                 block_type: block_types[idx],
                 text: next_block.to_string(),
+                figures: block_figures[idx].clone(),
             });
             idx += 1;
         }
@@ -533,6 +561,7 @@ fn make_fixed_chunk(text: &str, node_id: &str, chunk_seq: usize) -> Chunk {
         embedding_text: text.to_string(),
         heading_path: Vec::new(),
         blocks: Vec::new(),
+        figures: Vec::new(),
     }
 }
 
@@ -582,6 +611,11 @@ fn make_chunk(
         }
     };
 
+    let figures = blocks
+        .iter()
+        .flat_map(|block| block.figures.iter().cloned())
+        .collect();
+
     Chunk {
         node_id: node_id.to_string(),
         chunk_seq,
@@ -589,6 +623,7 @@ fn make_chunk(
         embedding_text,
         heading_path: heading_path.to_vec(),
         blocks,
+        figures,
     }
 }
 
@@ -606,6 +641,7 @@ fn block_type_of(kind: &NodeKind) -> BlockType {
         NodeKind::CodeBlock { .. } => BlockType::CodeBlock,
         NodeKind::MathBlock { .. } => BlockType::MathBlock,
         NodeKind::Table { .. } => BlockType::Table,
+        NodeKind::Figure { .. } => BlockType::Figure,
         _ => unreachable!("content block kinds only"),
     }
 }

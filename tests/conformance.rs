@@ -93,7 +93,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     );
 
     let content = "# Test Guide\n\nThis is a conformance test document.\n";
-    let document_id = register_document(&pool, KB_NAME, content, "guide.md").await?;
+    let document_id = register_document(&pool, KB_NAME, content, "guide.md", "").await?;
     mark_document_parsed(
         &pool,
         document_id,
@@ -126,6 +126,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
             chunk_seq: 0,
             text: "Introduction".into(),
             blocks: Vec::new(),
+            figures: Vec::new(),
             embedding: vec![0.1, 0.2, 0.3],
             marker_embedding: vec![0.4, 0.5, 0.6],
             markers: vec!["guide".into(), "introduction".into()],
@@ -226,7 +227,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     assert!(marker_kb_has_marker_col, "marker_embedding column should exist for llm-enabled kb");
 
     let marker_document_id =
-        register_document(&pool, KB_NAME_MARKER, content, "guide.md").await?;
+        register_document(&pool, KB_NAME_MARKER, content, "guide.md", "").await?;
     mark_document_parsed(
         &pool,
         marker_document_id,
@@ -250,6 +251,7 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
             chunk_seq: 0,
             text: "Introduction".into(),
             blocks: Vec::new(),
+            figures: Vec::new(),
             embedding: vec![0.1, 0.2, 0.3],
             marker_embedding: vec![0.4, 0.5, 0.6],
             markers: vec!["guide".into(), "introduction".into()],
@@ -342,6 +344,7 @@ fn tree_chunk(node_id: &str, chunk_seq: usize, text: &str) -> ChunkRow {
         chunk_seq: chunk_seq as i32,
         text: text.into(),
         blocks: Vec::new(),
+        figures: Vec::new(),
         embedding: vec![0.1, 0.2, 0.3],
         marker_embedding: Vec::new(),
         markers: Vec::new(),
@@ -359,6 +362,7 @@ fn tree_hit(document_id: i64, node_id: &str, chunk_seq: usize) -> QueryResult {
         sort_order: 0,
         source: QueryChannel::Vec,
         text: String::new(),
+        figures: Vec::new(),
         markers: Vec::new(),
         distance: 0.0,
     }
@@ -400,7 +404,7 @@ async fn expand_neighbors_returns_tree_context_in_document_order() -> Result<()>
     //   │   └── ch1b
     //   └── ch2
     //       └── ch2a
-    let document_id = register_document(&pool, KB_NAME_TREE, "tree", "tree.md").await?;
+    let document_id = register_document(&pool, KB_NAME_TREE, "tree", "tree.md", "").await?;
     mark_document_parsed(&pool, document_id, &json!({})).await?;
     replace_document_chunks(
         &pool,
@@ -428,7 +432,7 @@ async fn expand_neighbors_returns_tree_context_in_document_order() -> Result<()>
 
     // A second document reusing the same node ids must not leak into the
     // first document's expansion: traversal is document-scoped.
-    let other_id = register_document(&pool, KB_NAME_TREE, "other", "other.md").await?;
+    let other_id = register_document(&pool, KB_NAME_TREE, "other", "other.md", "").await?;
     mark_document_parsed(&pool, other_id, &json!({})).await?;
     replace_document_chunks(
         &pool,

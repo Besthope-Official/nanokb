@@ -40,6 +40,7 @@ pub struct Task {
     pub document_id: i64,
     pub filename: String,
     pub content: String,
+    pub source_dir: String,
     pub kb_name: String,
     pub status: TaskStatus,
     pub error_message: Option<String>,
@@ -56,6 +57,7 @@ impl TryFrom<TaskRow> for Task {
             document_id: row.document_id,
             filename: row.filename,
             content: row.content,
+            source_dir: row.source_dir,
             kb_name: row.kb_name,
             status,
             error_message: row.error_message,
@@ -121,6 +123,7 @@ async fn process_task(task: &Task, pipeline: &Pipeline, pool: &PgPool, progress:
         document_id: task.document_id,
         content: &task.content,
         filename: &task.filename,
+        source_dir: &task.source_dir,
         kb_name: &task.kb_name,
     };
     let result = pipeline
@@ -184,7 +187,8 @@ pub async fn update_file(
 ) -> Result<i64> {
     let content = read_supported(file_path)?
         .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
-    postgres::replace_document_content(pool, kb_name, document_id, &content).await?;
+    let source_dir = parent_dir_string(file_path);
+    postgres::replace_document_content(pool, kb_name, document_id, &content, &source_dir).await?;
     let task_id = postgres::insert_task(pool, document_id, priority).await?;
     postgres::notify_task_added(pool).await?;
     Ok(task_id)
@@ -216,7 +220,9 @@ pub async fn import_dir(
             continue;
         };
         let filename = utf8_filename(&path)?;
-        let document_id = postgres::register_document(pool, kb_name, &content, filename).await?;
+        let source_dir = dir_path.to_string();
+        let document_id =
+            postgres::register_document(pool, kb_name, &content, filename, &source_dir).await?;
         let task_id = postgres::insert_task(pool, document_id, priority).await?;
         task_ids.push(task_id);
     }
@@ -232,7 +238,15 @@ async fn register_file(pool: &PgPool, file_path: &Path, kb_name: &str) -> Result
     let content = read_supported(file_path)?
         .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
     let filename = utf8_filename(file_path)?;
-    postgres::register_document(pool, kb_name, &content, filename).await
+    let source_dir = parent_dir_string(file_path);
+    postgres::register_document(pool, kb_name, &content, filename, &source_dir).await
+}
+
+fn parent_dir_string(file_path: &Path) -> String {
+    file_path
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn utf8_filename(file_path: &Path) -> Result<&str> {

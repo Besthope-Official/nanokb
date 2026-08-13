@@ -455,6 +455,13 @@ fn chunk_lines<'a>(
             lines.push(format!("[HEADER] {}", result.heading_path.join(" > ")));
         }
         lines.push(format!("{prefix}{}", result.text));
+        for figure in &result.figures {
+            let blob_note = match &figure.blob {
+                Some(blob) => format!(" · blob {} bytes", blob.len()),
+                None => String::new(),
+            };
+            lines.push(format!("[FIGURE {}] {}{blob_note}", figure.src, figure.caption));
+        }
         lines.push("</chunk>".to_string());
     }
     lines
@@ -726,6 +733,7 @@ mod tests {
             sort_order,
             source: postgres::QueryChannel::Vec,
             text: text.to_string(),
+            figures: Vec::new(),
             markers: Vec::new(),
             distance: 0.0,
         }

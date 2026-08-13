@@ -3,16 +3,19 @@ use crate::config::{AppConfig, QueryMode};
 use crate::embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
 use crate::filter::Filter;
 use crate::llm::{LlmClient, TokenUsage};
-use crate::parser::Document;
+use crate::parser::{Document, Figure};
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use serde_json::json;
 use sqlx::PgPool;
+use std::path::Path;
 use std::sync::Arc;
 
 pub struct DocumentInput<'a> {
     pub document_id: i64,
     pub content: &'a str,
     pub filename: &'a str,
+    pub source_dir: &'a str,
     pub kb_name: &'a str,
 }
 
@@ -149,6 +152,39 @@ impl Pipeline {
         let chunks = &doc_chunks.chunks;
         let total = chunks.len();
 
+        let resolved_figures: Vec<Vec<Figure>> = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .figures
+                    .iter()
+                    .map(|figure| {
+                        if figure.src.starts_with("http://") || figure.src.starts_with("https://") {
+                            on_info(format!(
+                                "[{}] remote figure kept without blob: {}",
+                                input.filename, figure.src
+                            ));
+                            return Ok(Figure {
+                                src: figure.src.clone(),
+                                caption: figure.caption.clone(),
+                                description: figure.description.clone(),
+                                blob: None,
+                            });
+                        }
+                        let path = Path::new(input.source_dir).join(&figure.src);
+                        let bytes = std::fs::read(&path)
+                            .with_context(|| format!("failed to read figure {}", path.display()))?;
+                        Ok(Figure {
+                            src: figure.src.clone(),
+                            caption: figure.caption.clone(),
+                            description: figure.description.clone(),
+                            blob: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+                        })
+                    })
+                    .collect()
+            })
+            .collect::<Result<_>>()?;
+
         // Stage 3: Markers
         let markers = match &self.llm {
             Some(llm) => {
@@ -182,6 +218,7 @@ impl Pipeline {
                     chunk_seq: chunk.chunk_seq,
                     text: chunk.text.clone(),
                     blocks: chunk.blocks.clone(),
+                    figures: resolved_figures[chunk_idx].clone(),
                     embedding,
                     marker_embedding: Vec::new(),
                     markers: markers[chunk_idx].clone(),
