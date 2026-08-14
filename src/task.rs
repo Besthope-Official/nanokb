@@ -212,6 +212,13 @@ pub async fn import_dir(
         if path.is_dir() {
             continue;
         }
+        if is_reserved_okf_filename(&path) {
+            eprintln!(
+                "skipping {}: reserved okf filenames are not concept documents",
+                path.display()
+            );
+            continue;
+        }
         let Some(content) = read_supported(&path)? else {
             eprintln!(
                 "skipping {}: only markdown documents are supported so far",
@@ -254,6 +261,13 @@ fn utf8_filename(file_path: &Path) -> Result<&str> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| anyhow::anyhow!("non-UTF-8 filename: {}", file_path.display()))
+}
+
+fn is_reserved_okf_filename(file_path: &Path) -> bool {
+    matches!(
+        file_path.file_name().and_then(|n| n.to_str()),
+        Some("index.md") | Some("log.md")
+    )
 }
 
 /// Read `file_path` if its detected content type is supported, else `None`.
