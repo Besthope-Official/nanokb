@@ -4,13 +4,16 @@ use std::{collections::BTreeMap, fmt, path::Path};
 
 /// Typed accessors for the okf-defined fields of a frontmatter map.
 ///
-/// Frontmatter stays a flat yaml map so custom keys survive untouched; this
-/// trait lifts the [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
-/// fields (`type`, `title`, `description`, `resource`, `tags`, `timestamp`)
-/// out of it. Consumers tolerate a missing or malformed field: accessors fall
-/// back to `None` / empty rather than failing the document parse.
+/// Frontmatter stays a flat yaml map so custom keys and the `sources`
+/// provenance list survive untouched; this trait lifts the
+/// [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+/// fields (`type`, `title`, `description`, `resource`, `tags`, `generated.at`)
+/// out of it. `type` is required at parse time (`Document::from_content`
+/// fails on frontmatter without one); the remaining fields are optional and
+/// their accessors fall back to `None` / empty.
 pub trait FrontmatterExt {
-    /// The concept kind (`book`, `chapter`, `paper`, ...).
+    /// The concept kind (`book`, `chapter`, `paper`, ...). Optional here only
+    /// because stored jsonb may predate the parse-time requirement.
     fn okf_type(&self) -> Option<&str>;
     /// Human-readable display name.
     fn title(&self) -> Option<&str>;
@@ -20,8 +23,9 @@ pub trait FrontmatterExt {
     fn resource(&self) -> Option<&str>;
     /// Cross-cutting categorization; non-list values yield an empty list.
     fn tags(&self) -> Vec<String>;
-    /// Iso 8601 timestamp of the last meaningful change.
-    fn timestamp(&self) -> Option<&str>;
+    /// Iso 8601 datetime of the content's last meaningful change
+    /// (okf v0.2 `generated.at`, which supersedes the v0.1 `timestamp`).
+    fn generated_at(&self) -> Option<&str>;
 }
 
 impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
@@ -53,8 +57,11 @@ impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
             .unwrap_or_default()
     }
 
-    fn timestamp(&self) -> Option<&str> {
-        self.get("timestamp").and_then(|v| v.as_str())
+    fn generated_at(&self) -> Option<&str> {
+        self.get("generated")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get("at"))
+            .and_then(|v| v.as_str())
     }
 }
 
@@ -221,6 +228,15 @@ impl Document {
     pub fn from_content(content: &str, filename: &str) -> Result<Self> {
         let frontmatter = parse_frontmatter(content);
         let body = strip_frontmatter(content).unwrap_or(content);
+        let has_type = frontmatter
+            .as_ref()
+            .and_then(|m| m.get("type"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|t| !t.is_empty());
+        anyhow::ensure!(
+            has_type,
+            "document '{filename}' is missing the required okf 'type' field"
+        );
         let metadata = DocumentMetadata {
             filename: filename.to_owned(),
             frontmatter,
@@ -546,16 +562,7 @@ fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
     let yaml_section = &remains[..yaml_len];
     let _body = &remains[yaml_len + closing_len..];
     match yaml_serde::from_str::<BTreeMap<String, yaml_serde::Value>>(yaml_section) {
-        Ok(metadata) => {
-            if !metadata
-                .get("type")
-                .and_then(|v| v.as_str())
-                .is_some_and(|t| !t.is_empty())
-            {
-                eprintln!("[WARN] frontmatter missing the required okf 'type' field");
-            }
-            Some(metadata)
-        }
+        Ok(metadata) => Some(metadata),
         Err(e) => {
             eprintln!("[WARN] invalid frontmatter yaml, skipping metadata: {e}");
             None

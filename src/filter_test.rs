@@ -2,7 +2,8 @@ use super::*;
 use crate::parser::Document;
 
 fn dropped_titles(markdown: &str) -> Vec<String> {
-    let (_, dropped) = Document::from_content(markdown, "a.md")
+    let with_type = format!("---\ntype: doc\n---\n{markdown}");
+    let (_, dropped) = Document::from_content(&with_type, "a.md")
         .unwrap()
         .into_parsed()
         .filter(&[Filter::DropReference]);

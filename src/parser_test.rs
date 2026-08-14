@@ -4,7 +4,7 @@ use rstest::*;
 #[test]
 fn from_content_loads_frontmatter_and_body() {
     let document = Document::from_content(
-        "---\ntitle: Guide\nauthor: NanoKB\n---\n\n# Intro\nBody",
+        "---\ntype: chapter\ntitle: Guide\nauthor: NanoKB\n---\n\n# Intro\nBody",
         "guide.md",
     )
     .unwrap();
@@ -19,38 +19,41 @@ fn from_content_loads_frontmatter_and_body() {
 #[rstest]
 #[case::plain_body("plain body")]
 #[case::with_frontmatter("---\ntitle: \"hello\"\n---\nbody")]
-fn from_content_uses_file_name_as_title(#[case] content: &str) {
-    let document = Document::from_content(content, "fallback-title.md").unwrap();
+fn from_content_requires_okf_type(#[case] content: &str) {
+    let result = Document::from_content(content, "fallback-title.md");
 
-    assert_eq!(document.metadata.filename, "fallback-title.md");
+    assert!(result.is_err(), "content without an okf 'type' must be rejected");
 }
 
 #[rstest]
 #[case::single_key(
-    "---\ntitle: hello\n---\nbody text",
-    &[("title", "hello")],
+    "---\ntype: chapter\ntitle: hello\n---\nbody text",
+    &[("type", "chapter"), ("title", "hello")],
     "body text",
 )]
 #[case::quoted_values(
-    "---\ntitle: \"hello world\"\nauthor: 'Nano KB'\n---\nbody",
-    &[("title", "hello world"), ("author", "Nano KB")],
+    "---\ntype: chapter\ntitle: \"hello world\"\nauthor: 'Nano KB'\n---\nbody",
+    &[("type", "chapter"), ("title", "hello world"), ("author", "Nano KB")],
     "body",
 )]
 #[case::multiple_keys(
-    "---\ntitle: foo\ndate: 2024-01-01\ntags: rust, kb\n---\n\n# Heading\ncontent",
-    &[("title", "foo"), ("date", "2024-01-01"), ("tags", "rust, kb")],
+    "---\ntype: chapter\ntitle: foo\ndate: 2024-01-01\ntags: rust, kb\n---\n\n# Heading\ncontent",
+    &[("type", "chapter"), ("title", "foo"), ("date", "2024-01-01"), ("tags", "rust, kb")],
     "\n# Heading\ncontent",
 )]
-#[case::empty_frontmatter("---\n---\nbody", &[], "body")]
-#[case::empty_body("---\ntitle: x\n---\n", &[("title", "x")], "")]
-#[case::trimmed_key_and_colon_in_value(
-    "---\n title : \"hello: world\" \n---\nbody",
-    &[("title", "hello: world")],
+#[case::empty_body(
+    "---\ntype: chapter\ntitle: x\n---\n",
+    &[("type", "chapter"), ("title", "x")],
+    "",
+)]
+#[case::colon_in_value(
+    "---\ntype: chapter\ntitle: \"hello: world\"\n---\nbody",
+    &[("type", "chapter"), ("title", "hello: world")],
     "body",
 )]
 #[case::crlf(
-    "---\r\ntitle: hello\r\n---\r\nfirst\r\nsecond",
-    &[("title", "hello")],
+    "---\r\ntype: chapter\r\ntitle: hello\r\n---\r\nfirst\r\nsecond",
+    &[("type", "chapter"), ("title", "hello")],
     "first\r\nsecond",
 )]
 fn frontmatter_parses_metadata_and_preserves_body(
@@ -74,13 +77,13 @@ fn frontmatter_parses_metadata_and_preserves_body(
 
 #[test]
 fn frontmatter_accepts_yaml_comments_and_blank_lines() {
-    let frontmatter = parse_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody");
+    let frontmatter = parse_frontmatter("---\n\n# comment\ntype: chapter\ntitle: kept\n---\nbody");
 
     let metadata = frontmatter.unwrap();
-    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata.len(), 2);
     assert_eq!(metadata.get("title").and_then(|v| v.as_str()), Some("kept"));
     assert_eq!(
-        strip_frontmatter("---\n\n# comment\ntitle: kept\n---\nbody"),
+        strip_frontmatter("---\n\n# comment\ntype: chapter\ntitle: kept\n---\nbody"),
         Some("body")
     );
 }
@@ -113,7 +116,8 @@ fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
 fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
     let frontmatter = parse_frontmatter(
         "---\ntype: chapter\ntitle: Guide\ndescription: A short guide.\n\
-         resource: https://example.com/guide\ntags: [kb, rust]\ntimestamp: 2026-08-13\n\
+         resource: https://example.com/guide\ntags: [kb, rust]\n\
+         generated: { by: human:besthope, at: 2026-08-13 }\n\
          book: ddia\n---\nbody",
     )
     .unwrap();
@@ -123,25 +127,33 @@ fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
     assert_eq!(frontmatter.description(), Some("A short guide."));
     assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
     assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
-    assert_eq!(frontmatter.timestamp(), Some("2026-08-13"));
+    assert_eq!(frontmatter.generated_at(), Some("2026-08-13"));
     assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
 }
 
 #[test]
 fn frontmatter_ext_tolerates_scalar_tags() {
-    let frontmatter = parse_frontmatter("---\ntags: rust, kb\n---\nbody").unwrap();
+    let frontmatter = parse_frontmatter("---\ntype: chapter\ntags: rust, kb\n---\nbody").unwrap();
 
     assert!(frontmatter.tags().is_empty());
 }
 
 #[test]
-fn frontmatter_ext_defaults_missing_fields() {
-    let frontmatter = parse_frontmatter("---\n---\nbody").unwrap();
+fn frontmatter_ext_defaults_optional_fields() {
+    let frontmatter = parse_frontmatter("---\ntype: chapter\n---\nbody").unwrap();
 
-    assert_eq!(frontmatter.okf_type(), None);
+    assert_eq!(frontmatter.okf_type(), Some("chapter"));
     assert_eq!(frontmatter.title(), None);
     assert!(frontmatter.tags().is_empty());
-    assert_eq!(frontmatter.timestamp(), None);
+    assert_eq!(frontmatter.generated_at(), None);
+}
+
+#[test]
+fn parse_frontmatter_keeps_type_less_yaml() {
+    let frontmatter = parse_frontmatter("---\ntitle: Guide\n---\nbody");
+
+    assert!(frontmatter.is_some());
+    assert_eq!(strip_frontmatter("---\ntitle: Guide\n---\nbody"), Some("body"));
 }
 
 #[test]
@@ -258,7 +270,8 @@ fn image_immediately_followed_by_text_gets_a_space() {
 }
 
 fn parse(content: &str) -> StructuredDocument {
-    Document::from_content(content, "math.md")
+    let with_type = format!("---\ntype: doc\n---\n{content}");
+    Document::from_content(&with_type, "math.md")
         .unwrap()
         .into_parsed()
 }

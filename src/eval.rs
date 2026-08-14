@@ -665,7 +665,6 @@ struct CorpusDoc {
     author: Option<String>,
     source: String,
     category: String,
-    published_at: String,
     url: String,
     body: String,
 }
@@ -756,8 +755,8 @@ fn doc_filename(index: usize, title: &str) -> String {
 }
 
 /// Render a CorpusDoc as markdown with okf frontmatter: `url` becomes the
-/// okf `resource` and `published_at` the okf `timestamp`; the rest stays as
-/// custom keys.
+/// okf `resource`; the rest stays as custom keys. `generated.by` names the
+/// conversion process.
 fn doc_markdown(doc: &CorpusDoc) -> String {
     let mut out = String::from("---\n");
     out.push_str("type: article\n");
@@ -766,7 +765,7 @@ fn doc_markdown(doc: &CorpusDoc) -> String {
         out.push_str(&format!("author: {}\n", yaml_quoted(author)));
     }
     out.push_str(&format!("resource: {}\n", yaml_quoted(&doc.url)));
-    out.push_str(&format!("timestamp: {}\n", yaml_quoted(&doc.published_at)));
+    out.push_str("generated: { by: process:nanokb-eval }\n");
     out.push_str(&format!("source: {}\n", yaml_quoted(&doc.source)));
     out.push_str(&format!("category: {}\n", yaml_quoted(&doc.category)));
     out.push_str("---\n\n");
