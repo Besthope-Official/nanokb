@@ -49,7 +49,7 @@ fn start_multi_mock_server(responses: Vec<(u16, &'static str)>) -> String {
 
             let status_text = if status_code == 200 { "OK" } else { "Internal Server Error" };
             let response = format!(
-                "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_json.len(),
                 response_json
             );

@@ -5,7 +5,7 @@ use crate::pipeline::Pipeline;
 use crate::rerank::RerankClient;
 use crate::retrieve;
 use crate::filter::Filter;
-use crate::{AppConfig, postgres, task};
+use crate::{AppConfig, pdf, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -185,6 +185,11 @@ enum TopLevelCommand {
         #[arg(short = 'l', long = "filter")]
         filters: Vec<Filter>,
     },
+    #[command(about = "Slice and OCR PDFs with the PaddleOCR pipeline")]
+    Pdf {
+        #[command(subcommand)]
+        command: PdfCommand,
+    },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
 }
@@ -233,6 +238,24 @@ enum DocCommand {
     List {
         #[arg(short = 'n', long = "name")]
         kb: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum PdfCommand {
+    #[command(about = "Slice a PDF into per-slice files in the cache (no API calls)")]
+    Slice {
+        file: PathBuf,
+        /// Pages per slice; defaults to config pdf.slice_pages.
+        #[arg(long)]
+        slice_pages: Option<usize>,
+    },
+    #[command(about = "Slice a PDF, OCR every slice via PaddleOCR, cache raw results")]
+    Probe {
+        file: PathBuf,
+        /// Pages per slice; defaults to config pdf.slice_pages.
+        #[arg(long)]
+        slice_pages: Option<usize>,
     },
 }
 
@@ -301,8 +324,22 @@ pub async fn run() -> Result<()> {
             expand_depth,
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
+        TopLevelCommand::Pdf {
+            command: PdfCommand::Slice { file, slice_pages },
+        } => run_pdf_slice(&config, &file, slice_pages).await,
+        TopLevelCommand::Pdf {
+            command: PdfCommand::Probe { file, slice_pages },
+        } => run_pdf_probe(&config, &file, slice_pages).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
+}
+
+async fn run_pdf_slice(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
+    pdf::slice_to_cache(file, slice_pages.unwrap_or(config.pdf.slice_pages), &config.pdf.model).await
+}
+
+async fn run_pdf_probe(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
+    pdf::run_probe(&config.pdf, file, slice_pages.unwrap_or(config.pdf.slice_pages)).await
 }
 
 async fn run_kb_list(pool: &sqlx::PgPool) -> Result<()> {
@@ -797,6 +834,31 @@ mod tests {
         assert!(matches!(
             cli.command,
             TopLevelCommand::Query { expand: true, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_pdf_slice_with_slice_pages() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "pdf", "slice", "book.pdf", "--slice-pages", "30"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Pdf {
+                command: PdfCommand::Slice { file, slice_pages },
+            } if file.as_path() == Path::new("book.pdf") && slice_pages == Some(30)
+        ));
+    }
+
+    #[test]
+    fn parses_pdf_probe() {
+        let cli = Cli::try_parse_from(["nanokb", "pdf", "probe", "book.pdf"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Pdf {
+                command: PdfCommand::Probe { file, slice_pages },
+            } if file.as_path() == Path::new("book.pdf") && slice_pages.is_none()
         ));
     }
 

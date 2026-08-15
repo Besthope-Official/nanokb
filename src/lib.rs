@@ -32,6 +32,9 @@ pub mod task;
 pub mod pipeline;
 pub use pipeline::Pipeline;
 
+pub mod pdf;
+pub use pdf::{ApiErrorKind, CacheLayout, JobState, OcrError, PaddleOcrClient, PdfDocument, cache_key};
+
 pub mod prune;
 pub use prune::PruneRule;
 

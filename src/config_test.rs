@@ -319,6 +319,37 @@ fn pipeline_config_defaults_llm_to_none() {
     assert!(config.llm.is_none());
 }
 
+#[test]
+fn pdf_config_defaults_when_absent() {
+    let config = parse_config(
+        &format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}"),
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    assert_eq!(config.pdf.api_base, "https://paddleocr.aistudio-app.com");
+    assert_eq!(config.pdf.model, "PaddleOCR-VL-1.6");
+    assert_eq!(config.pdf.slice_pages, 20);
+    assert!(config.pdf.access_token.is_empty());
+}
+
+#[test]
+fn pdf_config_rejects_unknown_field() {
+    let error = parse_config(
+        &format!(
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pdf:\n  wat: 1\n"
+        ),
+        &HashMap::new(),
+    )
+    .err()
+    .unwrap();
+
+    assert!(
+        error.to_string().contains("unknown field `wat`"),
+        "{error:#}"
+    );
+}
+
 const FULL_MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: BAAI/bge-m3\n      api_base: \"https://api.siliconflow.cn/v1\"\n      api_key: \"sk-test-key\"\n  llms:\n    deepseek:\n      model_name: deepseek-v4-flash-0731\n      api_base: https://api.deepseek.com/v1\n      api_key: sk-test\n";
 
 const LLM_PIPELINE_BLOCK: &str = "pipeline:\n  llm: deepseek\n";
