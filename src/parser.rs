@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::{collections::BTreeMap, fmt, path::Path};
 
@@ -272,17 +272,27 @@ fn collect_content_texts(
 impl Document {
     /// Parse markdown content into a Document.
     pub fn from_content(content: &str, filename: &str) -> Result<Self> {
-        let frontmatter = parse_frontmatter(content);
+        let frontmatter = parse_frontmatter(content)
+            .with_context(|| format!("document '{filename}' has invalid frontmatter yaml"))?;
         let body = strip_frontmatter(content).unwrap_or(content);
-        let has_type = frontmatter
-            .as_ref()
-            .and_then(|m| m.get("type"))
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| !t.is_empty());
-        anyhow::ensure!(
-            has_type,
-            "document '{filename}' is missing the required okf 'type' field"
-        );
+        match frontmatter {
+            None => {
+                anyhow::bail!(
+                    "document '{filename}' has no frontmatter; \
+                     a concept document needs an okf 'type' field"
+                )
+            }
+            Some(ref frontmatter) => {
+                let has_type = frontmatter
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !t.is_empty());
+                anyhow::ensure!(
+                    has_type,
+                    "document '{filename}' is missing the required okf 'type' field"
+                );
+            }
+        }
         let metadata = DocumentMetadata {
             filename: filename.to_owned(),
             frontmatter,
@@ -589,10 +599,13 @@ fn render_markdown_table(rows: &[String], col_count: usize) -> String {
     lines.join("\n")
 }
 
-fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
-    let remains = raw
+fn parse_frontmatter(raw: &str) -> Result<Option<BTreeMap<String, yaml_serde::Value>>> {
+    let Some(remains) = raw
         .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))?;
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
+        return Ok(None);
+    };
 
     let mut yaml_len = 0;
     let mut closing_len = None;
@@ -604,16 +617,13 @@ fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
         yaml_len += line.len();
     }
 
-    let closing_len = closing_len?;
-    let yaml_section = &remains[..yaml_len];
-    let _body = &remains[yaml_len + closing_len..];
-    match yaml_serde::from_str::<BTreeMap<String, yaml_serde::Value>>(yaml_section) {
-        Ok(metadata) => Some(metadata),
-        Err(e) => {
-            eprintln!("[WARN] invalid frontmatter yaml, skipping metadata: {e}");
-            None
-        }
+    if closing_len.is_none() {
+        return Ok(None);
     }
+    let yaml_section = &remains[..yaml_len];
+    yaml_serde::from_str::<BTreeMap<String, yaml_serde::Value>>(yaml_section)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
 }
 
 fn strip_frontmatter(raw: &str) -> Option<&str> {

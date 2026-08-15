@@ -25,6 +25,39 @@ fn from_content_requires_okf_type(#[case] content: &str) {
     assert!(result.is_err(), "content without an okf 'type' must be rejected");
 }
 
+#[test]
+fn from_content_distinguishes_missing_frontmatter_from_missing_type() {
+    let error = Document::from_content("plain body", "a.md")
+        .err()
+        .expect("expected an error");
+    assert!(
+        error.to_string().contains("has no frontmatter"),
+        "{error:#}"
+    );
+
+    let error = Document::from_content("---\ntitle: x\n---\nbody", "a.md")
+        .err()
+        .expect("expected an error");
+    assert!(
+        error
+            .to_string()
+            .contains("missing the required okf 'type' field"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn from_content_rejects_invalid_frontmatter_yaml() {
+    let error = Document::from_content("---\ntitle: [unterminated\n---\nbody", "a.md")
+        .err()
+        .expect("expected an error");
+
+    assert!(
+        error.to_string().contains("invalid frontmatter yaml"),
+        "{error:#}"
+    );
+}
+
 #[rstest]
 #[case::single_key(
     "---\ntype: chapter\ntitle: hello\n---\nbody text",
@@ -61,7 +94,7 @@ fn frontmatter_parses_metadata_and_preserves_body(
     #[case] expected_metadata: &[(&str, &str)],
     #[case] expected_body: &str,
 ) {
-    let frontmatter = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input).unwrap();
 
     match frontmatter {
         Some(metadata) => {
@@ -77,7 +110,7 @@ fn frontmatter_parses_metadata_and_preserves_body(
 
 #[test]
 fn frontmatter_accepts_yaml_comments_and_blank_lines() {
-    let frontmatter = parse_frontmatter("---\n\n# comment\ntype: chapter\ntitle: kept\n---\nbody");
+    let frontmatter = parse_frontmatter("---\n\n# comment\ntype: chapter\ntitle: kept\n---\nbody").unwrap();
 
     let metadata = frontmatter.unwrap();
     assert_eq!(metadata.len(), 2);
@@ -89,10 +122,10 @@ fn frontmatter_accepts_yaml_comments_and_blank_lines() {
 }
 
 #[test]
-fn frontmatter_discards_invalid_yaml_metadata() {
+fn frontmatter_rejects_invalid_yaml() {
     let frontmatter = parse_frontmatter("---\ntitle: [unterminated\n---\nbody");
 
-    assert!(frontmatter.is_none());
+    assert!(frontmatter.is_err());
     assert_eq!(
         strip_frontmatter("---\ntitle: [unterminated\n---\nbody"),
         Some("body")
@@ -106,7 +139,7 @@ fn frontmatter_discards_invalid_yaml_metadata() {
 #[case::leading_blank_line("\n---\ntitle: x\n---\nbody")]
 #[case::near_miss_delimiter("----\ntitle: x\n---\nbody")]
 fn frontmatter_returns_raw_input_without_a_valid_block(#[case] input: &str) {
-    let frontmatter = parse_frontmatter(input);
+    let frontmatter = parse_frontmatter(input).unwrap();
 
     assert!(frontmatter.is_none());
     assert_eq!(strip_frontmatter(input), None);
@@ -120,6 +153,7 @@ fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
          generated: { by: human:besthope, at: 2026-08-13 }\n\
          book: ddia\n---\nbody",
     )
+    .unwrap()
     .unwrap();
 
     assert_eq!(frontmatter.okf_type(), Some("chapter"));
@@ -164,14 +198,14 @@ fn frontmatter_ext_defaults_generated_by() {
 
 #[test]
 fn frontmatter_ext_tolerates_scalar_tags() {
-    let frontmatter = parse_frontmatter("---\ntype: chapter\ntags: rust, kb\n---\nbody").unwrap();
+    let frontmatter = parse_frontmatter("---\ntype: chapter\ntags: rust, kb\n---\nbody").unwrap().unwrap();
 
     assert!(frontmatter.tags().is_empty());
 }
 
 #[test]
 fn frontmatter_ext_defaults_optional_fields() {
-    let frontmatter = parse_frontmatter("---\ntype: chapter\n---\nbody").unwrap();
+    let frontmatter = parse_frontmatter("---\ntype: chapter\n---\nbody").unwrap().unwrap();
 
     assert_eq!(frontmatter.okf_type(), Some("chapter"));
     assert_eq!(frontmatter.title(), None);
@@ -181,7 +215,7 @@ fn frontmatter_ext_defaults_optional_fields() {
 
 #[test]
 fn parse_frontmatter_keeps_type_less_yaml() {
-    let frontmatter = parse_frontmatter("---\ntitle: Guide\n---\nbody");
+    let frontmatter = parse_frontmatter("---\ntitle: Guide\n---\nbody").unwrap();
 
     assert!(frontmatter.is_some());
     assert_eq!(strip_frontmatter("---\ntitle: Guide\n---\nbody"), Some("body"));
