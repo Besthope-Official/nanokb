@@ -2,6 +2,7 @@ use crate::config::QueryMode;
 use crate::embed::embed_model_for_kb;
 use crate::postgres;
 use crate::rerank::{RerankClient, rrf_fusion};
+use crate::filter::Filter;
 use crate::AppConfig;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -38,17 +39,18 @@ pub async fn retrieve_candidates(
     mode: QueryMode,
     query_text: &str,
     limit: usize,
+    filters: &[Filter],
 ) -> Result<Vec<postgres::QueryResult>> {
     match mode {
         QueryMode::Vector => {
             let model = embed_model_for_kb(config, meta).await?;
             let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_chunks(pool, kb_name, &embedding, limit).await?)
+            Ok(postgres::query_chunks(pool, kb_name, &embedding, limit, filters).await?)
         }
         QueryMode::Marker => {
             let model = embed_model_for_kb(config, meta).await?;
             let embedding = model.embed_query(query_text).await?;
-            Ok(postgres::query_markers(pool, kb_name, &embedding, limit).await?)
+            Ok(postgres::query_markers(pool, kb_name, &embedding, limit, filters).await?)
         }
         QueryMode::Hybrid => {
             let model = embed_model_for_kb(config, meta).await?;
@@ -56,10 +58,10 @@ pub async fn retrieve_candidates(
 
             let (marker_results, vector_results) = tokio::join!(
                 async {
-                    postgres::query_markers(pool, kb_name, &query_emb, limit).await
+                    postgres::query_markers(pool, kb_name, &query_emb, limit, filters).await
                 },
                 async {
-                    postgres::query_chunks(pool, kb_name, &query_emb, limit).await
+                    postgres::query_chunks(pool, kb_name, &query_emb, limit, filters).await
                 },
             );
 

@@ -8,7 +8,7 @@ pub mod embed;
 pub use embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks, embed_model_for_kb};
 
 pub mod filter;
-pub use filter::Filter;
+pub use filter::{Filter, FilterOp, where_clause};
 
 pub mod llm;
 pub use llm::{ChatMessage, LlmClient};
@@ -31,6 +31,9 @@ pub mod task;
 
 pub mod pipeline;
 pub use pipeline::Pipeline;
+
+pub mod prune;
+pub use prune::PruneRule;
 
 pub mod cli;
 

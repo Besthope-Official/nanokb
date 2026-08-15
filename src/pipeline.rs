@@ -1,7 +1,7 @@
 use crate::chunker::ChunkStrategy;
 use crate::config::{AppConfig, QueryMode};
 use crate::embed::{EmbedClient, EmbedModel, EmbeddedChunk, EmbeddedChunks};
-use crate::filter::Filter;
+use crate::prune::PruneRule;
 use crate::llm::{LlmClient, TokenUsage};
 use crate::parser::{Document, Figure};
 use anyhow::{Context, Result};
@@ -135,7 +135,7 @@ impl Pipeline {
         let document = Document::from_content(input.content, input.filename)?;
         let frontmatter = serde_json::to_value(&document.metadata.frontmatter)
             .context("failed to serialize document frontmatter")?;
-        let (document, dropped) = document.into_parsed().filter(&[Filter::DropReference]);
+        let (document, dropped) = document.into_parsed().prune(&[PruneRule::DropReference]);
         if !dropped.is_empty() {
             on_info(format!(
                 "[{}] dropped {} reference section(s): {}",
@@ -188,14 +188,13 @@ impl Pipeline {
         // Stage 3: Markers
         let markers = match &self.llm {
             Some(llm) => {
-                let markers = crate::markers::generate_document_markers(
+                crate::markers::generate_document_markers(
                     Arc::clone(llm),
-                    &chunks,
+                    chunks,
                     self.llm_concurrency,
                     on_stage,
                 )
-                .await?;
-                markers
+                .await?
             }
             None => vec![Vec::new(); chunks.len()],
         };

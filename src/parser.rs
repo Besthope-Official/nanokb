@@ -1,6 +1,115 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use std::{collections::BTreeMap, fmt, path::Path};
+
+/// Typed accessors for the okf-defined fields of a frontmatter map.
+///
+/// Frontmatter stays a flat yaml map so custom keys and the `sources`
+/// provenance list survive untouched; this trait lifts the
+/// [Open Knowledge Format](https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md)
+/// fields (`type`, `title`, `description`, `resource`, `tags`, `generated.at`)
+/// out of it. `type` is required at parse time (`Document::from_content`
+/// fails on frontmatter without one); the remaining fields are optional and
+/// their accessors fall back to `None` / empty.
+pub trait FrontmatterExt {
+    /// The concept kind (`book`, `chapter`, `paper`, ...). Optional here only
+    /// because stored jsonb may predate the parse-time requirement.
+    fn okf_type(&self) -> Option<&str>;
+    /// Human-readable display name.
+    fn title(&self) -> Option<&str>;
+    /// One-sentence summary.
+    fn description(&self) -> Option<&str>;
+    /// Canonical uri identifying the underlying asset.
+    fn resource(&self) -> Option<&str>;
+    /// Cross-cutting categorization; non-list values yield an empty list.
+    fn tags(&self) -> Vec<String>;
+    /// Iso 8601 datetime of the content's last meaningful change
+    /// (okf v0.2 `generated.at`, which supersedes the v0.1 `timestamp`).
+    fn generated_at(&self) -> Option<&str>;
+    fn generated_by(&self) -> Option<&str>;
+}
+
+impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
+    fn okf_type(&self) -> Option<&str> {
+        self.get("type").and_then(|v| v.as_str())
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.get("title").and_then(|v| v.as_str())
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.get("description").and_then(|v| v.as_str())
+    }
+
+    fn resource(&self) -> Option<&str> {
+        self.get("resource").and_then(|v| v.as_str())
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.get("tags")
+            .and_then(|v| v.as_sequence())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn generated_at(&self) -> Option<&str> {
+        self.get("generated")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get("at"))
+            .and_then(|v| v.as_str())
+    }
+
+    fn generated_by(&self) -> Option<&str> {
+        self.get("generated")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get("by"))
+            .and_then(|v| v.as_str())
+    }
+}
+
+impl FrontmatterExt for serde_json::Value {
+    fn okf_type(&self) -> Option<&str> {
+        self.get("type").and_then(|v| v.as_str())
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.get("title").and_then(|v| v.as_str())
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.get("description").and_then(|v| v.as_str())
+    }
+
+    fn resource(&self) -> Option<&str> {
+        self.get("resource").and_then(|v| v.as_str())
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.get("tags")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn generated_at(&self) -> Option<&str> {
+        self.get("generated").and_then(|m| m.get("at")).and_then(|v| v.as_str())
+    }
+
+    fn generated_by(&self) -> Option<&str> {
+        self.get("generated").and_then(|m| m.get("by")).and_then(|v| v.as_str())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DocumentMetadata {
@@ -163,8 +272,27 @@ fn collect_content_texts(
 impl Document {
     /// Parse markdown content into a Document.
     pub fn from_content(content: &str, filename: &str) -> Result<Self> {
-        let frontmatter = parse_frontmatter(content);
+        let frontmatter = parse_frontmatter(content)
+            .with_context(|| format!("document '{filename}' has invalid frontmatter yaml"))?;
         let body = strip_frontmatter(content).unwrap_or(content);
+        match frontmatter {
+            None => {
+                anyhow::bail!(
+                    "document '{filename}' has no frontmatter; \
+                     a concept document needs an okf 'type' field"
+                )
+            }
+            Some(ref frontmatter) => {
+                let has_type = frontmatter
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|t| !t.is_empty());
+                anyhow::ensure!(
+                    has_type,
+                    "document '{filename}' is missing the required okf 'type' field"
+                );
+            }
+        }
         let metadata = DocumentMetadata {
             filename: filename.to_owned(),
             frontmatter,
@@ -471,10 +599,13 @@ fn render_markdown_table(rows: &[String], col_count: usize) -> String {
     lines.join("\n")
 }
 
-fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
-    let remains = raw
+fn parse_frontmatter(raw: &str) -> Result<Option<BTreeMap<String, yaml_serde::Value>>> {
+    let Some(remains) = raw
         .strip_prefix("---\n")
-        .or_else(|| raw.strip_prefix("---\r\n"))?;
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
+        return Ok(None);
+    };
 
     let mut yaml_len = 0;
     let mut closing_len = None;
@@ -486,16 +617,13 @@ fn parse_frontmatter(raw: &str) -> Option<BTreeMap<String, yaml_serde::Value>> {
         yaml_len += line.len();
     }
 
-    let closing_len = closing_len?;
-    let yaml_section = &remains[..yaml_len];
-    let _body = &remains[yaml_len + closing_len..];
-    match yaml_serde::from_str(yaml_section) {
-        Ok(m) => Some(m),
-        Err(e) => {
-            eprintln!("[WARN] invalid frontmatter yaml, skipping metadata: {e}");
-            None
-        }
+    if closing_len.is_none() {
+        return Ok(None);
     }
+    let yaml_section = &remains[..yaml_len];
+    yaml_serde::from_str::<BTreeMap<String, yaml_serde::Value>>(yaml_section)
+        .map(Some)
+        .map_err(anyhow::Error::msg)
 }
 
 fn strip_frontmatter(raw: &str) -> Option<&str> {

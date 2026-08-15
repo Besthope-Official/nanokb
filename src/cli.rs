@@ -1,8 +1,10 @@
 use crate::chunker::ChunkStrategy;
 use crate::config::QueryMode;
+use crate::parser::{Figure, FrontmatterExt};
 use crate::pipeline::Pipeline;
 use crate::rerank::RerankClient;
 use crate::retrieve;
+use crate::filter::Filter;
 use crate::{AppConfig, postgres, task};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -177,6 +179,11 @@ enum TopLevelCommand {
         /// How many ancestor levels to walk (1 = direct parent, 2 = grandparent).
         #[arg(long)]
         expand_depth: Option<usize>,
+        /// Filter chunks by frontmatter, kubectl-style; repeatable, AND
+        /// semantics. `key=value` matches scalar equality or array containment;
+        /// `key!=value` matches missing keys and differing values.
+        #[arg(short = 'l', long = "filter")]
+        filters: Vec<Filter>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -292,7 +299,8 @@ pub async fn run() -> Result<()> {
             reranker,
             expand,
             expand_depth,
-        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth).await,
+            filters,
+        } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -375,6 +383,7 @@ async fn run_query(
     reranker_name: Option<&str>,
     expand: bool,
     expand_depth: Option<usize>,
+    filters: &[Filter],
 ) -> Result<()> {
     let meta = postgres::load_kb_meta(pool, kb_name).await?;
     let retrieval_defaults: crate::config::RetrievalConfig =
@@ -411,19 +420,19 @@ async fn run_query(
     let limit = if reranker.is_some() { top_k * 4 } else { top_k };
 
     let mut candidates =
-        retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit)
+        retrieve::retrieve_candidates(config, pool, kb_name, &meta, effective_mode, query_text, limit, filters)
             .await?;
     if expand {
         let neighbors =
-            postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
+            postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth, filters).await?;
         candidates = retrieve::merge_with_neighbors(candidates, neighbors);
     }
 
     match &reranker {
         Some(reranker) => {
             let ordered = retrieve::rerank_ordered(reranker, query_text, candidates, top_k).await?;
-            print_chunks(ordered.iter().map(|(score, result)| {
-                (format!("[{score:.4} RERANK] [{}] ", result.source), result)
+            print_results(ordered.iter().map(|(score, result)| {
+                (*score, "RERANK".to_string(), result)
             }));
         }
         None => {
@@ -433,8 +442,8 @@ async fn run_query(
             if !expand {
                 candidates.truncate(top_k);
             }
-            print_chunks(candidates.iter().map(|r| {
-                (format!("[{:.4} {}] ", r.distance, r.source), r)
+            print_results(candidates.iter().map(|r| {
+                (r.distance, r.source.to_string(), r)
             }));
         }
     }
@@ -442,35 +451,161 @@ async fn run_query(
     Ok(())
 }
 
-/// Render query results as self-describing chunk elements: every chunk is
-/// wrapped in `<chunk>` tags, with a `[HEADER]` line carrying its heading
-/// path and one content line. The path never touches the chunk text itself.
-fn chunk_lines<'a>(
-    rows: impl IntoIterator<Item = (String, &'a postgres::QueryResult)>,
+fn result_lines<'a>(
+    rows: impl IntoIterator<Item = (f64, String, &'a postgres::QueryResult)>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
-    for (prefix, result) in rows {
-        lines.push("<chunk>".to_string());
+    for (score, channel, result) in rows {
+        let leaf = result.heading_path.last().map(String::as_str);
+        lines.push("<result>".to_string());
+        lines.push(format!(
+            "{:<8} {}",
+            "[title]",
+            result_title(&result.filename, &result.frontmatter, leaf)
+        ));
+        lines.push(format!(
+            "{:<8} {}",
+            "[url]",
+            result_url(&result.filename, &result.frontmatter, leaf)
+        ));
+        if let Some(date) = result_date(&result.frontmatter) {
+            lines.push(format!("{:<8} {}", "[date]", date));
+        }
+        lines.push(format!("{:<8} {score:.2} · {channel}", "[score]"));
         if !result.heading_path.is_empty() {
-            lines.push(format!("[HEADER] {}", result.heading_path.join(" > ")));
+            lines.push(format!("{:<8} {}", "[path]", result.heading_path.join(" > ")));
         }
-        lines.push(format!("{prefix}{}", result.text));
         for figure in &result.figures {
-            let blob_note = match &figure.blob {
-                Some(blob) => format!(" · blob {} bytes", blob.len()),
-                None => String::new(),
-            };
-            lines.push(format!("[FIGURE {}] {}{blob_note}", figure.src, figure.caption));
+            lines.push(format!("{:<8} {}", "[figure]", figure_line(figure)));
         }
-        lines.push("</chunk>".to_string());
+        lines.push(result.text.clone());
+        lines.push("</result>".to_string());
     }
     lines
 }
 
-fn print_chunks<'a>(rows: impl IntoIterator<Item = (String, &'a postgres::QueryResult)>) {
-    for line in chunk_lines(rows) {
+fn print_results<'a>(rows: impl IntoIterator<Item = (f64, String, &'a postgres::QueryResult)>) {
+    for line in result_lines(rows) {
         println!("{line}");
     }
+}
+
+fn result_title(filename: &str, frontmatter: &serde_json::Value, leaf: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(book) = frontmatter.get("book").and_then(|v| v.as_str()) {
+        parts.push(book.to_string());
+    }
+    match (
+        frontmatter.get("chapter").and_then(chapter_label),
+        frontmatter.title(),
+    ) {
+        (Some(chapter), Some(title)) => parts.push(format!("{chapter} \"{title}\"")),
+        (Some(chapter), None) => parts.push(chapter),
+        (None, Some(title)) => parts.push(format!("\"{title}\"")),
+        (None, None) => {}
+    }
+    if let Some(leaf) = leaf {
+        parts.push(leaf.to_string());
+    }
+    if parts.is_empty() {
+        return stem_of(filename);
+    }
+    parts.join(" · ")
+}
+
+fn result_url(filename: &str, frontmatter: &serde_json::Value, leaf: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(resource) = frontmatter.resource() {
+        parts.push(resource.to_string());
+    }
+    let doc_path = match (
+        frontmatter.get("book").and_then(|v| v.as_str()),
+        frontmatter.get("chapter").and_then(chapter_label),
+    ) {
+        (Some(book), Some(chapter)) => format!("{book}/{chapter}"),
+        _ => stem_of(filename),
+    };
+    let kb_uri = match leaf {
+        Some(leaf) => format!("kb://{doc_path}#{}", slug_heading(leaf)),
+        None => format!("kb://{doc_path}"),
+    };
+    parts.push(kb_uri);
+    parts.join(" · ")
+}
+
+fn result_date(frontmatter: &serde_json::Value) -> Option<String> {
+    let at = frontmatter.generated_at()?;
+    Some(match frontmatter.generated_by() {
+        Some(by) => format!("{at} (generated: {by})"),
+        None => at.to_string(),
+    })
+}
+
+fn chapter_label(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Number(n) => Some(format!("ch{n}")),
+        serde_json::Value::String(s) => Some(
+            s.parse::<u32>()
+                .map(|n| format!("ch{n}"))
+                .unwrap_or_else(|_| s.clone()),
+        ),
+        _ => None,
+    }
+}
+
+fn slug_heading(heading: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_separator = true;
+    for c in heading.chars() {
+        if c.is_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+            previous_separator = false;
+        } else if !previous_separator {
+            slug.push('_');
+            previous_separator = true;
+        }
+    }
+    while slug.ends_with('_') {
+        slug.pop();
+    }
+    slug
+}
+
+fn stem_of(filename: &str) -> String {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename)
+        .to_string()
+}
+
+fn figure_line(figure: &Figure) -> String {
+    let mut parts = vec![figure.src.clone()];
+    if !figure.caption.is_empty() {
+        parts.push(format!("\"{}\"", figure.caption));
+    }
+    if let Some(blob) = &figure.blob {
+        parts.push(format!("blob {}", format_bytes(base64_byte_len(blob))));
+    }
+    parts.join(" · ")
+}
+
+fn format_bytes(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let n = bytes as f64;
+    if n >= MB {
+        format!("{:.1} MB", n / MB)
+    } else if n >= KB {
+        format!("{:.0} KB", n / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn base64_byte_len(encoded: &str) -> usize {
+    let padding = encoded.chars().rev().take_while(|c| *c == '=').count();
+    encoded.len() / 4 * 3 - padding
 }
 
 async fn run_doc_add(
@@ -637,6 +772,7 @@ async fn wait_all_done(pool: &sqlx::PgPool, kb_name: &str, progress: &Progress) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filter::FilterOp;
 
     #[test]
     fn parses_kb_create_with_an_optional_config_path() {
@@ -650,7 +786,7 @@ mod tests {
                     config_path: Some(config_path),
                     overlay_files,
                 },
-            } if name == "books" && config_path == PathBuf::from("recipe.yaml") && overlay_files.is_empty()
+            } if name == "books" && config_path.as_path() == Path::new("recipe.yaml") && overlay_files.is_empty()
         ));
     }
 
@@ -725,7 +861,7 @@ mod tests {
     ) -> postgres::QueryResult {
         postgres::QueryResult {
             document_id,
-            filename: String::new(),
+            filename: "guide.md".to_string(),
             frontmatter: serde_json::Value::Null,
             node_id: node_id.to_string(),
             chunk_seq,
@@ -740,55 +876,199 @@ mod tests {
     }
 
     #[test]
-    fn chunk_lines_wraps_every_chunk_with_header_and_content() {
+    fn result_lines_wrap_every_result_with_score_path_and_text() {
         let path = vec!["Chapter 1", "1.1"];
         let first = make_result_in("a", 0, 0, 1, path.clone(), "first");
         let second = make_result_in("a", 1, 0, 1, path, "second");
-        let rows = vec![(String::new(), &first), (String::new(), &second)];
+        let rows = vec![
+            (0.12, "VEC".to_string(), &first),
+            (0.34, "VEC".to_string(), &second),
+        ];
 
-        let lines = chunk_lines(rows);
+        let lines = result_lines(rows);
 
-        // Every chunk is self-describing: its own [HEADER] line inside the
-        // tags, even when a sibling chunk shares the same section.
         assert_eq!(
             lines,
             vec![
-                "<chunk>",
-                "[HEADER] Chapter 1 > 1.1",
+                "<result>",
+                "[title]  1.1",
+                "[url]    kb://guide#1_1",
+                "[score]  0.12 · VEC",
+                "[path]   Chapter 1 > 1.1",
                 "first",
-                "</chunk>",
-                "<chunk>",
-                "[HEADER] Chapter 1 > 1.1",
+                "</result>",
+                "<result>",
+                "[title]  1.1",
+                "[url]    kb://guide#1_1",
+                "[score]  0.34 · VEC",
+                "[path]   Chapter 1 > 1.1",
                 "second",
-                "</chunk>",
+                "</result>",
             ]
         );
     }
 
     #[test]
-    fn chunk_lines_keeps_prefix_off_the_text() {
-        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "plain text");
-        let lines = chunk_lines(vec![("[0.1200 RERANK] ".to_string(), &result)]);
+    fn result_lines_compose_title_url_date_from_frontmatter() {
+        let mut result = make_result_in(
+            "a",
+            0,
+            0,
+            1,
+            vec!["Storage and Indexing for OLTP", "Write amplification"],
+            "body",
+        );
+        result.filename = "ch4.md".to_string();
+        result.frontmatter = serde_json::json!({
+            "type": "chapter",
+            "title": "4. Storage and Retrieval",
+            "resource": "../ddia.pdf#113-178",
+            "generated": { "by": "human:besthope", "at": "2026-08-13" },
+            "book": "ddia",
+            "chapter": 4,
+        });
+        let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
 
         assert_eq!(
             lines,
-            vec!["<chunk>", "[HEADER] Guide", "[0.1200 RERANK] plain text", "</chunk>"]
+            vec![
+                "<result>",
+                "[title]  ddia · ch4 \"4. Storage and Retrieval\" · Write amplification",
+                "[url]    ../ddia.pdf#113-178 · kb://ddia/ch4#write_amplification",
+                "[date]   2026-08-13 (generated: human:besthope)",
+                "[score]  0.31 · VEC",
+                "[path]   Storage and Indexing for OLTP > Write amplification",
+                "body",
+                "</result>",
+            ]
         );
     }
 
     #[test]
-    fn chunk_lines_omits_header_for_root_level_chunks() {
-        let root = make_result_in("root", 0, 0, 1, Vec::new(), "preface");
-        let lines = chunk_lines(vec![(String::new(), &root)]);
+    fn result_lines_labels_rerank_channel() {
+        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "plain text");
+        let lines = result_lines(vec![(0.84, "RERANK".to_string(), &result)]);
 
-        assert_eq!(lines, vec!["<chunk>", "preface", "</chunk>"]);
+        assert_eq!(
+            lines,
+            vec![
+                "<result>",
+                "[title]  Guide",
+                "[url]    kb://guide#guide",
+                "[score]  0.84 · RERANK",
+                "[path]   Guide",
+                "plain text",
+                "</result>",
+            ]
+        );
     }
 
     #[test]
-    fn chunk_lines_keeps_multiline_text_inside_one_element() {
-        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "line one\nline two");
-        let lines = chunk_lines(vec![(String::new(), &result)]);
+    fn result_lines_omit_path_for_root_level_chunks() {
+        let root = make_result_in("root", 0, 0, 1, Vec::new(), "preface");
+        let lines = result_lines(vec![(0.0, "TREE".to_string(), &root)]);
 
-        assert_eq!(lines, vec!["<chunk>", "[HEADER] Guide", "line one\nline two", "</chunk>"]);
+        assert_eq!(
+            lines,
+            vec![
+                "<result>",
+                "[title]  guide",
+                "[url]    kb://guide",
+                "[score]  0.00 · TREE",
+                "preface",
+                "</result>",
+            ]
+        );
+    }
+
+    #[test]
+    fn result_lines_keep_multiline_text_inside_one_element() {
+        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "line one\nline two");
+        let lines = result_lines(vec![(0.0, "VEC".to_string(), &result)]);
+
+        assert!(lines.contains(&"line one\nline two".to_string()));
+        assert_eq!(lines.first().unwrap(), "<result>");
+        assert_eq!(lines.last().unwrap(), "</result>");
+    }
+
+    #[test]
+    fn result_lines_render_figures_with_decoded_blob_size() {
+        let mut result = make_result_in("a", 0, 0, 1, vec!["Guide"], "body");
+        result.figures = vec![Figure {
+            src: "fig/ddia_0404.png".to_string(),
+            caption: "Figure 4-4. A Bloom filter".to_string(),
+            description: None,
+            blob: Some("QUJDRA==".to_string()),
+        }];
+        let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
+
+        assert!(lines.contains(
+            &"[figure] fig/ddia_0404.png · \"Figure 4-4. A Bloom filter\" · blob 4 B".to_string()
+        ));
+    }
+
+    #[test]
+    fn result_lines_omit_date_without_generated_at() {
+        let result = make_result_in("a", 0, 0, 1, vec!["Guide"], "body");
+        let lines = result_lines(vec![(0.0, "VEC".to_string(), &result)]);
+
+        assert!(!lines.iter().any(|l| l.starts_with("[date]")));
+    }
+
+    #[test]
+    fn format_bytes_humanizes_scales() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1 KB");
+        assert_eq!(format_bytes(49152), "48 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn base64_byte_len_strips_padding() {
+        assert_eq!(base64_byte_len("QUJDRA=="), 4);
+        assert_eq!(base64_byte_len("QUJD"), 3);
+    }
+
+    #[test]
+    fn slug_heading_lowercases_and_underscores() {
+        assert_eq!(slug_heading("Write amplification"), "write_amplification");
+        assert_eq!(slug_heading(" 1.1  "), "1_1");
+    }
+
+    #[test]
+    fn parses_query_with_repeated_filters() {
+        let cli = Cli::try_parse_from([
+            "nanokb",
+            "query",
+            "books",
+            "indexing",
+            "-l",
+            "type=chapter",
+            "-l",
+            "book!=ddia",
+        ])
+        .unwrap();
+
+        match cli.command {
+            TopLevelCommand::Query { filters, .. } => {
+                assert_eq!(filters.len(), 2);
+                assert_eq!(filters[0].key, "type");
+                assert_eq!(filters[0].op, FilterOp::Eq);
+                assert_eq!(filters[0].value, "chapter");
+                assert_eq!(filters[1].key, "book");
+                assert_eq!(filters[1].op, FilterOp::NotEq);
+                assert_eq!(filters[1].value, "ddia");
+            }
+            _ => panic!("expected query command"),
+        }
+    }
+
+    #[test]
+    fn query_rejects_malformed_filter() {
+        match Cli::try_parse_from(["nanokb", "query", "books", "indexing", "-l", "type"]) {
+            Err(error) => assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation),
+            Ok(_) => panic!("expected a malformed filter to be rejected"),
+        }
     }
 }

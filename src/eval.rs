@@ -399,10 +399,10 @@ async fn retrieve_arm(
     expand_depth: usize,
 ) -> Result<Vec<RunChunk>> {
     let mut candidates =
-        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode, query_text, limit)
+        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode, query_text, limit, &[])
             .await?;
     if arm.expand {
-        let neighbors = postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
+        let neighbors = postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth, &[]).await?;
         candidates = retrieve::merge_with_neighbors(candidates, neighbors);
     }
     let ordered: Vec<(f64, QueryResult)> = match reranker {
@@ -665,7 +665,6 @@ struct CorpusDoc {
     author: Option<String>,
     source: String,
     category: String,
-    published_at: String,
     url: String,
     body: String,
 }
@@ -755,17 +754,20 @@ fn doc_filename(index: usize, title: &str) -> String {
     format!("{index:03}-{}.md", slug(title))
 }
 
-/// Render a CorpusDoc as markdown with YAML frontmatter.
+/// Render a CorpusDoc as markdown with okf frontmatter: `url` becomes the
+/// okf `resource`; the rest stays as custom keys. `generated.by` names the
+/// conversion process.
 fn doc_markdown(doc: &CorpusDoc) -> String {
     let mut out = String::from("---\n");
+    out.push_str("type: article\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(&doc.title)));
     if let Some(author) = &doc.author {
         out.push_str(&format!("author: {}\n", yaml_quoted(author)));
     }
+    out.push_str(&format!("resource: {}\n", yaml_quoted(&doc.url)));
+    out.push_str("generated: { by: process:nanokb-eval }\n");
     out.push_str(&format!("source: {}\n", yaml_quoted(&doc.source)));
     out.push_str(&format!("category: {}\n", yaml_quoted(&doc.category)));
-    out.push_str(&format!("published_at: {}\n", yaml_quoted(&doc.published_at)));
-    out.push_str(&format!("url: {}\n", yaml_quoted(&doc.url)));
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n\n{}\n", doc.title.replace('\n', " "), doc.body));
     out

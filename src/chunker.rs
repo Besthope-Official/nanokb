@@ -463,14 +463,14 @@ fn fixed_chunks(
     for i in 0..total_tokens {
         let (start, end) = offsets[i];
         if full_text[start..end].ends_with(SENTENCE_DELIMITERS) {
-            push_sentence(&full_text, &offsets, seg_start, i, chunk_size, &mut segments);
+            push_sentence(full_text, offsets, seg_start, i, chunk_size, &mut segments);
             seg_start = i + 1;
         }
     }
     if seg_start < total_tokens {
         push_sentence(
-            &full_text,
-            &offsets,
+            full_text,
+            offsets,
             seg_start,
             total_tokens - 1,
             chunk_size,
@@ -541,7 +541,7 @@ fn push_sentence<'a>(
     chunk_size: usize,
     out: &mut Vec<&'a str>,
 ) {
-    if last - first + 1 <= chunk_size {
+    if last - first < chunk_size {
         out.push(&full_text[offsets[first].0..offsets[last].1]);
         return;
     }

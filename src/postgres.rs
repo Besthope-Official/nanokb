@@ -1,6 +1,7 @@
 use crate::chunker::{Block, NodeRow};
 use crate::config::IndexConfig;
 use crate::parser::Figure;
+use crate::filter::{Filter, where_clause};
 use anyhow::{Context, Result};
 use pgvector::Vector;
 use serde_json::Value;
@@ -609,10 +610,12 @@ pub async fn query_chunks(
     kb_name: &str,
     query_embedding: &[f32],
     top_k: usize,
+    filters: &[Filter],
 ) -> Result<Vec<QueryResult>> {
     let chunk_table = chunk_table(kb_name)?;
     let node_table = node_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
+    let where_sql = where_clause(filters, 3).unwrap_or_default();
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
@@ -621,12 +624,15 @@ pub async fn query_chunks(
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
          JOIN document ON document.id = chunk.document_id \
+         {where_sql} \
          ORDER BY chunk.embedding <=> $1::vector \
          LIMIT $2"
     );
-    let rows = sqlx::query(AssertSqlSafe(sql))
-        .bind(vector)
-        .bind(top_k as i64)
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(vector).bind(top_k as i64);
+    for filter in filters {
+        query = query.bind(&filter.key).bind(&filter.value);
+    }
+    let rows = query
         .fetch_all(pool)
         .await
         .with_context(|| format!("failed to query kb {kb_name}"))?;
@@ -708,10 +714,12 @@ pub async fn query_markers(
     kb_name: &str,
     query_embedding: &[f32],
     top_k: usize,
+    filters: &[Filter],
 ) -> Result<Vec<QueryResult>> {
     let chunk_table = chunk_table(kb_name)?;
     let node_table = node_table(kb_name)?;
     let vector = Vector::from(query_embedding.to_vec());
+    let where_sql = where_clause(filters, 3).unwrap_or_default();
 
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
@@ -721,12 +729,15 @@ pub async fn query_markers(
          FROM {chunk_table} AS chunk \
          JOIN {node_table} AS node ON node.document_id = chunk.document_id AND node.node_id = chunk.node_id \
          JOIN document ON document.id = chunk.document_id \
+         {where_sql} \
          ORDER BY chunk.marker_embedding <=> $1::vector \
          LIMIT $2"
     );
-    let rows = sqlx::query(AssertSqlSafe(sql))
-        .bind(vector)
-        .bind(top_k as i64)
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(vector).bind(top_k as i64);
+    for filter in filters {
+        query = query.bind(&filter.key).bind(&filter.value);
+    }
+    let rows = query
         .fetch_all(pool)
         .await
         .with_context(|| format!("failed to query markers in kb {kb_name}"))?;
@@ -770,6 +781,7 @@ pub async fn expand_neighbors(
     kb_name: &str,
     hits: &[QueryResult],
     max_ancestor_depth: usize,
+    filters: &[Filter],
 ) -> Result<Vec<QueryResult>> {
     let chunk_table = chunk_table(kb_name)?;
     let node_table = node_table(kb_name)?;
@@ -815,7 +827,7 @@ pub async fn expand_neighbors(
         return Ok(Vec::new());
     }
 
-    fetch_chunks_by_nodes(pool, &chunk_table, &node_table, &neighbors).await
+    fetch_chunks_by_nodes(pool, &chunk_table, &node_table, &neighbors, filters).await
 }
 
 /// Distinct nodes whose `parent_id` points at any of `nodes` — the direct
@@ -915,11 +927,13 @@ async fn fetch_chunks_by_nodes(
     chunk_table: &str,
     node_table: &str,
     nodes: &HashSet<(i64, String)>,
+    filters: &[Filter],
 ) -> Result<Vec<QueryResult>> {
     let (doc_ids, node_ids): (Vec<i64>, Vec<String>) = nodes
         .iter()
         .map(|(doc, node)| (*doc, node.clone()))
         .unzip();
+    let where_sql = where_clause(filters, 3).unwrap_or_default();
     let sql = format!(
         "SELECT chunk.document_id, document.filename, document.frontmatter, \
                 chunk.node_id, chunk.chunk_seq, node.heading_path, node.sort_order, \
@@ -930,11 +944,14 @@ async fn fetch_chunks_by_nodes(
          JOIN document ON document.id = chunk.document_id \
          JOIN unnest($1::bigint[], $2::text[]) AS n(doc_id, node_id) \
            ON chunk.document_id = n.doc_id AND chunk.node_id = n.node_id \
+         {where_sql} \
          ORDER BY chunk.document_id, node.sort_order, chunk.chunk_seq"
     );
-    let rows = sqlx::query(AssertSqlSafe(sql))
-        .bind(doc_ids)
-        .bind(node_ids)
+    let mut query = sqlx::query(AssertSqlSafe(sql)).bind(doc_ids).bind(node_ids);
+    for filter in filters {
+        query = query.bind(&filter.key).bind(&filter.value);
+    }
+    let rows = query
         .fetch_all(pool)
         .await
         .context("failed to fetch neighbor chunks")?;

@@ -3,8 +3,9 @@ use nanokb::chunker::NodeRow;
 use nanokb::postgres::{
     ChunkRow, QueryChannel, QueryResult, connect, create_index, create_kb, create_marker_index,
     expand_neighbors, fetch_and_lock_pending, initialize, insert_task, mark_document_parsed,
-    query_markers, register_document, replace_document_chunks,
+    query_chunks, query_markers, register_document, replace_document_chunks,
 };
+use nanokb::Filter;
 use nanokb::AppConfig;
 use nanokb::IndexConfig;
 use serde_json::json;
@@ -260,12 +261,12 @@ async fn config_connects_to_pgvector_and_persists_kb_metadata() -> Result<()> {
     .await?;
 
     let query_emb = vec![0.1_f32, 0.2, 0.3];
-    let marker_hits = query_markers(&pool, KB_NAME_MARKER, &query_emb, 5).await?;
+    let marker_hits = query_markers(&pool, KB_NAME_MARKER, &query_emb, 5, &[]).await?;
     assert_eq!(marker_hits.len(), 1);
     assert_eq!(marker_hits[0].node_id, "intro");
     assert!(marker_hits[0].distance >= 0.0, "marker distance should be non-negative");
     assert_eq!(marker_hits[0].markers, vec!["guide", "introduction"]);
-    let far_hits = query_markers(&pool, KB_NAME_MARKER, &[-1.0, -1.0, -1.0], 5).await?;
+    let far_hits = query_markers(&pool, KB_NAME_MARKER, &[-1.0, -1.0, -1.0], 5, &[]).await?;
     assert!(far_hits[0].distance > marker_hits[0].distance,
         "farther embedding should have larger distance");
 
@@ -449,30 +450,30 @@ async fn expand_neighbors_returns_tree_context_in_document_order() -> Result<()>
     // Leaf-to-root (two levels) + siblings; the hit itself is excluded and
     // the root (no chunks) contributes nothing. Document order, not score.
     let hit = tree_hit(document_id, "ch1a", 0);
-    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 2).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 2, &[]).await?;
     assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch1b"]);
     assert_eq!(tree_texts(&neighbors), vec!["chapter 1 body", "section 1.2 body"]);
 
     // Depth 1 keeps only the direct parent.
     let hit = tree_hit(document_id, "ch1a", 0);
-    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 1).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit], 1, &[]).await?;
     assert_eq!(tree_node_order(&neighbors), vec!["ch1"]);
 
     // Both siblings retrieved: each hit's sibling is the other hit, so the
     // shared parent is the only new neighbor.
     let hit = tree_hit(document_id, "ch1a", 0);
     let hit_b = tree_hit(document_id, "ch1b", 0);
-    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit, hit_b], 2).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[hit, hit_b], 2, &[]).await?;
     assert_eq!(tree_node_order(&neighbors), vec!["ch1"]);
 
     // A root hit has no ancestors or siblings; root-to-leaves pulls the
     // top-level sections.
     let root_hit = tree_hit(document_id, "root", 0);
-    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[root_hit], 2).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[root_hit], 2, &[]).await?;
     assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch2"]);
 
     // Empty hits expand to nothing.
-    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[], 2).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_TREE, &[], 2, &[]).await?;
     assert!(neighbors.is_empty());
 
     sqlx::query("DELETE FROM document WHERE id = $1")
@@ -496,4 +497,259 @@ fn tree_node_order(results: &[QueryResult]) -> Vec<&str> {
 
 fn tree_texts(results: &[QueryResult]) -> Vec<&str> {
     results.iter().map(|r| r.text.as_str()).collect()
+}
+
+const KB_NAME_FILTER: &str = "config_conformance_filter";
+const KB_CHUNK_TABLE_FILTER: &str = "kb_config_conformance_filter_chunk";
+const KB_NODE_TABLE_FILTER: &str = "kb_config_conformance_filter_node";
+const KB_NAME_FILTER_MARKER: &str = "config_conformance_filter_marker";
+const KB_CHUNK_TABLE_FILTER_MARKER: &str = "kb_config_conformance_filter_marker_chunk";
+const KB_NODE_TABLE_FILTER_MARKER: &str = "kb_config_conformance_filter_marker_node";
+
+async fn seed_filter_doc(
+    pool: &PgPool,
+    kb_name: &str,
+    filename: &str,
+    frontmatter: serde_json::Value,
+    node_id: &str,
+) -> Result<i64> {
+    let document_id = register_document(pool, kb_name, "content", filename, "").await?;
+    mark_document_parsed(pool, document_id, &frontmatter).await?;
+    replace_document_chunks(
+        pool,
+        kb_name,
+        document_id,
+        &[tree_node(node_id, None, 1, 0, vec!["Guide"])],
+        &[tree_chunk(node_id, 0, "text")],
+    )
+    .await?;
+    Ok(document_id)
+}
+
+fn filter_set(raw: &[&str]) -> Vec<Filter> {
+    raw.iter().map(|s| s.parse().unwrap()).collect()
+}
+
+fn sorted_filenames(results: &[QueryResult]) -> Vec<String> {
+    let mut names: Vec<String> = results.iter().map(|r| r.filename.clone()).collect();
+    names.sort();
+    names
+}
+
+#[tokio::test]
+#[ignore = "requires the Docker Compose pgvector service"]
+async fn query_filters_filter_documents_by_frontmatter() -> Result<()> {
+    let config_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/conformance/config.yaml");
+    let config = AppConfig::try_load_from(config_path)?;
+    let pool = connect(&config.database.url).await?;
+    initialize(&pool).await?;
+
+    for table in [
+        KB_CHUNK_TABLE_FILTER,
+        KB_NODE_TABLE_FILTER,
+        KB_CHUNK_TABLE_FILTER_MARKER,
+        KB_NODE_TABLE_FILTER_MARKER,
+    ] {
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+            .execute(&pool)
+            .await?;
+    }
+    for name in [KB_NAME_FILTER, KB_NAME_FILTER_MARKER] {
+        sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+            .bind(name)
+            .execute(&pool)
+            .await?;
+    }
+
+    create_kb(
+        &pool,
+        KB_NAME_FILTER,
+        3,
+        &json!({"strategy": "layered"}),
+        &json!({"model": "conformance", "dimension": 3}),
+        &json!({}),
+        None,
+        "vector",
+    )
+    .await?;
+
+    // alpha/beta/gamma/delta/epsilon cover: scalar equality, array
+    // containment, differing arrays, missing keys, and empty frontmatter.
+    // Every embedding is identical, so assertions rely on filename sets.
+    let docs = [
+        (
+            "alpha.md",
+            json!({"type": "chapter", "book": "ddia", "tags": ["database", "replication"]}),
+        ),
+        ("beta.md", json!({"type": "appendix", "book": "ddia", "tags": ["database"]})),
+        ("gamma.md", json!({"type": "chapter", "book": "other", "tags": ["streaming"]})),
+        ("delta.md", json!({"type": "chapter"})),
+        ("epsilon.md", json!({})),
+    ];
+    let mut document_ids = Vec::new();
+    for (i, (filename, frontmatter)) in docs.iter().enumerate() {
+        let id = seed_filter_doc(
+            &pool,
+            KB_NAME_FILTER,
+            filename,
+            frontmatter.clone(),
+            &format!("node{i}"),
+        )
+        .await?;
+        document_ids.push(id);
+    }
+
+    let embedding = vec![0.1_f32, 0.2, 0.3];
+
+    let all = query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &[]).await?;
+    assert_eq!(
+        sorted_filenames(&all),
+        ["alpha.md", "beta.md", "delta.md", "epsilon.md", "gamma.md"]
+    );
+
+    let hits =
+        query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &filter_set(&["type=chapter"]))
+            .await?;
+    assert_eq!(sorted_filenames(&hits), ["alpha.md", "delta.md", "gamma.md"]);
+
+    let hits =
+        query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &filter_set(&["tags=database"]))
+            .await?;
+    assert_eq!(sorted_filenames(&hits), ["alpha.md", "beta.md"]);
+
+    // kubectl semantics: `!=` matches docs where the key is missing.
+    let hits =
+        query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &filter_set(&["type!=appendix"]))
+            .await?;
+    assert_eq!(
+        sorted_filenames(&hits),
+        ["alpha.md", "delta.md", "epsilon.md", "gamma.md"]
+    );
+
+    let hits =
+        query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &filter_set(&["tags!=database"]))
+            .await?;
+    assert_eq!(sorted_filenames(&hits), ["delta.md", "epsilon.md", "gamma.md"]);
+
+    let hits = query_chunks(
+        &pool,
+        KB_NAME_FILTER,
+        &embedding,
+        5,
+        &filter_set(&["type=chapter", "book=ddia"]),
+    )
+    .await?;
+    assert_eq!(sorted_filenames(&hits), ["alpha.md"]);
+
+    let hits =
+        query_chunks(&pool, KB_NAME_FILTER, &embedding, 5, &filter_set(&["nope=x"]))
+            .await?;
+    assert!(hits.is_empty(), "an unknown key filters everything out, it is not an error");
+
+    // Tree expansion runs the same predicate in `fetch_chunks_by_nodes`: the
+    // hit is hand-built (bypasses query_chunks), so an excluding filter
+    // must empty the neighbor fetch server-side.
+    let tree_id = register_document(&pool, KB_NAME_FILTER, "tree", "tree.md", "").await?;
+    mark_document_parsed(&pool, tree_id, &json!({"type": "chapter", "tags": ["database"]})).await?;
+    replace_document_chunks(
+        &pool,
+        KB_NAME_FILTER,
+        tree_id,
+        &[
+            tree_node("root", None, 0, 0, vec![]),
+            tree_node("ch1", Some("root"), 1, 1, vec!["Chapter 1"]),
+            tree_node("ch1a", Some("ch1"), 2, 2, vec!["Chapter 1", "1.1"]),
+            tree_node("ch1b", Some("ch1"), 2, 3, vec!["Chapter 1", "1.2"]),
+        ],
+        &[
+            tree_chunk("ch1", 0, "chapter 1 body"),
+            tree_chunk("ch1a", 0, "section 1.1"),
+            tree_chunk("ch1b", 0, "section 1.2"),
+        ],
+    )
+    .await?;
+
+    let hit = tree_hit(tree_id, "ch1a", 0);
+    let neighbors = expand_neighbors(&pool, KB_NAME_FILTER, std::slice::from_ref(&hit), 2, &filter_set(&["tags=database"])).await?;
+    assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch1b"]);
+    let neighbors = expand_neighbors(&pool, KB_NAME_FILTER, &[hit], 2, &filter_set(&["tags!=database"])).await?;
+    assert!(neighbors.is_empty(), "neighbor fetch must apply the filter server-side");
+
+    // The marker channel compiles the same WHERE into its own SQL.
+    create_kb(
+        &pool,
+        KB_NAME_FILTER_MARKER,
+        3,
+        &json!({"strategy": "layered"}),
+        &json!({"model": "conformance", "dimension": 3}),
+        &json!({}),
+        Some(&json!({"model": "conformance"})),
+        "hybrid",
+    )
+    .await?;
+    for (filename, frontmatter, marker_text) in [
+        ("alpha.md", json!({"type": "chapter", "tags": ["database"]}), "alpha marker"),
+        ("beta.md", json!({"type": "appendix", "tags": ["database"]}), "beta marker"),
+    ] {
+        let id = register_document(&pool, KB_NAME_FILTER_MARKER, "content", filename, "").await?;
+        mark_document_parsed(&pool, id, &frontmatter).await?;
+        replace_document_chunks(
+            &pool,
+            KB_NAME_FILTER_MARKER,
+            id,
+            &[tree_node("node", None, 1, 0, vec!["Guide"])],
+            &[ChunkRow {
+                node_id: "node".into(),
+                chunk_seq: 0,
+                text: marker_text.into(),
+                blocks: Vec::new(),
+                figures: Vec::new(),
+                embedding: vec![0.1, 0.2, 0.3],
+                marker_embedding: vec![0.4, 0.5, 0.6],
+                markers: vec![marker_text.into()],
+            }],
+        )
+        .await?;
+    }
+    let marker_hits = query_markers(
+        &pool,
+        KB_NAME_FILTER_MARKER,
+        &embedding,
+        5,
+        &filter_set(&["tags=database"]),
+    )
+    .await?;
+    assert_eq!(sorted_filenames(&marker_hits), ["alpha.md", "beta.md"]);
+
+    for document_id in document_ids {
+        sqlx::query("DELETE FROM document WHERE id = $1")
+            .bind(document_id)
+            .execute(&pool)
+            .await?;
+    }
+    sqlx::query("DELETE FROM document WHERE id = $1")
+        .bind(tree_id)
+        .execute(&pool)
+        .await?;
+    sqlx::query("DELETE FROM document WHERE kb_name = $1")
+        .bind(KB_NAME_FILTER_MARKER)
+        .execute(&pool)
+        .await?;
+    for table in [
+        KB_CHUNK_TABLE_FILTER,
+        KB_NODE_TABLE_FILTER,
+        KB_CHUNK_TABLE_FILTER_MARKER,
+        KB_NODE_TABLE_FILTER_MARKER,
+    ] {
+        sqlx::query(AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+            .execute(&pool)
+            .await?;
+    }
+    for name in [KB_NAME_FILTER, KB_NAME_FILTER_MARKER] {
+        sqlx::query("DELETE FROM kb_meta WHERE name = $1")
+            .bind(name)
+            .execute(&pool)
+            .await?;
+    }
+    Ok(())
 }

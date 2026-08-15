@@ -441,9 +441,20 @@ fn merge_sequence_overlay_replaces() {
     assert_eq!(merged["items"], vec!["c"]);
 }
 
-// -----------------------------------------------------------------
-// try_load_with_overlays
-// -----------------------------------------------------------------
+#[test]
+fn merge_null_overlay_clears_optional_field() {
+    let mut base = yaml_serde::from_str(&format!(
+        "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  llm: deepseek\n  retrieval:\n    mode: hybrid"
+    ))
+    .unwrap();
+    let overlay =
+        yaml_serde::from_str("pipeline:\n  llm: null\n  retrieval:\n    mode: vector").unwrap();
+    merge_values(&mut base, &overlay);
+
+    let config: AppConfig = yaml_serde::from_value(base).unwrap();
+    assert!(config.pipeline.llm.is_none());
+    assert_eq!(config.pipeline.retrieval.mode.as_deref(), Some("vector"));
+}
 
 #[test]
 fn try_load_with_single_overlay() {
