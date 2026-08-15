@@ -3,7 +3,7 @@ use crate::parser::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -1253,7 +1253,7 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
         title: Some("My Paper".into()),
         ..Default::default()
     };
-    write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
     let md_path = out.join("my-paper.md");
     let index_path = out.join("index.md");
     assert!(md_path.exists());
@@ -1265,7 +1265,7 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
         title: Some("Renamed".into()),
         ..Default::default()
     };
-    write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:01Z").unwrap();
+    write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:01Z", DocType::Auto).unwrap();
     assert!(fs::read_to_string(&md_path).unwrap().contains("Renamed"));
     assert_eq!(fs::read(&index_path).unwrap(), index_before);
 }
@@ -1273,6 +1273,22 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
 fn project_book(blocks: &[String]) -> (StructuredDocument, ProjectReport) {
     let page = page_json(blocks);
     project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-book").unwrap()
+}
+
+/// Sorted (file name, contents) pairs of every file in a bundle directory.
+fn read_dir_files(dir: &Path) -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            (
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+                fs::read_to_string(&path).unwrap(),
+            )
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 #[test]
@@ -1290,7 +1306,7 @@ fn write_book_bundle_creates_book_chapters_and_index() {
         block("paragraph_title", "Chapter 3. Classified", [0, 140, 10, 150]),
         block("text", "Classified body.", [0, 160, 10, 170]),
     ]);
-    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     let book_md = fs::read_to_string(out.join("my-book.md")).unwrap();
     assert!(book_md.contains("type: book"), "{book_md}");
@@ -1333,7 +1349,7 @@ fn write_book_bundle_uses_keys_for_parts_appendices_and_noise() {
         block("doc_title", "Appendix B. Checklist", [0, 40, 10, 50]),
         block("doc_title", "EXAMPLES OF SAMPLING BIAS", [0, 60, 10, 70]),
     ]);
-    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     let part = fs::read_to_string(out.join("part-ii.md")).unwrap();
     assert!(part.contains("chapter: part-ii"), "{part}");
@@ -1357,7 +1373,7 @@ fn write_book_bundle_writes_page_range_in_resource() {
     ]), 1)
     .unwrap();
     let (doc, report) = project(&pages, "my-book").unwrap();
-    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
     assert!(ch1.contains("resource: ../pdf/my-book.pdf#2-2"), "{ch1}");
@@ -1380,7 +1396,7 @@ fn write_book_bundle_attaches_non_chapter_headings_to_preceding_chapter() {
         block("paragraph_title", "Index", [0, 140, 10, 150]),
         block("text", "index entries", [0, 160, 10, 170]),
     ]);
-    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     assert!(!out.join("a-sidebar-note.md").exists());
     assert!(!out.join("chapter-9-overview.md").exists());
@@ -1408,7 +1424,7 @@ fn write_book_bundle_suffixes_duplicate_chapter_slugs() {
         block("doc_title", "Chapter 1. A", [0, 20, 10, 30]),
         block("doc_title", "Chapter 1. B", [0, 40, 10, 50]),
     ]);
-    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
     assert!(ch1.contains("# Chapter 1. A"), "{ch1}");
@@ -1419,3 +1435,116 @@ fn write_book_bundle_suffixes_duplicate_chapter_slugs() {
     assert!(index.contains("(ch1-2.md)"));
 }
 
+
+// ---------------------------------------------------------------
+// doc type dispatch
+// ---------------------------------------------------------------
+
+#[test]
+fn write_bundle_forced_paper_ignores_doc_title_headings() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-paper");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block("doc_title", "Chapter 1. Intro", [0, 20, 10, 30]),
+        block("text", "Body words.", [0, 40, 10, 50]),
+    ]);
+    assert!(!report.doc_title_headings.is_empty());
+
+    let chapters =
+        write_bundle(&out, "my-paper", &report, &doc, "2026-08-15T10:00:00Z", DocType::Paper)
+            .unwrap();
+    assert_eq!(chapters, 0);
+
+    let md = fs::read_to_string(out.join("my-paper.md")).unwrap();
+    assert!(md.contains("type: paper"), "{md}");
+    assert!(md.contains("# My Paper"), "{md}");
+    assert!(md.contains("## Chapter 1. Intro"), "{md}");
+    assert!(md.contains("Body words."));
+    assert!(!out.join("ch1.md").exists());
+    let index = fs::read_to_string(out.join("index.md")).unwrap();
+    assert!(index.contains("(my-paper.md)"), "{index}");
+    assert!(!index.contains("(ch1.md)"));
+}
+
+#[test]
+fn write_bundle_forced_book_with_chapters_matches_auto() {
+    let dir = TestDirectory::new();
+    let blocks = [
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("doc_title", "Chapter 1. Intro", [0, 20, 10, 30]),
+        block("text", "Intro body.", [0, 40, 10, 50]),
+        block("doc_title", "Chapter 2. Next", [0, 60, 10, 70]),
+        block("text", "Next body.", [0, 80, 10, 90]),
+    ];
+    let (doc, report) = project_book(&blocks);
+
+    // Same directory name so index.md's dir-name title matches across both.
+    let out_auto = dir.path().join("case-a").join("my-book");
+    let auto_count =
+        write_bundle(&out_auto, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
+            .unwrap();
+    let out_book = dir.path().join("case-b").join("my-book");
+    let book_count =
+        write_bundle(&out_book, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
+            .unwrap();
+
+    assert_eq!(auto_count, 2);
+    assert_eq!(book_count, auto_count);
+    let auto_files = read_dir_files(&out_auto);
+    assert_eq!(read_dir_files(&out_book), auto_files);
+}
+
+#[test]
+fn write_bundle_forced_book_degrades_to_single_doc() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("text", "Body words.", [0, 20, 10, 30]),
+    ]);
+    assert!(report.doc_title_headings.is_empty());
+
+    let chapters =
+        write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
+            .unwrap();
+    assert_eq!(chapters, 0);
+
+    let md = fs::read_to_string(out.join("my-book.md")).unwrap();
+    assert!(md.contains("type: book"), "{md}");
+    assert!(md.contains("# My Book"), "{md}");
+    assert!(md.contains("Body words."));
+    assert!(!md.contains("authors:"), "{md}");
+    assert!(!md.contains("arxiv:"), "{md}");
+    assert!(!out.join("ch1.md").exists());
+    let index = fs::read_to_string(out.join("index.md")).unwrap();
+    assert!(index.contains("(my-book.md)"), "{index}");
+    assert!(!index.contains("(ch1.md)"));
+
+    let warning = book_degradation_warning("my-book");
+    assert!(warning.contains("my-book"), "{warning}");
+    assert!(warning.contains("chapter boundaries"), "{warning}");
+    assert!(warning.contains("single-document book"), "{warning}");
+}
+
+#[test]
+fn write_bundle_forced_book_finds_chapters_via_heading_prefixes() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("paragraph_title", "Chapter 1. Intro", [0, 20, 10, 30]),
+        block("text", "Intro body.", [0, 40, 10, 50]),
+    ]);
+
+    let chapters =
+        write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
+            .unwrap();
+    assert_eq!(chapters, 1);
+
+    let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
+    assert!(ch1.contains("type: chapter"), "{ch1}");
+    assert!(ch1.contains("resource: ../pdf/my-book.pdf#1-1"), "{ch1}");
+    assert!(ch1.contains("# Chapter 1. Intro"), "{ch1}");
+    assert!(ch1.contains("Intro body."));
+}

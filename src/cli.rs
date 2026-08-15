@@ -205,6 +205,11 @@ enum TopLevelCommand {
         /// Pages per slice; defaults to config pdf.slice_pages.
         #[arg(long)]
         slice_pages: Option<usize>,
+        /// Bundle shape for the merge stage: paper -> one `type: paper` md;
+        /// book -> concept + `type: chapter` files (degrades to one `type: book`
+        /// md without chapter boundaries); auto = detect from the projection.
+        #[arg(long = "type", value_enum)]
+        doc_type: Option<pdf::DocType>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -340,7 +345,8 @@ pub async fn run() -> Result<()> {
             stage,
             dry_run,
             slice_pages,
-        } => run_convert(&config, &file, out.as_deref(), stage, dry_run, slice_pages).await,
+            doc_type,
+        } => run_convert(&config, &file, out.as_deref(), stage, dry_run, slice_pages, doc_type).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -353,8 +359,10 @@ async fn run_convert(
     stage: Option<ConvertStage>,
     dry_run: bool,
     slice_pages: Option<usize>,
+    doc_type: Option<pdf::DocType>,
 ) -> Result<()> {
     let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
+    let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
     if dry_run {
         let pdf_doc = pdf::PdfDocument::open(file)?;
         let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
@@ -371,7 +379,7 @@ async fn run_convert(
         }
         (Some(ConvertStage::Ocr), _) => pdf::run_ocr(&config.pdf, file, slice_pages).await,
         (Some(ConvertStage::Merge), Some(out)) => {
-            pdf::run_merge(&config.pdf, file, out, slice_pages)
+            pdf::run_merge(&config.pdf, file, out, slice_pages, doc_type)
         }
         (None, Some(out)) => {
             // Full pipeline: compute plan + cache layout once for both stages.
@@ -381,7 +389,7 @@ async fn run_convert(
             let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
             eprintln!("{}", pdf::plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages));
             pdf::run_ocr_with(&client, &pdf_doc, &layout, &plan).await?;
-            pdf::run_merge_with(&layout, &plan, file, out)
+            pdf::run_merge_with(&layout, &plan, file, out, doc_type)
         }
         (Some(ConvertStage::Merge) | None, None) => {
             bail!("--out <dir> is required unless --stage stops before merge")
@@ -892,8 +900,14 @@ mod tests {
 
         assert!(matches!(
             cli.command,
-            TopLevelCommand::Convert { file, out, stage: None, dry_run: false, .. }
-                if file.as_path() == Path::new("book.pdf")
+            TopLevelCommand::Convert {
+                file,
+                out,
+                stage: None,
+                dry_run: false,
+                doc_type: None,
+                ..
+            } if file.as_path() == Path::new("book.pdf")
                 && out.as_deref() == Some(Path::new("papers"))
         ));
     }
@@ -920,6 +934,34 @@ mod tests {
         assert!(matches!(
             cli.command,
             TopLevelCommand::Convert { dry_run: true, slice_pages: Some(30), .. }
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_with_type_book() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--type", "book",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { doc_type: Some(pdf::DocType::Book), .. }
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_with_type_paper() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--type", "paper",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { doc_type: Some(pdf::DocType::Paper), .. }
         ));
     }
 

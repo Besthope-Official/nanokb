@@ -348,6 +348,23 @@ pub struct Page {
     pub blocks: Vec<PageBlock>,
 }
 
+/// What kind of document the merge stage should emit.
+///
+/// This is the *input* shape switch for the bundle stage; the frontmatter
+/// `type:` strings of the emitted files are materialized from it
+/// (`paper` → `type: paper`; `book` → `type: book` + `type: chapter` files;
+/// degraded book → a single `type: book` file). `Auto` never reaches disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DocType {
+    /// A paper: single md document with first-page author metadata.
+    Paper,
+    /// A book: concept file + per-chapter files; degrades to a single
+    /// `type: book` document when no chapter boundaries are detected.
+    Book,
+    /// Detect from the projection: extra doc_title headings -> book, else paper.
+    Auto,
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectReport {
     pub title: Option<String>,
@@ -1102,13 +1119,35 @@ pub fn write_bundle(
     report: &ProjectReport,
     doc: &StructuredDocument,
     at: &str,
+    doc_type: DocType,
 ) -> Result<usize> {
     fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
-    if report.doc_title_headings.is_empty() {
-        write_paper_bundle(out, stem, report, doc, at)?;
-        Ok(0)
-    } else {
-        write_book_bundle(out, stem, report, doc, at)
+    let doc_type = match doc_type {
+        DocType::Auto => {
+            if report.doc_title_headings.is_empty() {
+                DocType::Paper
+            } else {
+                DocType::Book
+            }
+        }
+        other => other,
+    };
+    match doc_type {
+        DocType::Paper => {
+            write_paper_bundle(out, stem, report, doc, at)?;
+            Ok(0)
+        }
+        DocType::Book => {
+            let chapters = detect_chapters(report, doc);
+            if chapters.is_empty() {
+                write_book_single_doc(out, stem, report, doc, at)?;
+                eprintln!("warning: {}", book_degradation_warning(stem));
+                Ok(0)
+            } else {
+                write_book_bundle(out, stem, report, doc, at, &chapters)
+            }
+        }
+        DocType::Auto => unreachable!("resolved above"),
     }
 }
 
@@ -1150,48 +1189,91 @@ fn is_chapter_title(text: &str) -> bool {
     false
 }
 
+/// Chapter starts in document order: root headings that are doc_title
+/// headings or match the chapter/part/appendix prefix convention.
+fn detect_chapters(report: &ProjectReport, doc: &StructuredDocument) -> Vec<(NodeId, String)> {
+    let doc_title_nodes: BTreeSet<NodeId> = report
+        .doc_title_headings
+        .iter()
+        .map(|&(node_id, _)| node_id)
+        .collect();
+    doc.node(doc.root)
+        .children
+        .iter()
+        .filter_map(|&child| {
+            let NodeKind::Heading { title, .. } = &doc.node(child).kind else {
+                return None;
+            };
+            let title = one_line(title);
+            (doc_title_nodes.contains(&child) || is_chapter_title(&title)).then_some((child, title))
+        })
+        .collect()
+}
+
+/// Degradation path (design doc): a book without detectable chapter
+/// boundaries becomes one `type: book` document.
+fn write_book_single_doc(
+    out: &Path,
+    stem: &str,
+    report: &ProjectReport,
+    doc: &StructuredDocument,
+    at: &str,
+) -> Result<()> {
+    let title = one_line(report.title.as_deref().unwrap_or_default());
+    let md = format!(
+        "{}\n{}\n",
+        book_frontmatter(stem, &title, at),
+        render_markdown(doc, &title)
+    );
+    let md_path = out.join(format!("{stem}.md"));
+    fs::write(&md_path, md)
+        .with_context(|| format!("failed to write {}", md_path.display()))?;
+    write_index_skeleton(out, &[(title, format!("{stem}.md"))])
+}
+
+fn book_degradation_warning(stem: &str) -> String {
+    format!(
+        "no chapter boundaries detected in {stem}; wrote it as a single-document book (type: book) — check the OCR output for missing chapter titles and rerun if needed"
+    )
+}
+
 fn write_book_bundle(
     out: &Path,
     stem: &str,
     report: &ProjectReport,
     doc: &StructuredDocument,
     at: &str,
+    chapters: &[(NodeId, String)],
 ) -> Result<usize> {
     let title = one_line(report.title.as_deref().unwrap_or_default());
     let pages_by_node: BTreeMap<NodeId, usize> =
         report.root_headings.iter().copied().collect();
-    let doc_title_nodes: BTreeSet<NodeId> = report
-        .doc_title_headings
+    let chapter_titles: BTreeMap<NodeId, &str> = chapters
         .iter()
-        .map(|&(node_id, _)| node_id)
+        .map(|(node_id, title)| (*node_id, title.as_str()))
         .collect();
     let mut book_blocks = vec![format!("# {title}")];
-    let mut chapters: Vec<(NodeId, String, Vec<String>)> = Vec::new();
-    let mut append_rendered = |child: NodeId, chapters: &mut Vec<(NodeId, String, Vec<String>)>| {
-        let mut blocks = Vec::new();
-        let block = render_node(doc, child);
-        if !block.is_empty() {
-            blocks.push(block);
-        }
-        collect_render(doc, child, &mut blocks);
-        match chapters.last_mut() {
-            Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
-            None => book_blocks.extend(blocks),
-        }
-    };
-    for &child in &doc.node(doc.root).children {
-        let chapter_title = match &doc.node(child).kind {
-            NodeKind::Heading { title, .. } => Some(one_line(title)),
-            _ => None,
+    let mut out_chapters: Vec<(NodeId, String, Vec<String>)> = Vec::new();
+    let mut append_rendered =
+        |child: NodeId, out_chapters: &mut Vec<(NodeId, String, Vec<String>)>| {
+            let mut blocks = Vec::new();
+            let block = render_node(doc, child);
+            if !block.is_empty() {
+                blocks.push(block);
+            }
+            collect_render(doc, child, &mut blocks);
+            match out_chapters.last_mut() {
+                Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
+                None => book_blocks.extend(blocks),
+            }
         };
-        if let Some(chapter_title) = chapter_title
-            .filter(|title| doc_title_nodes.contains(&child) || is_chapter_title(title))
-        {
+    for &child in &doc.node(doc.root).children {
+        if let Some(chapter_title) = chapter_titles.get(&child) {
             let mut body = vec![format!("# {chapter_title}")];
             collect_render(doc, child, &mut body);
-            chapters.push((child, chapter_title, body));
+            out_chapters.push((child, (*chapter_title).to_string(), body));
         } else {
-            append_rendered(child, &mut chapters);
+            append_rendered(child, &mut out_chapters);
         }
     }
     book_blocks.push("See [index.md](index.md) for the chapter listing.".to_string());
@@ -1208,7 +1290,7 @@ fn write_book_bundle(
 
     let mut entries = vec![(title.clone(), format!("{stem}.md"))];
     let mut seen = BTreeSet::from(["index".to_string()]);
-    for (index, (node_id, chapter_title, body)) in chapters.iter().enumerate() {
+    for (index, (node_id, chapter_title, body)) in out_chapters.iter().enumerate() {
         let (base_stem, chapter) = chapter_key(chapter_title);
         ensure!(
             !base_stem.is_empty(),
@@ -1224,7 +1306,7 @@ fn write_book_bundle(
             .get(node_id)
             .copied()
             .with_context(|| format!("chapter {chapter_title:?} has no page"))?;
-        let end = chapters
+        let end = out_chapters
             .get(index + 1)
             .and_then(|(next, _, _)| pages_by_node.get(next))
             .map(|&next_page| next_page - 1)
@@ -1916,11 +1998,17 @@ pub async fn run_ocr_with(
 }
 
 /// Merge stage: project cached raw OCR results into an md bundle (offline).
-pub fn run_merge(cfg: &PdfConfig, pdf_path: &Path, out: &Path, slice_pages: usize) -> Result<()> {
+pub fn run_merge(
+    cfg: &PdfConfig,
+    pdf_path: &Path,
+    out: &Path,
+    slice_pages: usize,
+    doc_type: DocType,
+) -> Result<()> {
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
     let pdf_doc = PdfDocument::open(pdf_path)?;
     let plan = pdf_doc.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
-    run_merge_with(&layout, &plan, pdf_path, out)
+    run_merge_with(&layout, &plan, pdf_path, out, doc_type)
 }
 
 /// Merge using a precomputed plan and layout (see [`run_ocr_with`]).
@@ -1929,6 +2017,7 @@ pub fn run_merge_with(
     plan: &[(u32, u32)],
     pdf_path: &Path,
     out: &Path,
+    doc_type: DocType,
 ) -> Result<()> {
     let mut pages = Vec::new();
     for (index, &(start, _)) in plan.iter().enumerate() {
@@ -1952,18 +2041,18 @@ pub fn run_merge_with(
     let (doc, report) = project(&pages, stem)?;
 
     for warning in validate(&report)? {
-        eprintln!("warning: {warning}");
+        println!("warning: {warning}");
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let chapter_count = write_bundle(out, stem, &report, &doc, &at)?;
+    let chapter_count = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
     render_figures(pdf_path, &doc, &out.join("fig"), &pages)?;
     let chapters = if chapter_count == 0 {
         String::new()
     } else {
         format!(", {chapter_count} chapters")
     };
-    eprintln!(
+    println!(
         "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings{chapters})",
         pdf_path.display(),
         out.display(),
