@@ -25,7 +25,6 @@ const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_
 #[derive(Debug)]
 pub struct PdfDocument {
     doc: Document,
-    pages: u32,
 }
 
 impl PdfDocument {
@@ -37,23 +36,23 @@ impl PdfDocument {
             "encrypted PDF {} is not supported",
             path.display()
         );
-        let pages = doc.get_pages().len() as u32;
-        ensure!(pages >= 1, "PDF {} has no pages", path.display());
-        Ok(Self { doc, pages })
+        ensure!(!doc.get_pages().is_empty(), "PDF {} has no pages", path.display());
+        Ok(Self { doc })
     }
 
     pub fn page_count(&self) -> u32 {
-        self.pages
+        self.doc.get_pages().len() as u32
     }
 
     pub fn plan_slices(&self, slice_pages: usize, max_bytes: u64) -> Result<Vec<(u32, u32)>> {
         ensure!(slice_pages >= 1, "--slice-pages must be at least 1");
+        let pages = self.page_count();
         let mut ranges = Vec::new();
         let mut start = 1u32;
-        while start <= self.pages {
-            let window_end = (start + slice_pages as u32 - 1).min(self.pages);
-            if self.extract_size(start, window_end)? <= max_bytes {
-                ranges.push((start, window_end));
+        while start <= pages {
+            let window_end = (start + slice_pages as u32 - 1).min(pages);
+            let end = if self.extract_size(start, window_end)? <= max_bytes {
+                window_end
             } else {
                 let mut low = start;
                 let mut high = window_end;
@@ -65,15 +64,17 @@ impl PdfDocument {
                         high = mid - 1;
                     }
                 }
+                let low_size = self.extract_size(start, low)?;
                 ensure!(
-                    self.extract_size(start, low)? <= max_bytes,
+                    low_size <= max_bytes,
                     "page {start} alone is {} MB, exceeding the {} MB slice cap",
-                    self.extract_size(start, low)? / 1024 / 1024,
+                    low_size / 1024 / 1024,
                     max_bytes / 1024 / 1024
                 );
-                ranges.push((start, low));
-            }
-            start = ranges.last().expect("range just pushed").1 + 1;
+                low
+            };
+            ranges.push((start, end));
+            start = end + 1;
         }
         Ok(ranges)
     }
@@ -157,14 +158,11 @@ impl PdfDocument {
     }
 
     pub fn write_slice(&self, start: u32, end: u32, dest: &Path) -> Result<()> {
-        let mut slice = self.extract_pages(start, end)?;
-        let tmp = dest.with_extension("tmp");
-        slice
-            .save(&tmp)
-            .with_context(|| format!("failed to save slice {}", dest.display()))?;
-        fs::rename(&tmp, dest)
-            .with_context(|| format!("failed to rename slice into {}", dest.display()))?;
-        Ok(())
+        let mut buffer = Vec::new();
+        self.extract_pages(start, end)?
+            .save_to(&mut buffer)
+            .with_context(|| format!("failed to serialize slice {}", dest.display()))?;
+        write_file_atomic(dest, &buffer)
     }
 }
 
@@ -375,7 +373,10 @@ const HARD_IGNORE_LABELS: &[&str] = &[
     "header_image",
 ];
 
-pub fn parse_jsonl(text: &str) -> Result<Vec<Page>> {
+/// Parse a cached OCR result file. `base_page` is the PDF page number of the
+/// first page in this slice (1-based), so merged page numbers are correct
+/// without a renumbering pass.
+pub fn parse_jsonl(text: &str, base_page: usize) -> Result<Vec<Page>> {
     let mut pages = Vec::new();
     for (line_no, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -406,18 +407,15 @@ pub fn parse_jsonl(text: &str) -> Result<Vec<Page>> {
                 )
             })?;
         for (page_idx, page) in results.iter().enumerate() {
-            let page = parse_page(page)
+            let page = parse_page(page, base_page + page_idx)
                 .with_context(|| format!("cache JSONL line {} page {}", line_no + 1, page_idx + 1))?;
             pages.push(page);
         }
     }
-    for (index, page) in pages.iter_mut().enumerate() {
-        page.page_no = index + 1;
-    }
     Ok(pages)
 }
 
-fn parse_page(value: &Value) -> Result<Page> {
+fn parse_page(value: &Value, page_no: usize) -> Result<Page> {
     let pruned = value.get("prunedResult").context("page missing prunedResult")?;
     let width = pruned.get("width").and_then(Value::as_f64).unwrap_or(0.0);
     let height = pruned.get("height").and_then(Value::as_f64).unwrap_or(0.0);
@@ -461,7 +459,7 @@ fn parse_page(value: &Value) -> Result<Page> {
         blocks.push(PageBlock { label, content, bbox });
     }
     Ok(Page {
-        page_no: 0,
+        page_no,
         width,
         height,
         angle,
@@ -570,10 +568,11 @@ pub fn pair_figures(page: &Page) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>
             paired_captions.insert(caption);
         }
     }
+    let paired_images: BTreeSet<usize> = pairs.iter().map(|&(image, _)| image).collect();
     let unpaired_images = image_indices
         .iter()
         .copied()
-        .filter(|i| !pairs.iter().any(|&(image, _)| image == *i))
+        .filter(|i| !paired_images.contains(i))
         .collect();
     let unpaired_captions = caption_indices
         .iter()
@@ -632,7 +631,17 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                 .unpaired_images
                 .push(figure_src(page, &page.blocks[image]));
         }
+        let mut push_child = |parent: NodeId, kind: NodeKind| -> NodeId {
+            let node_id = NodeId(tree.len());
+            tree.push(Node {
+                kind,
+                children: Vec::new(),
+            });
+            tree[parent.0].children.push(node_id);
+            node_id
+        };
         for (block_idx, block) in page.blocks.iter().enumerate() {
+            let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
             match &block.label {
                 BlockLabel::Ignored(_) => {}
                 BlockLabel::DocTitle => {
@@ -644,15 +653,10 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                         report.suspicious_headings.push(block.content.clone());
                     }
                     heading_stack.clear();
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::Heading {
-                            level: 1,
-                            title: block.content.clone(),
-                        },
-                        children: Vec::new(),
+                    let node_id = push_child(root, NodeKind::Heading {
+                        level: 1,
+                        title: block.content.clone(),
                     });
-                    tree[root.0].children.push(node_id);
                     heading_stack.push((node_id, 1));
                     report.doc_title_headings.push((node_id, page.page_no));
                     report.root_headings.push((node_id, page.page_no));
@@ -667,63 +671,34 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                         }
                     }
                     let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::Heading {
-                            level,
-                            title: remainder.to_string(),
-                        },
-                        children: Vec::new(),
+                    let node_id = push_child(parent, NodeKind::Heading {
+                        level,
+                        title: remainder.to_string(),
                     });
-                    tree[parent.0].children.push(node_id);
                     heading_stack.push((node_id, level));
                     if parent == root {
                         report.root_headings.push((node_id, page.page_no));
                     }
                 }
                 BlockLabel::Text | BlockLabel::Abstract | BlockLabel::ReferenceContent => {
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::Paragraph {
-                            text: block.content.clone(),
-                        },
-                        children: Vec::new(),
+                    push_child(parent, NodeKind::Paragraph {
+                        text: block.content.clone(),
                     });
-                    tree[parent.0].children.push(node_id);
                 }
                 BlockLabel::Algorithm => {
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::CodeBlock {
-                            text: block.content.clone(),
-                        },
-                        children: Vec::new(),
+                    push_child(parent, NodeKind::CodeBlock {
+                        text: block.content.clone(),
                     });
-                    tree[parent.0].children.push(node_id);
                 }
                 BlockLabel::DisplayFormula => {
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::MathBlock {
-                            text: block.content.clone(),
-                        },
-                        children: Vec::new(),
+                    push_child(parent, NodeKind::MathBlock {
+                        text: block.content.clone(),
                     });
-                    tree[parent.0].children.push(node_id);
                 }
                 BlockLabel::Table => {
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::Table {
-                            text: block.content.clone(),
-                        },
-                        children: Vec::new(),
+                    push_child(parent, NodeKind::Table {
+                        text: block.content.clone(),
                     });
-                    tree[parent.0].children.push(node_id);
                 }
                 BlockLabel::Image | BlockLabel::Chart => {
                     let src = figure_src(page, block);
@@ -731,29 +706,17 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                         .get(&block_idx)
                         .map(|&c| page.blocks[c].content.clone())
                         .unwrap_or_default();
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                    let node_id = NodeId(tree.len());
-                    tree.push(Node {
-                        kind: NodeKind::Figure {
-                            src,
-                            caption,
-                            description: None,
-                        },
-                        children: Vec::new(),
+                    push_child(parent, NodeKind::Figure {
+                        src,
+                        caption,
+                        description: None,
                     });
-                    tree[parent.0].children.push(node_id);
                 }
                 BlockLabel::FigureTitle => {
-                    if !pairs.iter().any(|&(_, caption)| caption == block_idx) {
-                        let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
-                        let node_id = NodeId(tree.len());
-                        tree.push(Node {
-                            kind: NodeKind::Paragraph {
-                                text: block.content.clone(),
-                            },
-                            children: Vec::new(),
+                    if unpaired_captions.contains(&block_idx) {
+                        push_child(parent, NodeKind::Paragraph {
+                            text: block.content.clone(),
                         });
-                        tree[parent.0].children.push(node_id);
                     }
                 }
             }
@@ -977,6 +940,28 @@ fn yaml_quoted(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Shared tail of every frontmatter kind: description/resource/tags/generated/sources.
+fn push_frontmatter_common(
+    out: &mut String,
+    stem: &str,
+    at: &str,
+    resource: &str,
+    source_title: Option<&str>,
+) {
+    out.push_str("description: \"\"\n");
+    out.push_str(&format!("resource: {resource}\n"));
+    out.push_str("tags: []\n");
+    out.push_str(&format!(
+        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
+    ));
+    out.push_str(&format!(
+        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
+    ));
+    if let Some(title) = source_title {
+        out.push_str(&format!("    title: {}\n", yaml_quoted(title)));
+    }
+}
+
 pub fn frontmatter(stem: &str, report: &ProjectReport, at: &str) -> String {
     let title = report.title.as_deref().unwrap_or_default();
     let arxiv = arxiv_id_from_stem(stem);
@@ -1001,15 +986,7 @@ pub fn frontmatter(stem: &str, report: &ProjectReport, at: &str) -> String {
             .join(", ");
         out.push_str(&format!("affiliations: [{list}]\n"));
     }
-    out.push_str("description: \"\"\n");
-    out.push_str(&format!("resource: ../pdf/{stem}.pdf\n"));
-    out.push_str("tags: []\n");
-    out.push_str(&format!(
-        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
-    ));
-    out.push_str(&format!(
-        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
-    ));
+    push_frontmatter_common(&mut out, stem, at, &format!("../pdf/{stem}.pdf"), None);
     out.push_str("owner: machine\n");
     if let Some(id) = arxiv {
         out.push_str(&format!("arxiv: \"{id}\"\n"));
@@ -1032,7 +1009,7 @@ fn render_node(doc: &StructuredDocument, node_id: NodeId) -> String {
         NodeKind::MathBlock { text } => text.clone(),
         NodeKind::Table { text } => text.clone(),
         NodeKind::Figure { src, caption, .. } => format!("![{caption}]({src})"),
-        NodeKind::Root => String::new(),
+        NodeKind::Root => unreachable!("render_node is only called on children"),
     }
 }
 
@@ -1088,15 +1065,7 @@ fn book_frontmatter(stem: &str, title: &str, at: &str) -> String {
     let mut out = String::from("---\n");
     out.push_str("type: book\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(title)));
-    out.push_str("description: \"\"\n");
-    out.push_str(&format!("resource: ../pdf/{stem}.pdf\n"));
-    out.push_str("tags: []\n");
-    out.push_str(&format!(
-        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
-    ));
-    out.push_str(&format!(
-        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
-    ));
+    push_frontmatter_common(&mut out, stem, at, &format!("../pdf/{stem}.pdf"), None);
     out.push_str("owner: machine\n");
     out.push_str("---\n");
     out
@@ -1113,19 +1082,13 @@ fn chapter_frontmatter(
     let mut out = String::from("---\n");
     out.push_str("type: chapter\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(title)));
-    out.push_str("description: \"\"\n");
-    out.push_str(&format!(
-        "resource: ../pdf/{stem}.pdf#{}-{}\n",
-        pages.0, pages.1
-    ));
-    out.push_str("tags: []\n");
-    out.push_str(&format!(
-        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
-    ));
-    out.push_str(&format!(
-        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n    title: {}\n",
-        yaml_quoted(book_title)
-    ));
+    push_frontmatter_common(
+        &mut out,
+        stem,
+        at,
+        &format!("../pdf/{stem}.pdf#{}-{}", pages.0, pages.1),
+        Some(book_title),
+    );
     out.push_str(&format!("book: {stem}\n"));
     out.push_str(&format!("chapter: {chapter}\n"));
     out.push_str("owner: machine\n");
@@ -1204,31 +1167,7 @@ fn write_book_bundle(
         .collect();
     let mut book_blocks = vec![format!("# {title}")];
     let mut chapters: Vec<(NodeId, String, Vec<String>)> = Vec::new();
-    for &child in &doc.node(doc.root).children {
-        if let NodeKind::Heading {
-            title: heading_title,
-            ..
-        } = &doc.node(child).kind
-        {
-            let one_line = one_line(heading_title);
-            if doc_title_nodes.contains(&child) || is_chapter_title(&one_line) {
-                let mut body = vec![format!("# {one_line}")];
-                collect_render(doc, child, &mut body);
-                chapters.push((child, one_line, body));
-            } else {
-                let mut blocks = Vec::new();
-                let block = render_node(doc, child);
-                if !block.is_empty() {
-                    blocks.push(block);
-                }
-                collect_render(doc, child, &mut blocks);
-                match chapters.last_mut() {
-                    Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
-                    None => book_blocks.extend(blocks),
-                }
-            }
-            continue;
-        }
+    let mut append_rendered = |child: NodeId, chapters: &mut Vec<(NodeId, String, Vec<String>)>| {
         let mut blocks = Vec::new();
         let block = render_node(doc, child);
         if !block.is_empty() {
@@ -1238,6 +1177,21 @@ fn write_book_bundle(
         match chapters.last_mut() {
             Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
             None => book_blocks.extend(blocks),
+        }
+    };
+    for &child in &doc.node(doc.root).children {
+        let chapter_title = match &doc.node(child).kind {
+            NodeKind::Heading { title, .. } => Some(one_line(title)),
+            _ => None,
+        };
+        if let Some(chapter_title) = chapter_title
+            .filter(|title| doc_title_nodes.contains(&child) || is_chapter_title(title))
+        {
+            let mut body = vec![format!("# {chapter_title}")];
+            collect_render(doc, child, &mut body);
+            chapters.push((child, chapter_title, body));
+        } else {
+            append_rendered(child, &mut chapters);
         }
     }
     book_blocks.push("See [index.md](index.md) for the chapter listing.".to_string());
@@ -1349,8 +1303,19 @@ pub fn render_figures(
     fig_dir: &Path,
     pages: &[Page],
 ) -> Result<()> {
-    let srcs = figure_srcs(doc);
-    if srcs.is_empty() {
+    let mut by_page: BTreeMap<usize, Vec<(PathBuf, Bbox)>> = BTreeMap::new();
+    for src in figure_srcs(doc) {
+        let dest = fig_dir.join(src.rsplit('/').next().unwrap_or(&src));
+        if dest.exists() {
+            continue;
+        }
+        let Some((page_no, bbox)) = parse_figure_src(&src) else {
+            eprintln!("warning: unrenderable figure src {src}");
+            continue;
+        };
+        by_page.entry(page_no).or_default().push((dest, bbox));
+    }
+    if by_page.is_empty() {
         return Ok(());
     }
     fs::create_dir_all(fig_dir)
@@ -1362,15 +1327,7 @@ pub fn render_figures(
     let document = pdfium
         .load_pdf_from_file(pdf_path, None)
         .with_context(|| format!("failed to open PDF {}", pdf_path.display()))?;
-    for src in &srcs {
-        let dest = fig_dir.join(src.rsplit('/').next().unwrap_or(src));
-        if dest.exists() {
-            continue;
-        }
-        let Some((page_no, bbox)) = parse_figure_src(src) else {
-            eprintln!("warning: unrenderable figure src {src}");
-            continue;
-        };
+    for (page_no, figures) in &by_page {
         let ocr_page = pages
             .get(page_no - 1)
             .with_context(|| format!("no OCR page data for page {page_no}"))?;
@@ -1385,8 +1342,6 @@ pub fn render_figures(
             .with_context(|| format!("PDF has no page {page_no}"))?;
         let px_per_pt = ocr_page.width / page.width().value as f64;
         let to_render_px = |value: i64| (value as f64 / px_per_pt * 300.0 / 72.0).round() as u32;
-        let (left, top) = (to_render_px(bbox.x1), to_render_px(bbox.y1));
-        let (right, bottom) = (to_render_px(bbox.x2), to_render_px(bbox.y2));
         let bitmap = page
             .render_with_config(
                 &pdfium_render::prelude::PdfRenderConfig::new()
@@ -1395,13 +1350,17 @@ pub fn render_figures(
             .context("failed to render page")?;
         let image = bitmap.as_image().context("failed to decode rendered page")?;
         let (width, height) = (image.width(), image.height());
-        let right = right.min(width.saturating_sub(1)).max(left + 1);
-        let bottom = bottom.min(height.saturating_sub(1)).max(top + 1);
-        let cropped = image.crop_imm(left, top, right - left, bottom - top);
-        cropped
-            .save(&dest)
-            .with_context(|| format!("failed to save figure {}", dest.display()))?;
-        eprintln!("figure {} rendered", dest.display());
+        for (dest, bbox) in figures {
+            let (left, top) = (to_render_px(bbox.x1), to_render_px(bbox.y1));
+            let (right, bottom) = (to_render_px(bbox.x2), to_render_px(bbox.y2));
+            let right = right.min(width.saturating_sub(1)).max(left + 1);
+            let bottom = bottom.min(height.saturating_sub(1)).max(top + 1);
+            let cropped = image.crop_imm(left, top, right - left, bottom - top);
+            cropped
+                .save(dest)
+                .with_context(|| format!("failed to save figure {}", dest.display()))?;
+            eprintln!("figure {} rendered", dest.display());
+        }
     }
     Ok(())
 }
@@ -1411,9 +1370,10 @@ pub struct PaddleOcrClient {
     access_token: String,
     model: String,
     http: reqwest::Client,
-    retry_delay: Duration,
     submit_limiter: Arc<governor::DefaultDirectRateLimiter>,
 }
+
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 impl PaddleOcrClient {
     pub fn from_config(cfg: &PdfConfig) -> Result<Self> {
@@ -1430,32 +1390,43 @@ impl PaddleOcrClient {
             access_token: cfg.access_token.clone(),
             model: cfg.model.clone(),
             http,
-            retry_delay: Duration::from_secs(1),
             submit_limiter: Arc::new(RateLimiter::direct(
                 Quota::with_period(SUBMIT_PERIOD).expect("submit period is valid"),
             )),
         })
     }
 
-    pub async fn submit(&self, slice_path: &Path) -> Result<String> {
+    /// Retry `f` with exponential backoff while it returns Transient errors.
+    async fn retry<T, Fut>(&self, label: &str, mut f: impl FnMut() -> Fut) -> Result<T, OcrError>
+    where
+        Fut: std::future::Future<Output = Result<T, OcrError>>,
+    {
         let mut attempt = 0u32;
         loop {
-            self.submit_limiter.until_ready().await;
-            match self.try_submit(slice_path).await {
-                Ok(job_id) => return Ok(job_id),
+            match f().await {
+                Ok(value) => return Ok(value),
                 Err(OcrError {
                     kind: ApiErrorKind::Transient,
                     message,
                     ..
                 }) => {
-                    let delay = backoff(self.retry_delay, attempt);
+                    let delay = backoff(RETRY_DELAY, attempt);
                     attempt += 1;
-                    eprintln!("[PaddleOCR] submit retry {attempt} after {delay:?}: {message}");
+                    eprintln!("[PaddleOCR] {label} retry {attempt} after {delay:?}: {message}");
                     tokio::time::sleep(delay).await;
                 }
-                Err(e) => bail!("submit failed: {e}"),
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    pub async fn submit(&self, slice_path: &Path) -> Result<String> {
+        self.retry("submit", || async move {
+            self.submit_limiter.until_ready().await;
+            self.try_submit(slice_path).await
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("submit failed: {e}"))
     }
 
     async fn try_submit(&self, slice_path: &Path) -> Result<String, OcrError> {
@@ -1490,22 +1461,7 @@ impl PaddleOcrClient {
             message: format!("non-JSON submit response: {e}"),
             kind: ApiErrorKind::Terminal,
         })?;
-        if let Some(code) = pick(&body, CODE_KEYS).and_then(Value::as_i64).filter(|&c| c != 0) {
-            return Err(OcrError {
-                status,
-                code: Some(code),
-                message: response_message(&body),
-                kind: classify_error(status, Some(code)),
-            });
-        }
-        if !(200..300).contains(&status) {
-            return Err(OcrError {
-                status,
-                code: None,
-                message: response_message(&body),
-                kind: classify_error(status, None),
-            });
-        }
+        check_response(status, &body)?;
         find_job_id(&body).ok_or_else(|| OcrError {
             status,
             code: None,
@@ -1535,22 +1491,7 @@ impl PaddleOcrClient {
             message: format!("non-JSON poll response: {e}"),
             kind: ApiErrorKind::Terminal,
         })?;
-        if let Some(code) = pick(&body, CODE_KEYS).and_then(Value::as_i64).filter(|&c| c != 0) {
-            return Err(OcrError {
-                status,
-                code: Some(code),
-                message: response_message(&body),
-                kind: classify_error(status, Some(code)),
-            });
-        }
-        if !(200..300).contains(&status) {
-            return Err(OcrError {
-                status,
-                code: None,
-                message: response_message(&body),
-                kind: classify_error(status, None),
-            });
-        }
+        check_response(status, &body)?;
         let state = pick(&body, &["state", "State"])
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -1576,23 +1517,11 @@ impl PaddleOcrClient {
     }
 
     pub async fn download(&self, result_url: &str, dest: &Path) -> Result<()> {
-        let mut attempt = 0u32;
-        loop {
-            match self.try_download(result_url, dest).await {
-                Ok(()) => return Ok(()),
-                Err(OcrError {
-                    kind: ApiErrorKind::Transient,
-                    message,
-                    ..
-                }) => {
-                    let delay = backoff(self.retry_delay, attempt);
-                    attempt += 1;
-                    eprintln!("[PaddleOCR] download retry {attempt} after {delay:?}: {message}");
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => bail!("download failed: {e}"),
-            }
-        }
+        self.retry("download", || async move {
+            self.try_download(result_url, dest).await
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("download failed: {e}"))
     }
 
     async fn try_download(&self, result_url: &str, dest: &Path) -> Result<(), OcrError> {
@@ -1662,6 +1591,27 @@ impl fmt::Display for OcrError {
 }
 
 impl std::error::Error for OcrError {}
+
+/// Reject non-2xx responses and non-zero API codes as an OcrError.
+fn check_response(status: u16, body: &Value) -> Result<(), OcrError> {
+    if let Some(code) = pick(body, CODE_KEYS).and_then(Value::as_i64).filter(|&c| c != 0) {
+        return Err(OcrError {
+            status,
+            code: Some(code),
+            message: response_message(body),
+            kind: classify_error(status, Some(code)),
+        });
+    }
+    if !(200..300).contains(&status) {
+        return Err(OcrError {
+            status,
+            code: None,
+            message: response_message(body),
+            kind: classify_error(status, None),
+        });
+    }
+    Ok(())
+}
 
 fn classify_error(status: u16, code: Option<i64>) -> ApiErrorKind {
     match code {
@@ -1737,22 +1687,6 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
     jittered(capped)
 }
 
-struct FixedRateLimiter {
-    interval: tokio::time::Interval,
-}
-
-impl FixedRateLimiter {
-    fn new(period: Duration) -> Self {
-        Self {
-            interval: tokio::time::interval(period),
-        }
-    }
-
-    async fn tick(&mut self) {
-        self.interval.tick().await;
-    }
-}
-
 struct InFlightJob {
     index: usize,
     job_id: String,
@@ -1760,16 +1694,19 @@ struct InFlightJob {
     attempt: u32,
 }
 
+/// One-line plan summary, shared by dry-run and every stage entry point.
+pub fn plan_summary(pdf_path: &Path, page_count: u32, slices: usize, slice_pages: usize) -> String {
+    format!(
+        "{}: {page_count} pages · {slices} slices (up to {slice_pages} per slice)",
+        pdf_path.display()
+    )
+}
+
 pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, model: &str) -> Result<()> {
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, model)?;
-    eprintln!(
-        "{}: {} pages · {} slices (up to {slice_pages} per slice)",
-        pdf_path.display(),
-        pdf.page_count(),
-        plan.len()
-    );
+    eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
     for (index, &(start, end)) in plan.iter().enumerate() {
@@ -1838,13 +1775,18 @@ pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Re
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
-    let total = plan.len();
-    eprintln!(
-        "{}: {} pages · {} slices (up to {slice_pages} per slice)",
-        pdf_path.display(),
-        pdf.page_count(),
-        total
-    );
+    eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
+    run_ocr_with(&client, &pdf, &layout, &plan).await
+}
+
+/// OCR every uncached slice using a precomputed plan and layout, so a
+/// full-pipeline run shares one PDF open/hash/plan across stages.
+pub async fn run_ocr_with(
+    client: &Arc<PaddleOcrClient>,
+    pdf: &PdfDocument,
+    layout: &CacheLayout,
+    plan: &[(u32, u32)],
+) -> Result<()> {
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
     fs::create_dir_all(layout.results_dir())
@@ -1865,16 +1807,19 @@ pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Re
         eprintln!("all slices cached, nothing to OCR");
     }
 
-    let mut polling = submit_all_slices(&client, &layout, &pending).await?;
+    let mut polling = submit_all_slices(client, layout, &pending).await?;
 
-    let mut poll_limiter = FixedRateLimiter::new(Duration::from_millis(200));
+    let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
+    let poll_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
     let download_slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
     let (download_tx, mut download_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<()>)>();
+    let (poll_tx, mut poll_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(InFlightJob, Result<JobState, OcrError>)>();
     let mut done = 0usize;
     let total_pending = pending.len();
 
     while done < total_pending {
-        poll_limiter.tick().await;
+        poll_tick.tick().await;
         while let Ok((index, result)) = download_rx.try_recv() {
             match result {
                 Ok(()) => {
@@ -1884,11 +1829,62 @@ pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Re
                 Err(e) => bail!("slice {:04} download failed: {e:#}", index + 1),
             }
         }
+        while let Ok((job, result)) = poll_rx.try_recv() {
+            match result {
+                Ok(JobState::Running) => {
+                    polling.push(InFlightJob {
+                        next_poll_at: Instant::now() + jittered(Duration::from_secs(10)),
+                        ..job
+                    });
+                }
+                Ok(JobState::Done(url)) => {
+                    eprintln!("slice {:04} OCR done, downloading", job.index + 1);
+                    let client = Arc::clone(client);
+                    let slots = Arc::clone(&download_slots);
+                    let tx = download_tx.clone();
+                    let dest = layout.result_path(job.index);
+                    tokio::spawn(async move {
+                        let result = match slots.acquire().await {
+                            Ok(_permit) => client.download(&url, &dest).await,
+                            Err(e) => Err(anyhow::anyhow!("download semaphore closed: {e}")),
+                        };
+                        let _ = tx.send((job.index, result));
+                    });
+                }
+                Ok(JobState::Failed(message)) => {
+                    bail!("slice {:04} OCR job failed: {message}", job.index + 1)
+                }
+                Err(e) if e.kind == ApiErrorKind::Transient => {
+                    let delay = backoff(Duration::from_secs(10), job.attempt);
+                    eprintln!(
+                        "slice {:04} poll transient ({}), retrying in {delay:?}",
+                        job.index + 1,
+                        e.message
+                    );
+                    polling.push(InFlightJob {
+                        next_poll_at: Instant::now() + delay,
+                        attempt: job.attempt + 1,
+                        ..job
+                    });
+                }
+                Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
+            }
+        }
         if polling.is_empty() {
             tokio::time::sleep(Duration::from_millis(200)).await;
             continue;
         }
-        let Some(pos) = polling.iter().position(|j| j.next_poll_at <= Instant::now()) else {
+        let now = Instant::now();
+        let mut due = Vec::new();
+        let mut cursor = 0;
+        while cursor < polling.len() {
+            if polling[cursor].next_poll_at <= now {
+                due.push(polling.swap_remove(cursor));
+            } else {
+                cursor += 1;
+            }
+        }
+        if due.is_empty() {
             let earliest = polling
                 .iter()
                 .map(|j| j.next_poll_at)
@@ -1896,46 +1892,23 @@ pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Re
                 .expect("polling is not empty");
             tokio::time::sleep_until(earliest).await;
             continue;
-        };
-        let job = polling.swap_remove(pos);
-        match client.poll(&job.job_id).await {
-            Ok(JobState::Running) => {
-                polling.push(InFlightJob {
-                    next_poll_at: Instant::now() + jittered(Duration::from_secs(10)),
-                    ..job
-                });
-            }
-            Ok(JobState::Done(url)) => {
-                eprintln!("slice {:04} OCR done, downloading", job.index + 1);
-                let client = Arc::clone(&client);
-                let slots = Arc::clone(&download_slots);
-                let tx = download_tx.clone();
-                let dest = layout.result_path(job.index);
-                tokio::spawn(async move {
-                    let result = match slots.acquire().await {
-                        Ok(_permit) => client.download(&url, &dest).await,
-                        Err(e) => Err(anyhow::anyhow!("download semaphore closed: {e}")),
-                    };
-                    let _ = tx.send((job.index, result));
-                });
-            }
-            Ok(JobState::Failed(message)) => {
-                bail!("slice {:04} OCR job failed: {message}", job.index + 1)
-            }
-            Err(e) if e.kind == ApiErrorKind::Transient => {
-                let delay = backoff(Duration::from_secs(10), job.attempt);
-                eprintln!(
-                    "slice {:04} poll transient ({}), retrying in {delay:?}",
-                    job.index + 1,
-                    e.message
-                );
-                polling.push(InFlightJob {
-                    next_poll_at: Instant::now() + delay,
-                    attempt: job.attempt + 1,
-                    ..job
-                });
-            }
-            Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
+        }
+        for job in due {
+            let client = Arc::clone(client);
+            let slots = Arc::clone(&poll_slots);
+            let tx = poll_tx.clone();
+            tokio::spawn(async move {
+                let result = match slots.acquire().await {
+                    Ok(_permit) => client.poll(&job.job_id).await,
+                    Err(e) => Err(OcrError {
+                        status: 0,
+                        code: None,
+                        message: format!("poll semaphore closed: {e}"),
+                        kind: ApiErrorKind::Terminal,
+                    }),
+                };
+                let _ = tx.send((job, result));
+            });
         }
     }
     eprintln!("done");
@@ -1947,6 +1920,16 @@ pub fn run_merge(cfg: &PdfConfig, pdf_path: &Path, out: &Path, slice_pages: usiz
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
     let pdf_doc = PdfDocument::open(pdf_path)?;
     let plan = pdf_doc.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
+    run_merge_with(&layout, &plan, pdf_path, out)
+}
+
+/// Merge using a precomputed plan and layout (see [`run_ocr_with`]).
+pub fn run_merge_with(
+    layout: &CacheLayout,
+    plan: &[(u32, u32)],
+    pdf_path: &Path,
+    out: &Path,
+) -> Result<()> {
     let mut pages = Vec::new();
     for (index, &(start, _)) in plan.iter().enumerate() {
         let result_path = layout.result_path(index);
@@ -1960,10 +1943,7 @@ pub fn run_merge(cfg: &PdfConfig, pdf_path: &Path, out: &Path, slice_pages: usiz
         }
         let jsonl = std::fs::read_to_string(&result_path)
             .with_context(|| format!("failed to read {}", result_path.display()))?;
-        for mut page in parse_jsonl(&jsonl)? {
-            page.page_no += start as usize - 1;
-            pages.push(page);
-        }
+        pages.extend(parse_jsonl(&jsonl, start as usize)?);
     }
     let stem = pdf_path
         .file_stem()

@@ -221,7 +221,6 @@ fn test_client_with_submit_period(url: &str, period: Duration) -> PaddleOcrClien
         access_token: "test-token".to_string(),
         model: "PaddleOCR-VL-1.6".to_string(),
         http: reqwest::Client::builder().no_proxy().build().unwrap(),
-        retry_delay: Duration::from_millis(1),
         submit_limiter: Arc::new(RateLimiter::direct(Quota::with_period(period).unwrap())),
     }
 }
@@ -639,7 +638,7 @@ fn parse_jsonl_parses_pages_blocks() {
             block("paragraph_title", "1. Introduction", [82, 200, 400, 227]),
             block("text", "Some text.", [82, 240, 400, 300]),
         ]);
-    let pages = parse_jsonl(&jsonl_line(&[page])).unwrap();
+    let pages = parse_jsonl(&jsonl_line(&[page]), 1).unwrap();
 
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].page_no, 1);
@@ -660,7 +659,7 @@ fn parse_jsonl_marks_ignored_labels() {
             block("header_image", "decorative", [1100, 30, 1150, 60]),
             block("text", "body", [82, 100, 400, 200]),
         ]);
-    let pages = parse_jsonl(&jsonl_line(&[page])).unwrap();
+    let pages = parse_jsonl(&jsonl_line(&[page]), 1).unwrap();
 
     assert!(matches!(
         &pages[0].blocks[0].label,
@@ -688,7 +687,7 @@ fn parse_jsonl_marks_ignored_labels() {
 #[test]
 fn parse_jsonl_bails_on_error_code() {
     let line = r#"{"errorCode":12001,"errorMsg":"quota"}"#;
-    let error = parse_jsonl(line).unwrap_err();
+    let error = parse_jsonl(line, 1).unwrap_err();
     assert!(error.to_string().contains("12001"), "{error:#}");
     assert!(error.to_string().contains("quota"), "{error:#}");
 }
@@ -696,7 +695,7 @@ fn parse_jsonl_bails_on_error_code() {
 #[test]
 fn parse_jsonl_bails_on_unknown_label() {
     let page = page_json(&[block("weird_block", "x", [0, 0, 10, 10])]);
-    let error = parse_jsonl(&jsonl_line(&[page])).unwrap_err();
+    let error = parse_jsonl(&jsonl_line(&[page]), 1).unwrap_err();
     assert!(format!("{error:#}").contains("weird_block"), "{error:#}");
 }
 
@@ -731,7 +730,7 @@ fn project_builds_nested_tree() {
             block("paragraph_title", "References", [82, 760, 400, 787]),
             block("reference_content", "Ref one.", [82, 800, 600, 840]),
         ]);
-    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-paper").unwrap();
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-paper").unwrap();
 
     assert_eq!(report.title.as_deref(), Some("My Paper"));
     let root = doc.node(doc.root);
@@ -777,7 +776,7 @@ fn project_pairs_figures_and_reports_unpaired() {
             block("image", "", [100, 1000, 400, 1200]),
             block("figure_title", "Loose caption.", [82, 100, 400, 127]),
         ]);
-    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
 
     let root = doc.node(doc.root);
     assert_eq!(root.children.len(), 3);
@@ -845,7 +844,7 @@ fn project_extracts_marker_style_authors() {
             ),
             block("paragraph_title", "Abstract", [282, 500, 392, 529]),
         ]);
-    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
 
     assert_eq!(report.authors, vec!["Alice Chen", "Bob Wu", "Carol Zhou"]);
     assert_eq!(report.affiliations, vec!["Example University"]);
@@ -860,7 +859,7 @@ fn project_extracts_footnote_affiliations() {
             block("paragraph_title", "Abstract", [282, 324, 392, 353]),
             block("footnote", "$ ^{*} $Equal contribution  $ ^{1} $Example University, Springfield  $ ^{2} $Example Labs, Metropolis. Correspondence to: Alice Chen <alice@example.edu>.  $ ^{3} $Proceedings of the", [84, 1252, 600, 1387]),
         ]);
-    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
 
     assert_eq!(
         report.affiliations,
@@ -888,7 +887,7 @@ fn project_extracts_first_line_authors() {
             ),
             block("paragraph_title", "ABSTRACT", [282, 560, 392, 589]),
         ]);
-    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
 
     assert_eq!(report.authors, vec!["Dana Lin", "Erin Ma"]);
     assert_eq!(
@@ -907,7 +906,7 @@ fn project_treats_extra_doc_titles_as_chapter_headings() {
             block("doc_title", "Chapter 2. Next", [0, 60, 10, 70]),
             block("text", "Next body.", [0, 80, 10, 90]),
         ]);
-    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap();
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-book").unwrap();
 
     assert_eq!(report.title.as_deref(), Some("My Book"));
     assert_eq!(report.doc_title_headings.len(), 2);
@@ -934,7 +933,7 @@ fn project_treats_extra_doc_titles_as_chapter_headings() {
 #[test]
 fn project_bails_without_doc_title() {
     let page = page_json(&[block("text", "no title here", [0, 0, 10, 10])]);
-    let error = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "x").unwrap_err();
+    let error = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap_err();
     assert!(error.to_string().contains("doc_title"), "{error:#}");
 }
 
@@ -945,7 +944,7 @@ fn project_flags_suspicious_doc_title_headings() {
             block("doc_title", "My Book", [0, 0, 10, 10]),
             block("doc_title", "贝贝", [0, 20, 10, 30]),
         ]);
-    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap();
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-book").unwrap();
 
     assert_eq!(report.suspicious_headings, vec!["贝贝".to_string()]);
     let warnings = validate(&report).unwrap();
@@ -959,7 +958,7 @@ fn project_bails_on_heading_jump() {
             block("doc_title", "A", [0, 0, 10, 10]),
             block("paragraph_title", "2.1. Deep", [0, 20, 10, 30]),
         ]);
-    let error = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "x").unwrap_err();
+    let error = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap_err();
     assert!(error.to_string().contains("level jump"), "{error:#}");
 }
 
@@ -1273,7 +1272,7 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
 
 fn project_book(blocks: &[String]) -> (StructuredDocument, ProjectReport) {
     let page = page_json(blocks);
-    project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap()
+    project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-book").unwrap()
 }
 
 #[test]
@@ -1355,7 +1354,7 @@ fn write_book_bundle_writes_page_range_in_resource() {
             block("text", "body", [0, 20, 10, 30]),
         ]),
         page_json(&[block("doc_title", "Chapter 2. Next", [0, 0, 10, 10])]),
-    ]))
+    ]), 1)
     .unwrap();
     let (doc, report) = project(&pages, "my-book").unwrap();
     write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
@@ -1418,19 +1417,5 @@ fn write_book_bundle_suffixes_duplicate_chapter_slugs() {
     let index = fs::read_to_string(out.join("index.md")).unwrap();
     assert!(index.contains("(ch1.md)"), "{index}");
     assert!(index.contains("(ch1-2.md)"));
-}
-
-// ---------------------------------------------------------------
-// rate limiter
-// ---------------------------------------------------------------
-
-#[tokio::test]
-async fn fixed_rate_limiter_paces_ticks() {
-    let mut limiter = FixedRateLimiter::new(Duration::from_millis(50));
-    let start = Instant::now();
-    limiter.tick().await;
-    limiter.tick().await;
-    limiter.tick().await;
-    assert!(start.elapsed() >= Duration::from_millis(90));
 }
 
