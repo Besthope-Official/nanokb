@@ -166,49 +166,74 @@ fn test_client(url: &str) -> PaddleOcrClient {
 // ---------------------------------------------------------------
 
 #[test]
-fn slice_reports_page_count() {
+fn plan_slices_uses_configured_pages_when_fitting() {
     let dir = TestDirectory::new();
     let path = make_test_pdf(&dir, "book.pdf", 5);
-
-    let pdf = PdfDocument::open(&path, 2).unwrap();
+    let pdf = PdfDocument::open(&path).unwrap();
 
     assert_eq!(pdf.page_count(), 5);
-    assert_eq!(pdf.slice_count(), 3);
+    let plan = pdf.plan_slices(2, MAX_SLICE_BYTES).unwrap();
+    assert_eq!(plan, vec![(1, 2), (3, 4), (5, 5)]);
+
+    let plan = pdf.plan_slices(20, MAX_SLICE_BYTES).unwrap();
+    assert_eq!(plan, vec![(1, 5)]);
+
+    let error = pdf.plan_slices(0, MAX_SLICE_BYTES).unwrap_err();
+    assert!(error.to_string().contains("slice-pages"), "{error:#}");
 }
 
 #[test]
 fn slice_writes_exact_page_ranges() {
     let dir = TestDirectory::new();
     let path = make_test_pdf(&dir, "book.pdf", 7);
-    let pdf = PdfDocument::open(&path, 2).unwrap();
+    let pdf = PdfDocument::open(&path).unwrap();
 
-    assert_eq!(pdf.page_range(0), (1, 2));
-    assert_eq!(pdf.page_range(2), (5, 6));
-    assert_eq!(pdf.page_range(3), (7, 7));
+    let plan = pdf.plan_slices(2, MAX_SLICE_BYTES).unwrap();
+    assert_eq!(plan, vec![(1, 2), (3, 4), (5, 6), (7, 7)]);
 
     let dest = dir.path().join("slice2.pdf");
-    pdf.write_slice(2, &dest).unwrap();
+    pdf.write_slice(5, 6, &dest).unwrap();
     let reopened = Document::load(&dest).unwrap();
     assert_eq!(reopened.get_pages().len(), 2);
     assert!(reopened.objects.len() < pdf.doc.objects.len());
 
     let dest = dir.path().join("slice3.pdf");
-    pdf.write_slice(3, &dest).unwrap();
+    pdf.write_slice(7, 7, &dest).unwrap();
     let reopened = Document::load(&dest).unwrap();
     assert_eq!(reopened.get_pages().len(), 1);
 }
 
 #[test]
-fn slice_edges() {
+fn plan_slices_shrinks_under_byte_cap() {
     let dir = TestDirectory::new();
-    let path = make_test_pdf(&dir, "book.pdf", 5);
+    let path = make_test_pdf(&dir, "book.pdf", 4);
+    let pdf = PdfDocument::open(&path).unwrap();
 
-    let pdf = PdfDocument::open(&path, 20).unwrap();
-    assert_eq!(pdf.slice_count(), 1);
-    assert_eq!(pdf.page_range(0), (1, 5));
+    let cap = (1..=4)
+        .map(|p| pdf.extract_size(p, p).unwrap())
+        .max()
+        .unwrap();
+    let plan = pdf.plan_slices(2, cap).unwrap();
+    assert_eq!(plan, vec![(1, 1), (2, 2), (3, 3), (4, 4)]);
 
-    let error = PdfDocument::open(&path, 0).unwrap_err();
-    assert!(error.to_string().contains("slice-pages"), "{error:#}");
+    let cap = (1..=3)
+        .flat_map(|s| (s..=4).map(move |e| (s, e)))
+        .filter(|&(s, e)| e - s + 1 <= 2)
+        .map(|(s, e)| pdf.extract_size(s, e).unwrap())
+        .max()
+        .unwrap();
+    let plan = pdf.plan_slices(2, cap).unwrap();
+    assert_eq!(plan, vec![(1, 2), (3, 4)]);
+}
+
+#[test]
+fn plan_slices_bails_when_single_page_exceeds_cap() {
+    let dir = TestDirectory::new();
+    let path = make_test_pdf(&dir, "book.pdf", 3);
+    let pdf = PdfDocument::open(&path).unwrap();
+
+    let error = pdf.plan_slices(2, 1).unwrap_err();
+    assert!(format!("{error:#}").contains("exceeding"), "{error:#}");
 }
 
 // ---------------------------------------------------------------
@@ -427,6 +452,21 @@ async fn download_writes_body_verbatim() {
     client.download(&server.url, &dest).await.unwrap();
 
     assert_eq!(fs::read(&dest).unwrap(), body.as_bytes());
+    assert!(!dir.path().join("0001.tmp").exists());
+}
+
+#[test]
+fn write_file_atomic_leaves_no_partial_dest_on_error() {
+    let dir = TestDirectory::new();
+    let dest = dir.path().join("missing").join("0001.jsonl");
+
+    assert!(write_file_atomic(&dest, b"bytes").is_err());
+    assert!(!dest.exists());
+
+    let dest = dir.path().join("0001.jsonl");
+    write_file_atomic(&dest, b"bytes").unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), b"bytes");
+    assert!(!dir.path().join("0001.tmp").exists());
 }
 
 #[tokio::test]
@@ -1040,15 +1080,34 @@ async fn refresh_images_downloads_and_skips_existing() {
     let layout = layout_with_result(&dir, &jsonl);
     let client = test_client(&server.url);
 
-    refresh_images(&client, &layout, 1, 20).await.unwrap();
+    refresh_images(&client, &layout, &[(1, 20)]).await.unwrap();
 
     let image = layout.images_dir().join("1_img_in_image_box_10_20_30_40.jpg");
     assert!(image.exists());
     assert_eq!(fs::read(&image).unwrap(), body.as_bytes());
     assert!(server.requests.recv().is_ok());
 
-    refresh_images(&client, &layout, 1, 20).await.unwrap();
+    refresh_images(&client, &layout, &[(1, 20)]).await.unwrap();
     assert!(server.requests.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+}
+
+#[tokio::test]
+async fn refresh_images_uses_plan_page_offsets() {
+    let body = "jpeg";
+    let server = start_mock_server(vec![(200, body), (200, body)]);
+    let dir = TestDirectory::new();
+    let jsonl = jsonl_line(&[page_json(
+        &[block("text", "a", [0, 0, 10, 10])],
+        &format!(r#""imgs/x.jpg": "{}""#, server.url),
+    )]);
+    let layout = layout_with_result(&dir, &jsonl);
+    fs::write(layout.result_path(1), &jsonl).unwrap();
+    let client = test_client(&server.url);
+
+    refresh_images(&client, &layout, &[(1, 2), (3, 4)]).await.unwrap();
+
+    assert!(layout.image_path(1, "x.jpg").exists());
+    assert!(layout.image_path(3, "x.jpg").exists());
 }
 
 #[tokio::test]
@@ -1065,7 +1124,7 @@ async fn refresh_images_warns_and_continues_on_404() {
     let layout = layout_with_result(&dir, &jsonl);
     let client = test_client(&server.url);
 
-    refresh_images(&client, &layout, 1, 20).await.unwrap();
+    refresh_images(&client, &layout, &[(1, 20)]).await.unwrap();
 
     assert!(!layout.images_dir().join("1_img_in_image_box_10_20_30_40.jpg").exists());
 }
@@ -1083,3 +1142,4 @@ async fn fixed_rate_limiter_paces_ticks() {
     limiter.tick().await;
     assert!(start.elapsed() >= Duration::from_millis(90));
 }
+

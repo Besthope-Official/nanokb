@@ -356,9 +356,10 @@ async fn run_pdf_probe(config: &AppConfig, file: &Path, slice_pages: Option<usiz
 async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<()> {
     let slice_pages = config.pdf.slice_pages;
     let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
-    let slice_count = pdf::PdfDocument::open(file, slice_pages)?.slice_count();
+    let pdf_doc = pdf::PdfDocument::open(file)?;
+    let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
     let mut pages = Vec::new();
-    for index in 0..slice_count {
+    for (index, &(start, _)) in plan.iter().enumerate() {
         let result_path = layout.result_path(index);
         if !result_path.exists() {
             bail!(
@@ -371,7 +372,7 @@ async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<(
         let jsonl = std::fs::read_to_string(&result_path)
             .with_context(|| format!("failed to read {}", result_path.display()))?;
         for mut page in pdf::parse_jsonl(&jsonl)? {
-            page.page_no += index * slice_pages;
+            page.page_no += start as usize - 1;
             pages.push(page);
         }
     }

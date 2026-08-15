@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-const MAX_SLICE_BYTES: u64 = 50 * 1024 * 1024;
+pub const MAX_SLICE_BYTES: u64 = 50 * 1024 * 1024;
 const CLIENT_PLATFORM: &str = "nanokb";
 const CODE_KEYS: &[&str] = &["code", "err_code", "error_code"];
 const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_msg", "errMsg"];
@@ -23,12 +23,10 @@ const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_
 pub struct PdfDocument {
     doc: Document,
     pages: u32,
-    slice_pages: usize,
 }
 
 impl PdfDocument {
-    pub fn open(path: &Path, slice_pages: usize) -> Result<Self> {
-        ensure!(slice_pages >= 1, "--slice-pages must be at least 1");
+    pub fn open(path: &Path) -> Result<Self> {
         let doc = Document::load(path)
             .with_context(|| format!("failed to load PDF {}", path.display()))?;
         ensure!(
@@ -38,33 +36,58 @@ impl PdfDocument {
         );
         let pages = doc.get_pages().len() as u32;
         ensure!(pages >= 1, "PDF {} has no pages", path.display());
-        Ok(Self {
-            doc,
-            pages,
-            slice_pages,
-        })
+        Ok(Self { doc, pages })
     }
 
     pub fn page_count(&self) -> u32 {
         self.pages
     }
 
-    pub fn slice_count(&self) -> usize {
-        self.pages.div_ceil(self.slice_pages as u32) as usize
+    pub fn plan_slices(&self, slice_pages: usize, max_bytes: u64) -> Result<Vec<(u32, u32)>> {
+        ensure!(slice_pages >= 1, "--slice-pages must be at least 1");
+        let mut ranges = Vec::new();
+        let mut start = 1u32;
+        while start <= self.pages {
+            let window_end = (start + slice_pages as u32 - 1).min(self.pages);
+            if self.extract_size(start, window_end)? <= max_bytes {
+                ranges.push((start, window_end));
+            } else {
+                let mut low = start;
+                let mut high = window_end;
+                while low < high {
+                    let mid = low + (high - low).div_ceil(2);
+                    if self.extract_size(start, mid)? <= max_bytes {
+                        low = mid;
+                    } else {
+                        high = mid - 1;
+                    }
+                }
+                ensure!(
+                    self.extract_size(start, low)? <= max_bytes,
+                    "page {start} alone is {} MB, exceeding the {} MB slice cap",
+                    self.extract_size(start, low)? / 1024 / 1024,
+                    max_bytes / 1024 / 1024
+                );
+                ranges.push((start, low));
+            }
+            start = ranges.last().expect("range just pushed").1 + 1;
+        }
+        Ok(ranges)
     }
 
-    pub fn page_range(&self, index: usize) -> (u32, u32) {
-        let start = index as u32 * self.slice_pages as u32 + 1;
-        let end = (start + self.slice_pages as u32 - 1).min(self.pages);
-        (start, end)
+    fn extract_size(&self, start: u32, end: u32) -> Result<u64> {
+        let mut buffer = Vec::new();
+        self.extract_pages(start, end)?
+            .save_to(&mut buffer)
+            .context("failed to serialize slice")?;
+        Ok(buffer.len() as u64)
     }
 
-    pub fn write_slice(&self, index: usize, dest: &Path) -> Result<()> {
-        let (start, end) = self.page_range(index);
+    fn extract_pages(&self, start: u32, end: u32) -> Result<Document> {
         let pages = self.doc.get_pages();
         let kept_pages: BTreeSet<ObjectId> =
             pages.range(start..=end).map(|(_, &id)| id).collect();
-        ensure!(!kept_pages.is_empty(), "slice {:04} has no pages", index + 1);
+        ensure!(!kept_pages.is_empty(), "slice {start}-{end} has no pages");
 
         let catalog_id = self
             .doc
@@ -124,21 +147,20 @@ impl PdfDocument {
         let count = filter_page_tree(&mut slice, pages_root, &kept_pages);
         ensure!(
             count as usize == kept_pages.len(),
-            "slice {:04}: page tree kept {count} pages, expected {}",
-            index + 1,
+            "slice {start}-{end}: page tree kept {count} pages, expected {}",
             kept_pages.len()
         );
+        Ok(slice)
+    }
 
+    pub fn write_slice(&self, start: u32, end: u32, dest: &Path) -> Result<()> {
+        let mut slice = self.extract_pages(start, end)?;
+        let tmp = dest.with_extension("tmp");
         slice
-            .save(dest)
+            .save(&tmp)
             .with_context(|| format!("failed to save slice {}", dest.display()))?;
-        let size = fs::metadata(dest)?.len();
-        ensure!(
-            size <= MAX_SLICE_BYTES,
-            "slice {:04} (pages {start}-{end}) is {} MB, exceeding the 50 MB multipart limit; lower --slice-pages",
-            index + 1,
-            size / 1024 / 1024
-        );
+        fs::rename(&tmp, dest)
+            .with_context(|| format!("failed to rename slice into {}", dest.display()))?;
         Ok(())
     }
 }
@@ -1282,10 +1304,10 @@ impl PaddleOcrClient {
             message: format!("download body failed: {e}"),
             kind: ApiErrorKind::Terminal,
         })?;
-        fs::write(dest, &bytes).map_err(|e| OcrError {
+        write_file_atomic(dest, &bytes).map_err(|e| OcrError {
             status,
             code: None,
-            message: format!("failed to write {}: {e}", dest.display()),
+            message: format!("failed to write {}: {e:#}", dest.display()),
             kind: ApiErrorKind::Terminal,
         })
     }
@@ -1376,6 +1398,16 @@ fn find_result_url(value: &Value) -> Option<String> {
     }
 }
 
+fn write_file_atomic(dest: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = dest.with_extension("tmp");
+    if let Err(e) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to write {}", dest.display()));
+    }
+    fs::rename(&tmp, dest)
+        .with_context(|| format!("failed to rename download into {}", dest.display()))
+}
+
 fn jittered(base: Duration) -> Duration {
     base + base.mul_f64(rand::thread_rng().gen_range(0.0..1.0))
 }
@@ -1411,25 +1443,23 @@ struct InFlightJob {
 }
 
 pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, model: &str) -> Result<()> {
-    let pdf = PdfDocument::open(pdf_path, slice_pages)?;
+    let pdf = PdfDocument::open(pdf_path)?;
+    let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, model)?;
-    let total = pdf.slice_count();
     eprintln!(
-        "{}: {} pages · {} slices ({} per slice)",
+        "{}: {} pages · {} slices (up to {slice_pages} per slice)",
         pdf_path.display(),
         pdf.page_count(),
-        total,
-        slice_pages
+        plan.len()
     );
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
-    for index in 0..total {
+    for (index, &(start, end)) in plan.iter().enumerate() {
         let dest = layout.slice_path(index);
         if dest.exists() {
             continue;
         }
-        pdf.write_slice(index, &dest)?;
-        let (start, end) = pdf.page_range(index);
+        pdf.write_slice(start, end, &dest)?;
         eprintln!("slice {:04} (pages {start}-{end})", index + 1);
     }
     Ok(())
@@ -1437,15 +1467,15 @@ pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, model: &str) ->
 
 pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
     let client = Arc::new(PaddleOcrClient::from_config(cfg)?);
-    let pdf = PdfDocument::open(pdf_path, slice_pages)?;
+    let pdf = PdfDocument::open(pdf_path)?;
+    let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
-    let total = pdf.slice_count();
+    let total = plan.len();
     eprintln!(
-        "{}: {} pages · {} slices ({} per slice)",
+        "{}: {} pages · {} slices (up to {slice_pages} per slice)",
         pdf_path.display(),
         pdf.page_count(),
-        total,
-        slice_pages
+        total
     );
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
@@ -1453,13 +1483,13 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
         .with_context(|| format!("failed to create {}", layout.results_dir().display()))?;
 
     let mut pending = Vec::new();
-    for index in 0..total {
+    for (index, &(start, end)) in plan.iter().enumerate() {
         if layout.has_result(index) {
             eprintln!("slice {:04} cached, skipping", index + 1);
             continue;
         }
         if !layout.slice_path(index).exists() {
-            pdf.write_slice(index, &layout.slice_path(index))?;
+            pdf.write_slice(start, end, &layout.slice_path(index))?;
         }
         pending.push(index);
     }
@@ -1554,7 +1584,7 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
             Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
         }
     }
-    refresh_images(&client, &layout, total, slice_pages).await?;
+    refresh_images(&client, &layout, &plan).await?;
     eprintln!("done");
     Ok(())
 }
@@ -1562,19 +1592,18 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
 pub async fn refresh_images(
     client: &PaddleOcrClient,
     layout: &CacheLayout,
-    slice_count: usize,
-    slice_pages: usize,
+    plan: &[(u32, u32)],
 ) -> Result<()> {
     fs::create_dir_all(layout.images_dir())
         .with_context(|| format!("failed to create {}", layout.images_dir().display()))?;
-    for index in 0..slice_count {
+    for (index, &(start, _)) in plan.iter().enumerate() {
         if !layout.has_result(index) {
             continue;
         }
         let jsonl = fs::read_to_string(layout.result_path(index))
             .with_context(|| format!("failed to read {}", layout.result_path(index).display()))?;
         for image_ref in image_refs(&jsonl)? {
-            let page = index * slice_pages + image_ref.page_in_slice + 1;
+            let page = start as usize + image_ref.page_in_slice;
             let basename = image_ref
                 .relpath
                 .rsplit('/')
