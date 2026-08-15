@@ -185,6 +185,7 @@ pub async fn update_file(
     document_id: i64,
     priority: i32,
 ) -> Result<i64> {
+    reject_reserved_okf_filename(file_path)?;
     let content = read_supported(file_path)?
         .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
     let source_dir = parent_dir_string(file_path);
@@ -242,6 +243,7 @@ pub async fn import_dir(
 }
 
 async fn register_file(pool: &PgPool, file_path: &Path, kb_name: &str) -> Result<i64> {
+    reject_reserved_okf_filename(file_path)?;
     let content = read_supported(file_path)?
         .with_context(|| format!("unsupported document type: {}", file_path.display()))?;
     let filename = utf8_filename(file_path)?;
@@ -270,6 +272,16 @@ fn is_reserved_okf_filename(file_path: &Path) -> bool {
     )
 }
 
+fn reject_reserved_okf_filename(file_path: &Path) -> Result<()> {
+    if is_reserved_okf_filename(file_path) {
+        anyhow::bail!(
+            "{} is a reserved okf filename, not a concept document",
+            file_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Read `file_path` if its detected content type is supported, else `None`.
 fn read_supported(file_path: &Path) -> Result<Option<String>> {
     let extension = file_path
@@ -284,3 +296,7 @@ fn read_supported(file_path: &Path) -> Result<Option<String>> {
         .with_context(|| format!("failed to read markdown document: {}", file_path.display()))?;
     Ok(Some(content))
 }
+
+#[cfg(test)]
+#[path = "task_test.rs"]
+mod tests;
