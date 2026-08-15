@@ -190,10 +190,21 @@ enum TopLevelCommand {
         filters: Vec<Filter>,
     },
     #[cfg(feature = "pdf")]
-    #[command(about = "Slice and OCR PDFs with the PaddleOCR pipeline")]
-    Pdf {
-        #[command(subcommand)]
-        command: PdfCommand,
+    #[command(about = "Convert a PDF into an md bundle: slice → ocr → merge (resumable via cache)")]
+    Convert {
+        file: PathBuf,
+        /// Output directory for the md bundle; required unless --stage stops before merge.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Stop after this stage (default: run the whole pipeline).
+        #[arg(long, value_enum)]
+        stage: Option<ConvertStage>,
+        /// Print the slice plan and quota estimate, then exit (no API calls).
+        #[arg(long)]
+        dry_run: bool,
+        /// Pages per slice; defaults to config pdf.slice_pages.
+        #[arg(long)]
+        slice_pages: Option<usize>,
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
@@ -247,29 +258,14 @@ enum DocCommand {
 }
 
 #[cfg(feature = "pdf")]
-#[derive(Subcommand)]
-enum PdfCommand {
-    #[command(about = "Slice a PDF into per-slice files in the cache (no API calls)")]
-    Slice {
-        file: PathBuf,
-        /// Pages per slice; defaults to config pdf.slice_pages.
-        #[arg(long)]
-        slice_pages: Option<usize>,
-    },
-    #[command(about = "Slice a PDF, OCR every slice via PaddleOCR, cache raw results")]
-    Probe {
-        file: PathBuf,
-        /// Pages per slice; defaults to config pdf.slice_pages.
-        #[arg(long)]
-        slice_pages: Option<usize>,
-    },
-    #[command(about = "Project cached OCR results into a paper bundle (offline)")]
-    Bundle {
-        file: PathBuf,
-        /// Output directory for the paper bundle.
-        #[arg(long)]
-        out: PathBuf,
-    },
+#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
+enum ConvertStage {
+    /// Slice the PDF into per-slice files in the cache (no API calls).
+    Slice,
+    /// Slice + OCR every slice via PaddleOCR, cache raw results.
+    Ocr,
+    /// Project cached OCR results into the md bundle (offline).
+    Merge,
 }
 
 pub async fn run() -> Result<()> {
@@ -338,82 +334,51 @@ pub async fn run() -> Result<()> {
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
         #[cfg(feature = "pdf")]
-        TopLevelCommand::Pdf {
-            command: PdfCommand::Slice { file, slice_pages },
-        } => run_pdf_slice(&config, &file, slice_pages).await,
-        #[cfg(feature = "pdf")]
-        TopLevelCommand::Pdf {
-            command: PdfCommand::Probe { file, slice_pages },
-        } => run_pdf_probe(&config, &file, slice_pages).await,
-        #[cfg(feature = "pdf")]
-        TopLevelCommand::Pdf {
-            command: PdfCommand::Bundle { file, out },
-        } => run_pdf_bundle(&config, &file, &out).await,
+        TopLevelCommand::Convert {
+            file,
+            out,
+            stage,
+            dry_run,
+            slice_pages,
+        } => run_convert(&config, &file, out.as_deref(), stage, dry_run, slice_pages).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
 
 #[cfg(feature = "pdf")]
-async fn run_pdf_slice(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
-    pdf::slice_to_cache(file, slice_pages.unwrap_or(config.pdf.slice_pages), &config.pdf.model).await
-}
-
-#[cfg(feature = "pdf")]
-async fn run_pdf_probe(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
-    pdf::run_probe(&config.pdf, file, slice_pages.unwrap_or(config.pdf.slice_pages)).await
-}
-
-#[cfg(feature = "pdf")]
-async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<()> {
-    let slice_pages = config.pdf.slice_pages;
-    let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
-    let pdf_doc = pdf::PdfDocument::open(file)?;
-    let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
-    let mut pages = Vec::new();
-    for (index, &(start, _)) in plan.iter().enumerate() {
-        let result_path = layout.result_path(index);
-        if !result_path.exists() {
-            bail!(
-                "cache for {} is incomplete (missing {}); run `nanokb pdf probe {}` first",
-                file.display(),
-                result_path.display(),
-                file.display()
-            );
-        }
-        let jsonl = std::fs::read_to_string(&result_path)
-            .with_context(|| format!("failed to read {}", result_path.display()))?;
-        for mut page in pdf::parse_jsonl(&jsonl)? {
-            page.page_no += start as usize - 1;
-            pages.push(page);
+async fn run_convert(
+    config: &AppConfig,
+    file: &Path,
+    out: Option<&Path>,
+    stage: Option<ConvertStage>,
+    dry_run: bool,
+    slice_pages: Option<usize>,
+) -> Result<()> {
+    let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
+    if dry_run {
+        let pdf_doc = pdf::PdfDocument::open(file)?;
+        let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
+        let quota_pct = pdf_doc.page_count() as f64 * 100.0 / pdf::DAILY_QUOTA_PAGES as f64;
+        eprintln!(
+            "{}: {} pages · {} slices (up to {slice_pages} per slice) · {quota_pct:.0}% of daily quota",
+            file.display(),
+            pdf_doc.page_count(),
+            plan.len()
+        );
+        return Ok(());
+    }
+    let needs_merge = stage.is_none_or(|s| s == ConvertStage::Merge);
+    if needs_merge && out.is_none() {
+        bail!("--out <dir> is required unless --stage stops before merge");
+    }
+    match stage {
+        Some(ConvertStage::Slice) => pdf::slice_to_cache(file, slice_pages, &config.pdf.model).await,
+        Some(ConvertStage::Ocr) => pdf::run_ocr(&config.pdf, file, slice_pages).await,
+        Some(ConvertStage::Merge) | None => {
+            pdf::run_ocr(&config.pdf, file, slice_pages).await?;
+            pdf::run_merge(&config.pdf, file, out.expect("checked above"), slice_pages)
         }
     }
-    let stem = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .context("PDF path has no usable stem")?;
-    let (doc, report) = pdf::project(&pages, stem)?;
-
-    for warning in pdf::validate(&report)? {
-        eprintln!("warning: {warning}");
-    }
-
-    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let chapter_count = pdf::write_bundle(out, stem, &report, &doc, &at)?;
-    pdf::render_figures(file, &doc, &out.join("fig"), &pages)?;
-    let chapters = if chapter_count == 0 {
-        String::new()
-    } else {
-        format!(", {chapter_count} chapters")
-    };
-    eprintln!(
-        "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings{chapters})",
-        file.display(),
-        out.display(),
-        pages.len(),
-        report.pair_count,
-        report.unpaired_images.len() + report.unpaired_captions.len()
-    );
-    Ok(())
 }
 
 async fn run_kb_list(pool: &sqlx::PgPool) -> Result<()> {
@@ -913,42 +878,40 @@ mod tests {
 
     #[cfg(feature = "pdf")]
     #[test]
-    fn parses_pdf_slice_with_slice_pages() {
+    fn parses_convert_full_pipeline() {
         let cli =
-            Cli::try_parse_from(["nanokb", "pdf", "slice", "book.pdf", "--slice-pages", "30"]).unwrap();
+            Cli::try_parse_from(["nanokb", "convert", "book.pdf", "--out", "papers"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            TopLevelCommand::Pdf {
-                command: PdfCommand::Slice { file, slice_pages },
-            } if file.as_path() == Path::new("book.pdf") && slice_pages == Some(30)
+            TopLevelCommand::Convert { file, out, stage: None, dry_run: false, .. }
+                if file.as_path() == Path::new("book.pdf")
+                && out.as_deref() == Some(Path::new("papers"))
         ));
     }
 
     #[cfg(feature = "pdf")]
     #[test]
-    fn parses_pdf_probe() {
-        let cli = Cli::try_parse_from(["nanokb", "pdf", "probe", "book.pdf"]).unwrap();
+    fn parses_convert_stage_ocr_without_out() {
+        let cli = Cli::try_parse_from(["nanokb", "convert", "book.pdf", "--stage", "ocr"]).unwrap();
 
         assert!(matches!(
             cli.command,
-            TopLevelCommand::Pdf {
-                command: PdfCommand::Probe { file, slice_pages },
-            } if file.as_path() == Path::new("book.pdf") && slice_pages.is_none()
+            TopLevelCommand::Convert { out: None, stage: Some(ConvertStage::Ocr), .. }
         ));
     }
 
     #[cfg(feature = "pdf")]
     #[test]
-    fn parses_pdf_bundle_with_out() {
-        let cli =
-            Cli::try_parse_from(["nanokb", "pdf", "bundle", "book.pdf", "--out", "papers"]).unwrap();
+    fn parses_convert_dry_run_with_slice_pages() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--dry-run", "--slice-pages", "30",
+        ])
+        .unwrap();
 
         assert!(matches!(
             cli.command,
-            TopLevelCommand::Pdf {
-                command: PdfCommand::Bundle { file, out },
-            } if file.as_path() == Path::new("book.pdf") && out.as_path() == Path::new("papers")
+            TopLevelCommand::Convert { dry_run: true, slice_pages: Some(30), .. }
         ));
     }
 

@@ -16,6 +16,8 @@ use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
 pub const MAX_SLICE_BYTES: u64 = 50 * 1024 * 1024;
+/// PaddleOCR free-tier daily page quota (design doc: 3000 pages/day).
+pub const DAILY_QUOTA_PAGES: u32 = 3000;
 const CLIENT_PLATFORM: &str = "nanokb";
 const CODE_KEYS: &[&str] = &["code", "err_code", "error_code"];
 const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_msg", "errMsg"];
@@ -1831,7 +1833,7 @@ async fn submit_all_slices(
     Ok(polling)
 }
 
-pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
+pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
     let client = Arc::new(PaddleOcrClient::from_config(cfg)?);
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
@@ -1937,6 +1939,58 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
         }
     }
     eprintln!("done");
+    Ok(())
+}
+
+/// Merge stage: project cached raw OCR results into an md bundle (offline).
+pub fn run_merge(cfg: &PdfConfig, pdf_path: &Path, out: &Path, slice_pages: usize) -> Result<()> {
+    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
+    let pdf_doc = PdfDocument::open(pdf_path)?;
+    let plan = pdf_doc.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
+    let mut pages = Vec::new();
+    for (index, &(start, _)) in plan.iter().enumerate() {
+        let result_path = layout.result_path(index);
+        if !result_path.exists() {
+            bail!(
+                "cache for {} is incomplete (missing {}); run `nanokb convert {} --stage ocr` first",
+                pdf_path.display(),
+                result_path.display(),
+                pdf_path.display()
+            );
+        }
+        let jsonl = std::fs::read_to_string(&result_path)
+            .with_context(|| format!("failed to read {}", result_path.display()))?;
+        for mut page in parse_jsonl(&jsonl)? {
+            page.page_no += start as usize - 1;
+            pages.push(page);
+        }
+    }
+    let stem = pdf_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("PDF path has no usable stem")?;
+    let (doc, report) = project(&pages, stem)?;
+
+    for warning in validate(&report)? {
+        eprintln!("warning: {warning}");
+    }
+
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let chapter_count = write_bundle(out, stem, &report, &doc, &at)?;
+    render_figures(pdf_path, &doc, &out.join("fig"), &pages)?;
+    let chapters = if chapter_count == 0 {
+        String::new()
+    } else {
+        format!(", {chapter_count} chapters")
+    };
+    eprintln!(
+        "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings{chapters})",
+        pdf_path.display(),
+        out.display(),
+        pages.len(),
+        report.pair_count,
+        report.unpaired_images.len() + report.unpaired_captions.len()
+    );
     Ok(())
 }
 
