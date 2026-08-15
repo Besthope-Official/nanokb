@@ -305,14 +305,6 @@ impl CacheLayout {
     pub fn has_result(&self, index: usize) -> bool {
         self.result_path(index).exists()
     }
-
-    pub fn images_dir(&self) -> PathBuf {
-        self.root.join("images")
-    }
-
-    pub fn image_path(&self, page: usize, basename: &str) -> PathBuf {
-        self.images_dir().join(format!("{page}_{basename}"))
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -351,14 +343,8 @@ pub struct Page {
     pub page_no: usize,
     pub width: f64,
     pub height: f64,
+    pub angle: f64,
     pub blocks: Vec<PageBlock>,
-    pub images: Vec<(String, String)>,
-}
-
-pub struct ImageRef {
-    pub page_in_slice: usize,
-    pub relpath: String,
-    pub url: String,
 }
 
 #[derive(Debug, Default)]
@@ -421,6 +407,11 @@ fn parse_page(value: &Value) -> Result<Page> {
     let pruned = value.get("prunedResult").context("page missing prunedResult")?;
     let width = pruned.get("width").and_then(Value::as_f64).unwrap_or(0.0);
     let height = pruned.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+    let angle = pruned
+        .get("doc_preprocessor_res")
+        .and_then(|p| p.get("angle"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
     let ignore: BTreeSet<&str> = pruned
         .get("model_settings")
         .and_then(|m| m.get("markdown_ignore_labels"))
@@ -455,24 +446,12 @@ fn parse_page(value: &Value) -> Result<Page> {
         let bbox = parse_bbox(item.get("block_bbox").context("block missing block_bbox")?)?;
         blocks.push(PageBlock { label, content, bbox });
     }
-    let mut images = Vec::new();
-    if let Some(map) = value
-        .get("markdown")
-        .and_then(|m| m.get("images"))
-        .and_then(Value::as_object)
-    {
-        for (relpath, url) in map {
-            if let Some(url) = url.as_str() {
-                images.push((relpath.clone(), url.to_string()));
-            }
-        }
-    }
     Ok(Page {
         page_no: 0,
         width,
         height,
+        angle,
         blocks,
-        images,
     })
 }
 
@@ -858,18 +837,12 @@ fn push_affiliation(text: &str, affiliations: &mut Vec<String>, seen: &mut BTree
 
 fn figure_src(page: &Page, block: &PageBlock) -> String {
     let Bbox { x1, y1, x2, y2 } = block.bbox;
-    let needle = format!("{x1}_{y1}_{x2}_{y2}");
-    if let Some((relpath, _)) = page.images.iter().find(|(p, _)| p.contains(&needle)) {
-        let basename = relpath.rsplit('/').next().unwrap_or(relpath);
-        format!("fig/{}_{basename}", page.page_no)
+    let kind = if block.label == BlockLabel::Chart {
+        "chart"
     } else {
-        let kind = if block.label == BlockLabel::Chart {
-            "chart"
-        } else {
-            "image"
-        };
-        format!("fig/{}_img_in_{kind}_box_{needle}.jpg", page.page_no)
-    }
+        "image"
+    };
+    format!("fig/{}_img_in_{kind}_box_{x1}_{y1}_{x2}_{y2}.png", page.page_no)
 }
 
 fn check_structure(tree: &[Node], root: NodeId) -> Result<()> {
@@ -902,23 +875,13 @@ fn check_structure(tree: &[Node], root: NodeId) -> Result<()> {
     walk(tree, root, 0, &mut Vec::new())
 }
 
-pub fn validate(
-    doc: &StructuredDocument,
-    report: &ProjectReport,
-    available_images: &BTreeSet<String>,
-) -> Result<Vec<String>> {
+pub fn validate(report: &ProjectReport) -> Result<Vec<String>> {
     let mut warnings = Vec::new();
     for src in &report.unpaired_images {
         warnings.push(format!("figure without caption: {src}"));
     }
     for caption in &report.unpaired_captions {
         warnings.push(format!("caption without figure: {caption}"));
-    }
-    for src in figure_srcs(doc) {
-        let basename = src.rsplit('/').next().unwrap_or(&src).to_string();
-        if !available_images.contains(&basename) {
-            warnings.push(format!("image file missing from cache: {basename}"));
-        }
     }
     for (label, count) in &report.dropped {
         warnings.push(format!("dropped {count} {label} blocks"));
@@ -941,19 +904,6 @@ fn figure_srcs(doc: &StructuredDocument) -> Vec<String> {
     srcs
 }
 
-pub fn image_refs(jsonl: &str) -> Result<Vec<ImageRef>> {
-    let mut refs = Vec::new();
-    for page in parse_jsonl(jsonl)? {
-        for (relpath, url) in &page.images {
-            refs.push(ImageRef {
-                page_in_slice: page.page_no - 1,
-                relpath: relpath.clone(),
-                url: url.clone(),
-            });
-        }
-    }
-    Ok(refs)
-}
 
 pub fn arxiv_id_from_stem(stem: &str) -> Option<String> {
     let mut parts = stem.split('v');
@@ -1053,12 +1003,9 @@ pub fn write_bundle(
     stem: &str,
     report: &ProjectReport,
     doc: &StructuredDocument,
-    cache_images: &Path,
     at: &str,
 ) -> Result<()> {
-    let fig_dir = out.join("fig");
-    fs::create_dir_all(&fig_dir)
-        .with_context(|| format!("failed to create {}", fig_dir.display()))?;
+    fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
     let title = report.title.as_deref().unwrap_or_default();
     let md = format!(
         "{}\n{}",
@@ -1069,15 +1016,6 @@ pub fn write_bundle(
     fs::write(&md_path, md)
         .with_context(|| format!("failed to write {}", md_path.display()))?;
 
-    for src in figure_srcs(doc) {
-        let basename = src.rsplit('/').next().unwrap_or(&src);
-        let source = cache_images.join(basename);
-        let dest = fig_dir.join(basename);
-        if source.exists() && !dest.exists() {
-            fs::copy(&source, &dest)
-                .with_context(|| format!("failed to copy figure {source:?} to {dest:?}"))?;
-        }
-    }
     let index_path = out.join("index.md");
     if !index_path.exists() {
         let dir_name = out
@@ -1089,6 +1027,99 @@ pub fn write_bundle(
             format!("# {dir_name}\n\n- [{title}]({stem}.md)\n"),
         )
         .with_context(|| format!("failed to write {}", index_path.display()))?;
+    }
+    Ok(())
+}
+
+pub fn parse_figure_src(src: &str) -> Option<(usize, Bbox)> {
+    let rest = src.strip_prefix("fig/")?;
+    let (page_str, rest) = rest.split_once('_')?;
+    let page: usize = page_str.parse().ok()?;
+    let rest = rest.strip_prefix("img_in_")?;
+    let (kind_box, _ext) = rest.split_once('.')?;
+    let (kind, box_str) = kind_box.split_once("_box_")?;
+    if kind != "image" && kind != "chart" {
+        return None;
+    }
+    let mut nums = box_str.split('_');
+    let bbox = Bbox {
+        x1: nums.next()?.parse().ok()?,
+        y1: nums.next()?.parse().ok()?,
+        x2: nums.next()?.parse().ok()?,
+        y2: nums.next()?.parse().ok()?,
+    };
+    if nums.next().is_some() {
+        return None;
+    }
+    Some((page, bbox))
+}
+
+static PDFIUM: std::sync::OnceLock<Result<pdfium_render::prelude::Pdfium, String>> =
+    std::sync::OnceLock::new();
+
+fn pdfium() -> Result<&'static pdfium_render::prelude::Pdfium> {
+    match PDFIUM.get_or_init(|| pdfium_bundled::bind_pdfium_silent().map_err(|e| e.to_string())) {
+        Ok(pdfium) => Ok(pdfium),
+        Err(e) => bail!("failed to load pdfium: {e}"),
+    }
+}
+
+pub fn render_figures(
+    pdf_path: &Path,
+    doc: &StructuredDocument,
+    fig_dir: &Path,
+    pages: &[Page],
+) -> Result<()> {
+    let srcs = figure_srcs(doc);
+    if srcs.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(fig_dir)
+        .with_context(|| format!("failed to create {}", fig_dir.display()))?;
+    let pdfium = pdfium()?;
+    let document = pdfium
+        .load_pdf_from_file(pdf_path, None)
+        .with_context(|| format!("failed to open PDF {}", pdf_path.display()))?;
+    for src in &srcs {
+        let dest = fig_dir.join(src.rsplit('/').next().unwrap_or(src));
+        if dest.exists() {
+            continue;
+        }
+        let Some((page_no, bbox)) = parse_figure_src(src) else {
+            eprintln!("warning: unrenderable figure src {src}");
+            continue;
+        };
+        let ocr_page = pages
+            .get(page_no - 1)
+            .with_context(|| format!("no OCR page data for page {page_no}"))?;
+        ensure!(
+            ocr_page.angle == 0.0,
+            "page {page_no} is rotated by {} degrees; figure rendering does not support it",
+            ocr_page.angle
+        );
+        let page = document
+            .pages()
+            .get((page_no - 1) as pdfium_render::prelude::PdfPageIndex)
+            .with_context(|| format!("PDF has no page {page_no}"))?;
+        let px_per_pt = ocr_page.width / page.width().value as f64;
+        let to_render_px = |value: i64| (value as f64 / px_per_pt * 300.0 / 72.0).round() as u32;
+        let (left, top) = (to_render_px(bbox.x1), to_render_px(bbox.y1));
+        let (right, bottom) = (to_render_px(bbox.x2), to_render_px(bbox.y2));
+        let bitmap = page
+            .render_with_config(
+                &pdfium_render::prelude::PdfRenderConfig::new()
+                    .scale_page_by_factor(300.0 / 72.0),
+            )
+            .context("failed to render page")?;
+        let image = bitmap.as_image().context("failed to decode rendered page")?;
+        let (width, height) = (image.width(), image.height());
+        let right = right.min(width.saturating_sub(1)).max(left + 1);
+        let bottom = bottom.min(height.saturating_sub(1)).max(top + 1);
+        let cropped = image.crop_imm(left, top, right - left, bottom - top);
+        cropped
+            .save(&dest)
+            .with_context(|| format!("failed to save figure {}", dest.display()))?;
+        eprintln!("figure {} rendered", dest.display());
     }
     Ok(())
 }
@@ -1584,43 +1615,10 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
             Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
         }
     }
-    refresh_images(&client, &layout, &plan).await?;
     eprintln!("done");
     Ok(())
 }
 
-pub async fn refresh_images(
-    client: &PaddleOcrClient,
-    layout: &CacheLayout,
-    plan: &[(u32, u32)],
-) -> Result<()> {
-    fs::create_dir_all(layout.images_dir())
-        .with_context(|| format!("failed to create {}", layout.images_dir().display()))?;
-    for (index, &(start, _)) in plan.iter().enumerate() {
-        if !layout.has_result(index) {
-            continue;
-        }
-        let jsonl = fs::read_to_string(layout.result_path(index))
-            .with_context(|| format!("failed to read {}", layout.result_path(index).display()))?;
-        for image_ref in image_refs(&jsonl)? {
-            let page = start as usize + image_ref.page_in_slice;
-            let basename = image_ref
-                .relpath
-                .rsplit('/')
-                .next()
-                .unwrap_or(&image_ref.relpath);
-            let dest = layout.image_path(page, basename);
-            if dest.exists() {
-                continue;
-            }
-            match client.download(&image_ref.url, &dest).await {
-                Ok(()) => eprintln!("image {page}_{basename} cached"),
-                Err(e) => eprintln!("image {page}_{basename} download failed: {e:#}"),
-            }
-        }
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 #[path = "pdf_test.rs"]

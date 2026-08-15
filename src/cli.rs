@@ -8,7 +8,6 @@ use crate::filter::Filter;
 use crate::{AppConfig, pdf, postgres, task};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -382,20 +381,13 @@ async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<(
         .context("PDF path has no usable stem")?;
     let (doc, report) = pdf::project(&pages, stem)?;
 
-    let mut available = BTreeSet::new();
-    if let Ok(entries) = std::fs::read_dir(layout.images_dir()) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                available.insert(name.to_string());
-            }
-        }
-    }
-    for warning in pdf::validate(&doc, &report, &available)? {
+    for warning in pdf::validate(&report)? {
         eprintln!("warning: {warning}");
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    pdf::write_bundle(out, stem, &report, &doc, &layout.images_dir(), &at)?;
+    pdf::write_bundle(out, stem, &report, &doc, &at)?;
+    pdf::render_figures(file, &doc, &out.join("fig"), &pages)?;
     eprintln!(
         "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings)",
         file.display(),

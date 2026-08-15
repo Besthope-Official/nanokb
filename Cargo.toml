@@ -23,6 +23,9 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 yaml_serde = "0.10"
+pdfium-render = { version = "0.9.3", features = ["image_api", "pdfium_latest", "thread_safe"] }
+pdfium-bundled = { version = "0.1.1", features = ["bundled"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 rstest = "0.26"
