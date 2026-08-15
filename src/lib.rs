@@ -32,7 +32,9 @@ pub mod task;
 pub mod pipeline;
 pub use pipeline::Pipeline;
 
+#[cfg(feature = "pdf")]
 pub mod pdf;
+#[cfg(feature = "pdf")]
 pub use pdf::{
     ApiErrorKind, Bbox, BlockLabel, CacheLayout, JobState, OcrError, Page, PageBlock,
     PaddleOcrClient, PdfDocument, ProjectReport, arxiv_id_from_stem, cache_key, frontmatter,

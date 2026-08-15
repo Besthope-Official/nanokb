@@ -5,8 +5,12 @@ use crate::pipeline::Pipeline;
 use crate::rerank::RerankClient;
 use crate::retrieve;
 use crate::filter::Filter;
-use crate::{AppConfig, pdf, postgres, task};
-use anyhow::{Context, Result, bail};
+use crate::{AppConfig, postgres, task};
+#[cfg(feature = "pdf")]
+use crate::pdf;
+use anyhow::{Context, Result};
+#[cfg(feature = "pdf")]
+use anyhow::bail;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -185,6 +189,7 @@ enum TopLevelCommand {
         #[arg(short = 'l', long = "filter")]
         filters: Vec<Filter>,
     },
+    #[cfg(feature = "pdf")]
     #[command(about = "Slice and OCR PDFs with the PaddleOCR pipeline")]
     Pdf {
         #[command(subcommand)]
@@ -241,6 +246,7 @@ enum DocCommand {
     },
 }
 
+#[cfg(feature = "pdf")]
 #[derive(Subcommand)]
 enum PdfCommand {
     #[command(about = "Slice a PDF into per-slice files in the cache (no API calls)")]
@@ -331,12 +337,15 @@ pub async fn run() -> Result<()> {
             expand_depth,
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
+        #[cfg(feature = "pdf")]
         TopLevelCommand::Pdf {
             command: PdfCommand::Slice { file, slice_pages },
         } => run_pdf_slice(&config, &file, slice_pages).await,
+        #[cfg(feature = "pdf")]
         TopLevelCommand::Pdf {
             command: PdfCommand::Probe { file, slice_pages },
         } => run_pdf_probe(&config, &file, slice_pages).await,
+        #[cfg(feature = "pdf")]
         TopLevelCommand::Pdf {
             command: PdfCommand::Bundle { file, out },
         } => run_pdf_bundle(&config, &file, &out).await,
@@ -344,14 +353,17 @@ pub async fn run() -> Result<()> {
     }
 }
 
+#[cfg(feature = "pdf")]
 async fn run_pdf_slice(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
     pdf::slice_to_cache(file, slice_pages.unwrap_or(config.pdf.slice_pages), &config.pdf.model).await
 }
 
+#[cfg(feature = "pdf")]
 async fn run_pdf_probe(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
     pdf::run_probe(&config.pdf, file, slice_pages.unwrap_or(config.pdf.slice_pages)).await
 }
 
+#[cfg(feature = "pdf")]
 async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<()> {
     let slice_pages = config.pdf.slice_pages;
     let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
@@ -899,6 +911,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn parses_pdf_slice_with_slice_pages() {
         let cli =
@@ -912,6 +925,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn parses_pdf_probe() {
         let cli = Cli::try_parse_from(["nanokb", "pdf", "probe", "book.pdf"]).unwrap();
@@ -924,6 +938,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "pdf")]
     #[test]
     fn parses_pdf_bundle_with_out() {
         let cli =
