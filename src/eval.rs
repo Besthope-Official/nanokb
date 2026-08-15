@@ -399,10 +399,10 @@ async fn retrieve_arm(
     expand_depth: usize,
 ) -> Result<Vec<RunChunk>> {
     let mut candidates =
-        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode, query_text, limit)
+        retrieve::retrieve_candidates(config, pool, kb_name, meta, arm.mode, query_text, limit, &[])
             .await?;
     if arm.expand {
-        let neighbors = postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth).await?;
+        let neighbors = postgres::expand_neighbors(pool, kb_name, &candidates, expand_depth, &[]).await?;
         candidates = retrieve::merge_with_neighbors(candidates, neighbors);
     }
     let ordered: Vec<(f64, QueryResult)> = match reranker {

@@ -128,7 +128,38 @@ fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
     assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
     assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
     assert_eq!(frontmatter.generated_at(), Some("2026-08-13"));
+    assert_eq!(frontmatter.generated_by(), Some("human:besthope"));
     assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
+}
+
+#[test]
+fn frontmatter_ext_reads_stored_json_frontmatter() {
+    let frontmatter: serde_json::Value = serde_json::json!({
+        "type": "chapter",
+        "title": "Guide",
+        "description": "A short guide.",
+        "resource": "https://example.com/guide",
+        "tags": ["kb", "rust"],
+        "generated": { "by": "human:besthope", "at": "2026-08-13" },
+        "book": "ddia",
+    });
+
+    assert_eq!(frontmatter.okf_type(), Some("chapter"));
+    assert_eq!(frontmatter.title(), Some("Guide"));
+    assert_eq!(frontmatter.description(), Some("A short guide."));
+    assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
+    assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
+    assert_eq!(frontmatter.generated_at(), Some("2026-08-13"));
+    assert_eq!(frontmatter.generated_by(), Some("human:besthope"));
+    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
+}
+
+#[test]
+fn frontmatter_ext_defaults_generated_by() {
+    let frontmatter: serde_json::Value = serde_json::json!({ "type": "chapter" });
+
+    assert_eq!(frontmatter.generated_at(), None);
+    assert_eq!(frontmatter.generated_by(), None);
 }
 
 #[test]

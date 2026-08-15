@@ -26,6 +26,7 @@ pub trait FrontmatterExt {
     /// Iso 8601 datetime of the content's last meaningful change
     /// (okf v0.2 `generated.at`, which supersedes the v0.1 `timestamp`).
     fn generated_at(&self) -> Option<&str>;
+    fn generated_by(&self) -> Option<&str>;
 }
 
 impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
@@ -62,6 +63,51 @@ impl FrontmatterExt for BTreeMap<String, yaml_serde::Value> {
             .and_then(|v| v.as_mapping())
             .and_then(|m| m.get("at"))
             .and_then(|v| v.as_str())
+    }
+
+    fn generated_by(&self) -> Option<&str> {
+        self.get("generated")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get("by"))
+            .and_then(|v| v.as_str())
+    }
+}
+
+impl FrontmatterExt for serde_json::Value {
+    fn okf_type(&self) -> Option<&str> {
+        self.get("type").and_then(|v| v.as_str())
+    }
+
+    fn title(&self) -> Option<&str> {
+        self.get("title").and_then(|v| v.as_str())
+    }
+
+    fn description(&self) -> Option<&str> {
+        self.get("description").and_then(|v| v.as_str())
+    }
+
+    fn resource(&self) -> Option<&str> {
+        self.get("resource").and_then(|v| v.as_str())
+    }
+
+    fn tags(&self) -> Vec<String> {
+        self.get("tags")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn generated_at(&self) -> Option<&str> {
+        self.get("generated").and_then(|m| m.get("at")).and_then(|v| v.as_str())
+    }
+
+    fn generated_by(&self) -> Option<&str> {
+        self.get("generated").and_then(|m| m.get("by")).and_then(|v| v.as_str())
     }
 }
 

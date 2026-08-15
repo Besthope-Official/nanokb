@@ -1,59 +1,68 @@
-use crate::{NodeKind, StructuredDocument};
+use std::str::FromStr;
 
-pub enum Filter {
-    /// Drop sections whose title matches reference/bibliography patterns.
-    DropReference,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    NotEq,
 }
 
-impl StructuredDocument {
-    /// Applies `filters`, returning the titles of every section that was dropped.
-    pub fn filter(mut self, filters: &[Filter]) -> (Self, Vec<String>) {
-        let root = self.root;
-        let mut dropped = Vec::new();
-        for filter in filters {
-            match filter {
-                Filter::DropReference => prune_references(&mut self, root, &mut dropped),
-            }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Filter {
+    pub key: String,
+    pub op: FilterOp,
+    pub value: String,
+}
+
+impl FromStr for Filter {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let eq = raw.find('=').ok_or_else(|| {
+            format!("invalid filter '{raw}': expected key=value or key!=value")
+        })?;
+        let (op, key_end) = if eq > 0 && raw.as_bytes()[eq - 1] == b'!' {
+            (FilterOp::NotEq, eq - 1)
+        } else {
+            (FilterOp::Eq, eq)
+        };
+        let key = &raw[..key_end];
+        if key.is_empty() {
+            return Err(format!("invalid filter '{raw}': key is empty"));
         }
-        (self, dropped)
+        Ok(Self {
+            key: key.to_string(),
+            op,
+            value: raw[eq + 1..].to_string(),
+        })
     }
 }
 
-fn prune_references(
-    document: &mut StructuredDocument,
-    node_id: crate::NodeId,
-    dropped: &mut Vec<String>,
-) {
-    let child_ids = document.node(node_id).children.clone();
-
-    let (keep, drop): (Vec<_>, Vec<_>) = child_ids.into_iter().partition(|&cid| {
-        let child = document.node(cid);
-        !matches!(&child.kind, NodeKind::Heading { title, .. } if is_reference_title(title))
-    });
-
-    for cid in &keep {
-        prune_references(document, *cid, dropped);
-    }
-
-    // Retain metadata in tree but detach from parent — no reindex needed.
-    if !drop.is_empty() {
-        for cid in &drop {
-            if let NodeKind::Heading { title, .. } = &document.node(*cid).kind {
-                dropped.push(title.trim().to_string());
-            }
+impl Filter {
+    pub fn predicate_sql(&self, key_param: usize, value_param: usize) -> String {
+        let fragment = format!(
+            "CASE WHEN jsonb_typeof(document.frontmatter -> ${key_param}) = 'array' \
+             THEN document.frontmatter -> ${key_param} ? ${value_param} \
+             ELSE document.frontmatter ->> ${key_param} = ${value_param} END"
+        );
+        match self.op {
+            FilterOp::Eq => format!("({fragment}) IS TRUE"),
+            FilterOp::NotEq => format!("({fragment}) IS NOT TRUE"),
         }
-        document.tree[node_id.0].children = keep;
     }
+}
+
+pub fn where_clause(filters: &[Filter], start: usize) -> Option<String> {
+    if filters.is_empty() {
+        return None;
+    }
+    let fragments: Vec<String> = filters
+        .iter()
+        .enumerate()
+        .map(|(i, filter)| filter.predicate_sql(start + 2 * i, start + 2 * i + 1))
+        .collect();
+    Some(format!("WHERE {}", fragments.join(" AND ")))
 }
 
 #[cfg(test)]
 #[path = "filter_test.rs"]
 mod tests;
-
-fn is_reference_title(title: &str) -> bool {
-    let t = title.trim().to_lowercase();
-    matches!(
-        t.as_str(),
-        "references" | "bibliography" | "参考文献" | "參考文獻"
-    )
-}
