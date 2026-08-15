@@ -670,7 +670,7 @@ async fn query_filters_filter_documents_by_frontmatter() -> Result<()> {
     .await?;
 
     let hit = tree_hit(tree_id, "ch1a", 0);
-    let neighbors = expand_neighbors(&pool, KB_NAME_FILTER, &[hit.clone()], 2, &filter_set(&["tags=database"])).await?;
+    let neighbors = expand_neighbors(&pool, KB_NAME_FILTER, std::slice::from_ref(&hit), 2, &filter_set(&["tags=database"])).await?;
     assert_eq!(tree_node_order(&neighbors), vec!["ch1", "ch1b"]);
     let neighbors = expand_neighbors(&pool, KB_NAME_FILTER, &[hit], 2, &filter_set(&["tags!=database"])).await?;
     assert!(neighbors.is_empty(), "neighbor fetch must apply the filter server-side");

@@ -786,7 +786,7 @@ mod tests {
                     config_path: Some(config_path),
                     overlay_files,
                 },
-            } if name == "books" && config_path == PathBuf::from("recipe.yaml") && overlay_files.is_empty()
+            } if name == "books" && config_path.as_path() == Path::new("recipe.yaml") && overlay_files.is_empty()
         ));
     }
 

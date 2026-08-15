@@ -10,25 +10,21 @@ fn start_mock_server(response_json: &'static str) -> String {
     let url = format!("http://127.0.0.1:{}", addr.port());
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stream = stream.unwrap();
-            let mut buffer = [0u8; 4096];
-            let n = stream.read(&mut buffer).unwrap();
-            let request = String::from_utf8_lossy(&buffer[..n]);
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let mut buffer = [0u8; 4096];
+        let n = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..n]);
 
-            // Minimal HTTP response — read the Content-Length body if present.
-            let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
-            let _body = &request[body_start..];
+        let body_start = request.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        let _body = &request[body_start..];
 
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                response_json.len(),
-                response_json
-            );
-            stream.write_all(response.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            break; // Only handle one request.
-        }
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            response_json.len(),
+            response_json
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.flush().unwrap();
     });
 
     url

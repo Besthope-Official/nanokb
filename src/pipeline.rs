@@ -188,14 +188,13 @@ impl Pipeline {
         // Stage 3: Markers
         let markers = match &self.llm {
             Some(llm) => {
-                let markers = crate::markers::generate_document_markers(
+                crate::markers::generate_document_markers(
                     Arc::clone(llm),
-                    &chunks,
+                    chunks,
                     self.llm_concurrency,
                     on_stage,
                 )
-                .await?;
-                markers
+                .await?
             }
             None => vec![Vec::new(); chunks.len()],
         };
