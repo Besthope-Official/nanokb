@@ -386,10 +386,15 @@ async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<(
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    pdf::write_bundle(out, stem, &report, &doc, &at)?;
+    let chapter_count = pdf::write_bundle(out, stem, &report, &doc, &at)?;
     pdf::render_figures(file, &doc, &out.join("fig"), &pages)?;
+    let chapters = if chapter_count == 0 {
+        String::new()
+    } else {
+        format!(", {chapter_count} chapters")
+    };
     eprintln!(
-        "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings)",
+        "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings{chapters})",
         file.display(),
         out.display(),
         pages.len(),

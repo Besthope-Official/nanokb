@@ -353,13 +353,24 @@ pub struct ProjectReport {
     pub authors: Vec<String>,
     pub affiliations: Vec<String>,
     pub doc_title_count: usize,
+    pub suspicious_headings: Vec<String>,
+    pub doc_title_headings: Vec<(NodeId, usize)>,
+    pub root_headings: Vec<(NodeId, usize)>,
+    pub total_pages: usize,
     pub unpaired_captions: Vec<String>,
     pub unpaired_images: Vec<String>,
     pub dropped: BTreeMap<String, usize>,
     pub pair_count: usize,
 }
 
-const HARD_IGNORE_LABELS: &[&str] = &["number", "formula_number", "header", "footnote"];
+const HARD_IGNORE_LABELS: &[&str] = &[
+    "number",
+    "formula_number",
+    "header",
+    "footnote",
+    "vision_footnote",
+    "header_image",
+];
 
 pub fn parse_jsonl(text: &str) -> Result<Vec<Page>> {
     let mut pages = Vec::new();
@@ -570,7 +581,10 @@ pub fn pair_figures(page: &Page) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>
 }
 
 pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, ProjectReport)> {
-    let mut report = ProjectReport::default();
+    let mut report = ProjectReport {
+        total_pages: pages.len(),
+        ..Default::default()
+    };
     for page in pages {
         for block in &page.blocks {
             if let BlockLabel::Ignored(label) = &block.label {
@@ -585,9 +599,8 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         }
     }
     ensure!(
-        report.doc_title_count == 1,
-        "expected exactly one doc_title block, found {}",
-        report.doc_title_count
+        report.doc_title_count >= 1,
+        "expected at least one doc_title block, found none",
     );
     if let Some(first_page) = pages.first() {
         report.authors = extract_authors(&first_page.blocks);
@@ -600,6 +613,7 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
     }];
     let root = NodeId(0);
     let mut heading_stack: Vec<(NodeId, usize)> = Vec::new();
+    let mut title_seen = false;
     for page in pages {
         let (pairs, unpaired_images, unpaired_captions) = pair_figures(page);
         report.pair_count += pairs.len();
@@ -617,7 +631,29 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         }
         for (block_idx, block) in page.blocks.iter().enumerate() {
             match &block.label {
-                BlockLabel::Ignored(_) | BlockLabel::DocTitle => {}
+                BlockLabel::Ignored(_) => {}
+                BlockLabel::DocTitle => {
+                    if !title_seen {
+                        title_seen = true;
+                        continue;
+                    }
+                    if block.content.chars().filter(|c| c.is_alphanumeric()).count() < 4 {
+                        report.suspicious_headings.push(block.content.clone());
+                    }
+                    heading_stack.clear();
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::Heading {
+                            level: 1,
+                            title: block.content.clone(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[root.0].children.push(node_id);
+                    heading_stack.push((node_id, 1));
+                    report.doc_title_headings.push((node_id, page.page_no));
+                    report.root_headings.push((node_id, page.page_no));
+                }
                 BlockLabel::ParagraphTitle => {
                     let (level, remainder) = infer_heading_level(&block.content);
                     while let Some(&(_, top_level)) = heading_stack.last() {
@@ -638,6 +674,9 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                     });
                     tree[parent.0].children.push(node_id);
                     heading_stack.push((node_id, level));
+                    if parent == root {
+                        report.root_headings.push((node_id, page.page_no));
+                    }
                 }
                 BlockLabel::Text | BlockLabel::Abstract | BlockLabel::ReferenceContent => {
                     let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
@@ -886,6 +925,9 @@ pub fn validate(report: &ProjectReport) -> Result<Vec<String>> {
     for (label, count) in &report.dropped {
         warnings.push(format!("dropped {count} {label} blocks"));
     }
+    for title in &report.suspicious_headings {
+        warnings.push(format!("suspicious doc_title heading: {title}"));
+    }
     Ok(warnings)
 }
 
@@ -979,23 +1021,113 @@ pub fn render_markdown(doc: &StructuredDocument, title: &str) -> String {
     format!("{}\n", blocks.join("\n\n"))
 }
 
+fn render_node(doc: &StructuredDocument, node_id: NodeId) -> String {
+    match &doc.node(node_id).kind {
+        NodeKind::Heading { level, title } => format!("{} {title}", "#".repeat(level + 1)),
+        NodeKind::Paragraph { text } => text.clone(),
+        NodeKind::CodeBlock { text } => format!("```\n{text}\n```"),
+        NodeKind::MathBlock { text } => text.clone(),
+        NodeKind::Table { text } => text.clone(),
+        NodeKind::Figure { src, caption, .. } => format!("![{caption}]({src})"),
+        NodeKind::Root => String::new(),
+    }
+}
+
 fn collect_render(doc: &StructuredDocument, node_id: NodeId, blocks: &mut Vec<String>) {
     for &child in &doc.node(node_id).children {
-        let node = doc.node(child);
-        let block = match &node.kind {
-            NodeKind::Heading { level, title } => format!("{} {title}", "#".repeat(level + 1)),
-            NodeKind::Paragraph { text } => text.clone(),
-            NodeKind::CodeBlock { text } => format!("```\n{text}\n```"),
-            NodeKind::MathBlock { text } => text.clone(),
-            NodeKind::Table { text } => text.clone(),
-            NodeKind::Figure { src, caption, .. } => format!("![{caption}]({src})"),
-            NodeKind::Root => String::new(),
-        };
+        let block = render_node(doc, child);
         if !block.is_empty() {
             blocks.push(block);
         }
         collect_render(doc, child, blocks);
     }
+}
+
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    let mut dash = false;
+    for c in text.trim().chars() {
+        if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+            dash = false;
+        } else if !dash {
+            slug.push('-');
+            dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn chapter_key(title: &str) -> (String, String) {
+    let trimmed = title.trim();
+    if let Some(num) = trimmed
+        .strip_prefix("Chapter ")
+        .or_else(|| trimmed.strip_prefix("chapter "))
+        .and_then(|rest| rest.split('.').next())
+        .and_then(|num| num.parse::<u64>().ok())
+    {
+        return (format!("ch{num}"), num.to_string());
+    }
+    for prefix in ["Part ", "part ", "Appendix ", "appendix "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let token = rest.split('.').next().unwrap_or(rest).trim();
+            if !token.is_empty() {
+                let key = format!("{}-{}", prefix.trim().to_lowercase(), slugify(token));
+                return (key.clone(), key);
+            }
+        }
+    }
+    let slug = slugify(trimmed);
+    (slug.clone(), slug)
+}
+
+fn book_frontmatter(stem: &str, title: &str, at: &str) -> String {
+    let mut out = String::from("---\n");
+    out.push_str("type: book\n");
+    out.push_str(&format!("title: {}\n", yaml_quoted(title)));
+    out.push_str("description: \"\"\n");
+    out.push_str(&format!("resource: ../pdf/{stem}.pdf\n"));
+    out.push_str("tags: []\n");
+    out.push_str(&format!(
+        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
+    ));
+    out.push_str(&format!(
+        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
+    ));
+    out.push_str("owner: machine\n");
+    out.push_str("---\n");
+    out
+}
+
+fn chapter_frontmatter(
+    stem: &str,
+    book_title: &str,
+    title: &str,
+    chapter: &str,
+    pages: (usize, usize),
+    at: &str,
+) -> String {
+    let mut out = String::from("---\n");
+    out.push_str("type: chapter\n");
+    out.push_str(&format!("title: {}\n", yaml_quoted(title)));
+    out.push_str("description: \"\"\n");
+    out.push_str(&format!(
+        "resource: ../pdf/{stem}.pdf#{}-{}\n",
+        pages.0, pages.1
+    ));
+    out.push_str("tags: []\n");
+    out.push_str(&format!(
+        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
+    ));
+    out.push_str(&format!(
+        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n    title: {}\n",
+        yaml_quoted(book_title)
+    ));
+    out.push_str(&format!("book: {stem}\n"));
+    out.push_str(&format!("chapter: {chapter}\n"));
+    out.push_str("owner: machine\n");
+    out.push_str("---\n");
+    out
 }
 
 pub fn write_bundle(
@@ -1004,8 +1136,23 @@ pub fn write_bundle(
     report: &ProjectReport,
     doc: &StructuredDocument,
     at: &str,
-) -> Result<()> {
+) -> Result<usize> {
     fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
+    if report.doc_title_headings.is_empty() {
+        write_paper_bundle(out, stem, report, doc, at)?;
+        Ok(0)
+    } else {
+        write_book_bundle(out, stem, report, doc, at)
+    }
+}
+
+fn write_paper_bundle(
+    out: &Path,
+    stem: &str,
+    report: &ProjectReport,
+    doc: &StructuredDocument,
+    at: &str,
+) -> Result<()> {
     let title = report.title.as_deref().unwrap_or_default();
     let md = format!(
         "{}\n{}",
@@ -1016,19 +1163,146 @@ pub fn write_bundle(
     fs::write(&md_path, md)
         .with_context(|| format!("failed to write {}", md_path.display()))?;
 
-    let index_path = out.join("index.md");
-    if !index_path.exists() {
-        let dir_name = out
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Index");
-        fs::write(
-            &index_path,
-            format!("# {dir_name}\n\n- [{title}]({stem}.md)\n"),
-        )
-        .with_context(|| format!("failed to write {}", index_path.display()))?;
-    }
+    write_index_skeleton(out, &[(title.to_string(), format!("{stem}.md"))])?;
     Ok(())
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_chapter_title(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    for prefix in ["chapter ", "part ", "appendix "] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let token = rest.split('.').next().unwrap_or(rest);
+            return !token.is_empty()
+                && token.chars().all(|c| c.is_alphanumeric())
+                && rest.len() > token.len();
+        }
+    }
+    false
+}
+
+fn write_book_bundle(
+    out: &Path,
+    stem: &str,
+    report: &ProjectReport,
+    doc: &StructuredDocument,
+    at: &str,
+) -> Result<usize> {
+    let title = one_line(report.title.as_deref().unwrap_or_default());
+    let pages_by_node: BTreeMap<NodeId, usize> =
+        report.root_headings.iter().copied().collect();
+    let doc_title_nodes: BTreeSet<NodeId> = report
+        .doc_title_headings
+        .iter()
+        .map(|&(node_id, _)| node_id)
+        .collect();
+    let mut book_blocks = vec![format!("# {title}")];
+    let mut chapters: Vec<(NodeId, String, Vec<String>)> = Vec::new();
+    for &child in &doc.node(doc.root).children {
+        if let NodeKind::Heading {
+            title: heading_title,
+            ..
+        } = &doc.node(child).kind
+        {
+            let one_line = one_line(heading_title);
+            if doc_title_nodes.contains(&child) || is_chapter_title(&one_line) {
+                let mut body = vec![format!("# {one_line}")];
+                collect_render(doc, child, &mut body);
+                chapters.push((child, one_line, body));
+            } else {
+                let mut blocks = Vec::new();
+                let block = render_node(doc, child);
+                if !block.is_empty() {
+                    blocks.push(block);
+                }
+                collect_render(doc, child, &mut blocks);
+                match chapters.last_mut() {
+                    Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
+                    None => book_blocks.extend(blocks),
+                }
+            }
+            continue;
+        }
+        let mut blocks = Vec::new();
+        let block = render_node(doc, child);
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+        collect_render(doc, child, &mut blocks);
+        match chapters.last_mut() {
+            Some((_, _, chapter_blocks)) => chapter_blocks.extend(blocks),
+            None => book_blocks.extend(blocks),
+        }
+    }
+    book_blocks.push("See [index.md](index.md) for the chapter listing.".to_string());
+    let book_path = out.join(format!("{stem}.md"));
+    fs::write(
+        &book_path,
+        format!(
+            "{}\n{}\n",
+            book_frontmatter(stem, &title, at),
+            book_blocks.join("\n\n")
+        ),
+    )
+    .with_context(|| format!("failed to write {}", book_path.display()))?;
+
+    let mut entries = vec![(title.clone(), format!("{stem}.md"))];
+    let mut seen = BTreeSet::from(["index".to_string()]);
+    for (index, (node_id, chapter_title, body)) in chapters.iter().enumerate() {
+        let (base_stem, chapter) = chapter_key(chapter_title);
+        ensure!(
+            !base_stem.is_empty(),
+            "root heading {chapter_title:?} has an empty chapter slug"
+        );
+        let mut file_stem = base_stem.clone();
+        let mut suffix = 2;
+        while !seen.insert(file_stem.clone()) {
+            file_stem = format!("{base_stem}-{suffix}");
+            suffix += 1;
+        }
+        let page_no = pages_by_node
+            .get(node_id)
+            .copied()
+            .with_context(|| format!("chapter {chapter_title:?} has no page"))?;
+        let end = chapters
+            .get(index + 1)
+            .and_then(|(next, _, _)| pages_by_node.get(next))
+            .map(|&next_page| next_page - 1)
+            .unwrap_or(report.total_pages);
+        let path = out.join(format!("{file_stem}.md"));
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                chapter_frontmatter(stem, &title, chapter_title, &chapter, (page_no, end), at),
+                body.join("\n\n")
+            ),
+        )
+        .with_context(|| format!("failed to write {}", path.display()))?;
+        entries.push((chapter_title.clone(), format!("{file_stem}.md")));
+    }
+    write_index_skeleton(out, &entries)?;
+    Ok(entries.len() - 1)
+}
+
+fn write_index_skeleton(out: &Path, entries: &[(String, String)]) -> Result<()> {
+    let index_path = out.join("index.md");
+    if index_path.exists() {
+        return Ok(());
+    }
+    let dir_name = out
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Index");
+    let mut lines = vec![format!("# {dir_name}"), String::new()];
+    for (title, file) in entries {
+        lines.push(format!("- [{title}]({file})"));
+    }
+    fs::write(&index_path, format!("{}\n", lines.join("\n")))
+        .with_context(|| format!("failed to write {}", index_path.display()))
 }
 
 pub fn parse_figure_src(src: &str) -> Option<(usize, Bbox)> {
@@ -1064,6 +1338,8 @@ fn pdfium() -> Result<&'static pdfium_render::prelude::Pdfium> {
     }
 }
 
+static PDFIUM_RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn render_figures(
     pdf_path: &Path,
     doc: &StructuredDocument,
@@ -1076,6 +1352,9 @@ pub fn render_figures(
     }
     fs::create_dir_all(fig_dir)
         .with_context(|| format!("failed to create {}", fig_dir.display()))?;
+    let _guard = PDFIUM_RENDER_LOCK
+        .lock()
+        .expect("pdfium render lock poisoned");
     let pdfium = pdfium()?;
     let document = pdfium
         .load_pdf_from_file(pdf_path, None)

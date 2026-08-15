@@ -537,6 +537,8 @@ fn parse_jsonl_marks_ignored_labels() {
             block("header", "running title", [220, 32, 1003, 61]),
             block("number", "1", [602, 1503, 615, 1524]),
             block("formula_number", "(2)", [600, 700, 615, 720]),
+            block("vision_footnote", "marginal note", [100, 500, 200, 520]),
+            block("header_image", "decorative", [1100, 30, 1150, 60]),
             block("text", "body", [82, 100, 400, 200]),
         ]);
     let pages = parse_jsonl(&jsonl_line(&[page])).unwrap();
@@ -553,7 +555,15 @@ fn parse_jsonl_marks_ignored_labels() {
         &pages[0].blocks[2].label,
         BlockLabel::Ignored(l) if l == "formula_number"
     ));
-    assert_eq!(pages[0].blocks[3].label, BlockLabel::Text);
+    assert!(matches!(
+        &pages[0].blocks[3].label,
+        BlockLabel::Ignored(l) if l == "vision_footnote"
+    ));
+    assert!(matches!(
+        &pages[0].blocks[4].label,
+        BlockLabel::Ignored(l) if l == "header_image"
+    ));
+    assert_eq!(pages[0].blocks[5].label, BlockLabel::Text);
 }
 
 #[test]
@@ -769,14 +779,58 @@ fn project_extracts_first_line_authors() {
 }
 
 #[test]
-fn project_bails_on_two_titles() {
+fn project_treats_extra_doc_titles_as_chapter_headings() {
     let page = page_json(
         &[
-            block("doc_title", "A", [0, 0, 10, 10]),
-            block("doc_title", "B", [0, 20, 10, 30]),
+            block("doc_title", "My Book", [0, 0, 10, 10]),
+            block("doc_title", "Chapter 1. Intro", [0, 20, 10, 30]),
+            block("text", "Chapter body.", [0, 40, 10, 50]),
+            block("doc_title", "Chapter 2. Next", [0, 60, 10, 70]),
+            block("text", "Next body.", [0, 80, 10, 90]),
         ]);
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap();
+
+    assert_eq!(report.title.as_deref(), Some("My Book"));
+    assert_eq!(report.doc_title_headings.len(), 2);
+    let root = doc.node(doc.root);
+    assert_eq!(root.children.len(), 2);
+    let ch1 = doc.node(root.children[0]);
+    assert!(matches!(
+        &ch1.kind,
+        NodeKind::Heading { level: 1, title } if title == "Chapter 1. Intro"
+    ));
+    assert_eq!(ch1.children.len(), 1);
+    assert!(matches!(
+        &doc.node(ch1.children[0]).kind,
+        NodeKind::Paragraph { text } if text == "Chapter body."
+    ));
+    let ch2 = doc.node(root.children[1]);
+    assert!(matches!(
+        &ch2.kind,
+        NodeKind::Heading { level: 1, title } if title == "Chapter 2. Next"
+    ));
+    assert_eq!(ch2.children.len(), 1);
+}
+
+#[test]
+fn project_bails_without_doc_title() {
+    let page = page_json(&[block("text", "no title here", [0, 0, 10, 10])]);
     let error = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "x").unwrap_err();
     assert!(error.to_string().contains("doc_title"), "{error:#}");
+}
+
+#[test]
+fn project_flags_suspicious_doc_title_headings() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Book", [0, 0, 10, 10]),
+            block("doc_title", "贝贝", [0, 20, 10, 30]),
+        ]);
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap();
+
+    assert_eq!(report.suspicious_headings, vec!["贝贝".to_string()]);
+    let warnings = validate(&report).unwrap();
+    assert!(warnings.iter().any(|w| w.contains("贝贝")));
 }
 
 #[test]
@@ -1096,6 +1150,155 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
     write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:01Z").unwrap();
     assert!(fs::read_to_string(&md_path).unwrap().contains("Renamed"));
     assert_eq!(fs::read(&index_path).unwrap(), index_before);
+}
+
+fn project_book(blocks: &[String]) -> (StructuredDocument, ProjectReport) {
+    let page = page_json(blocks);
+    project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-book").unwrap()
+}
+
+#[test]
+fn write_book_bundle_creates_book_chapters_and_index() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("text", "Preface words.", [0, 0, 10, 10]),
+        block("doc_title", "My Book", [0, 20, 10, 30]),
+        block("doc_title", "Chapter 1. Intro", [0, 40, 10, 50]),
+        block("paragraph_title", "1.1. Background", [0, 60, 10, 70]),
+        block("text", "Intro body.", [0, 80, 10, 90]),
+        block("doc_title", "Chapter 2. Next", [0, 100, 10, 110]),
+        block("text", "Next body.", [0, 120, 10, 130]),
+        block("paragraph_title", "Chapter 3. Classified", [0, 140, 10, 150]),
+        block("text", "Classified body.", [0, 160, 10, 170]),
+    ]);
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+
+    let book_md = fs::read_to_string(out.join("my-book.md")).unwrap();
+    assert!(book_md.contains("type: book"), "{book_md}");
+    assert!(book_md.contains("title: \"My Book\""));
+    assert!(book_md.contains("# My Book"));
+    assert!(book_md.contains("Preface words."));
+    assert!(!book_md.contains("Intro body."));
+
+    let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
+    assert!(ch1.contains("type: chapter"), "{ch1}");
+    assert!(ch1.contains("book: my-book"));
+    assert!(ch1.contains("chapter: 1"));
+    assert!(ch1.contains("# Chapter 1. Intro"));
+    assert!(ch1.contains("### Background"), "{ch1}");
+    assert!(ch1.contains("Intro body."));
+
+    let ch2 = fs::read_to_string(out.join("ch2.md")).unwrap();
+    assert!(ch2.contains("# Chapter 2. Next"), "{ch2}");
+    assert!(ch2.contains("Next body."));
+
+    let ch3 = fs::read_to_string(out.join("ch3.md")).unwrap();
+    assert!(ch3.contains("# Chapter 3. Classified"), "{ch3}");
+    assert!(ch3.contains("chapter: 3"));
+    assert!(ch3.contains("Classified body."));
+
+    let index = fs::read_to_string(out.join("index.md")).unwrap();
+    assert!(index.contains("(my-book.md)"), "{index}");
+    assert!(index.contains("(ch1.md)"));
+    assert!(index.contains("(ch2.md)"));
+    assert!(index.contains("(ch3.md)"));
+}
+
+#[test]
+fn write_book_bundle_uses_keys_for_parts_appendices_and_noise() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("doc_title", "Part II. Deep Learning", [0, 20, 10, 30]),
+        block("doc_title", "Appendix B. Checklist", [0, 40, 10, 50]),
+        block("doc_title", "EXAMPLES OF SAMPLING BIAS", [0, 60, 10, 70]),
+    ]);
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+
+    let part = fs::read_to_string(out.join("part-ii.md")).unwrap();
+    assert!(part.contains("chapter: part-ii"), "{part}");
+    let appendix = fs::read_to_string(out.join("appendix-b.md")).unwrap();
+    assert!(appendix.contains("chapter: appendix-b"), "{appendix}");
+    let noise = fs::read_to_string(out.join("examples-of-sampling-bias.md")).unwrap();
+    assert!(noise.contains("chapter: examples-of-sampling-bias"), "{noise}");
+}
+
+#[test]
+fn write_book_bundle_writes_page_range_in_resource() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let pages = parse_jsonl(&jsonl_line(&[
+        page_json(&[block("doc_title", "My Book", [0, 0, 10, 10])]),
+        page_json(&[
+            block("doc_title", "Chapter 1. Intro", [0, 0, 10, 10]),
+            block("text", "body", [0, 20, 10, 30]),
+        ]),
+        page_json(&[block("doc_title", "Chapter 2. Next", [0, 0, 10, 10])]),
+    ]))
+    .unwrap();
+    let (doc, report) = project(&pages, "my-book").unwrap();
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+
+    let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
+    assert!(ch1.contains("resource: ../pdf/my-book.pdf#2-2"), "{ch1}");
+    let ch2 = fs::read_to_string(out.join("ch2.md")).unwrap();
+    assert!(ch2.contains("resource: ../pdf/my-book.pdf#3-3"), "{ch2}");
+}
+
+#[test]
+fn write_book_bundle_attaches_non_chapter_headings_to_preceding_chapter() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("doc_title", "Chapter 1. Intro", [0, 20, 10, 30]),
+        block("text", "Intro body.", [0, 40, 10, 50]),
+        block("paragraph_title", "A Sidebar Note", [0, 60, 10, 70]),
+        block("text", "Sidebar words.", [0, 80, 10, 90]),
+        block("paragraph_title", "Chapter 9 Overview", [0, 100, 10, 110]),
+        block("text", "toc entry", [0, 120, 10, 130]),
+        block("paragraph_title", "Index", [0, 140, 10, 150]),
+        block("text", "index entries", [0, 160, 10, 170]),
+    ]);
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+
+    assert!(!out.join("a-sidebar-note.md").exists());
+    assert!(!out.join("chapter-9-overview.md").exists());
+    assert!(!out.join("index-2.md").exists());
+    let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
+    assert!(ch1.contains("## A Sidebar Note"), "{ch1}");
+    assert!(ch1.contains("Sidebar words."));
+    assert!(ch1.contains("## Chapter 9 Overview"), "{ch1}");
+    assert!(ch1.contains("toc entry"));
+    assert!(ch1.contains("## Index"), "{ch1}");
+    assert!(ch1.contains("index entries"));
+
+    let index = fs::read_to_string(out.join("index.md")).unwrap();
+    assert!(!index.contains("type: chapter"), "{index}");
+    assert!(index.contains("(my-book.md)"));
+    assert!(index.contains("(ch1.md)"));
+}
+
+#[test]
+fn write_book_bundle_suffixes_duplicate_chapter_slugs() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("doc_title", "Chapter 1. A", [0, 20, 10, 30]),
+        block("doc_title", "Chapter 1. B", [0, 40, 10, 50]),
+    ]);
+    write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z").unwrap();
+
+    let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
+    assert!(ch1.contains("# Chapter 1. A"), "{ch1}");
+    let ch1_dup = fs::read_to_string(out.join("ch1-2.md")).unwrap();
+    assert!(ch1_dup.contains("# Chapter 1. B"), "{ch1_dup}");
+    let index = fs::read_to_string(out.join("index.md")).unwrap();
+    assert!(index.contains("(ch1.md)"), "{index}");
+    assert!(index.contains("(ch1-2.md)"));
 }
 
 // ---------------------------------------------------------------
