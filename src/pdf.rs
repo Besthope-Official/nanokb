@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use governor::{Quota, RateLimiter};
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
@@ -1409,6 +1410,7 @@ pub struct PaddleOcrClient {
     model: String,
     http: reqwest::Client,
     retry_delay: Duration,
+    submit_limiter: Arc<governor::DefaultDirectRateLimiter>,
 }
 
 impl PaddleOcrClient {
@@ -1427,12 +1429,16 @@ impl PaddleOcrClient {
             model: cfg.model.clone(),
             http,
             retry_delay: Duration::from_secs(1),
+            submit_limiter: Arc::new(RateLimiter::direct(
+                Quota::with_period(SUBMIT_PERIOD).expect("submit period is valid"),
+            )),
         })
     }
 
     pub async fn submit(&self, slice_path: &Path) -> Result<String> {
         let mut attempt = 0u32;
         loop {
+            self.submit_limiter.until_ready().await;
             match self.try_submit(slice_path).await {
                 Ok(job_id) => return Ok(job_id),
                 Err(OcrError {
@@ -1775,6 +1781,56 @@ pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, model: &str) ->
     Ok(())
 }
 
+const MAX_SUBMIT_CONCURRENCY: usize = 4;
+const MAX_DOWNLOAD_CONCURRENCY: usize = 8;
+const SUBMIT_PERIOD: Duration = Duration::from_millis(500);
+
+async fn submit_all_slices(
+    client: &Arc<PaddleOcrClient>,
+    layout: &CacheLayout,
+    pending: &[usize],
+) -> Result<Vec<InFlightJob>> {
+    let submit_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
+    let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<String>)>();
+    let mut spawned = 0usize;
+    for &index in pending {
+        let client = Arc::clone(client);
+        let slots = Arc::clone(&submit_slots);
+        let tx = submit_tx.clone();
+        let slice_path = layout.slice_path(index);
+        tokio::spawn(async move {
+            let result = match slots.acquire().await {
+                Ok(_permit) => client.submit(&slice_path).await,
+                Err(e) => Err(anyhow::anyhow!("submit semaphore closed: {e}")),
+            };
+            let _ = tx.send((index, result));
+        });
+        spawned += 1;
+    }
+    drop(submit_tx);
+
+    let mut polling = Vec::with_capacity(spawned);
+    for submitted in 0..spawned {
+        let (index, result) = submit_rx
+            .recv()
+            .await
+            .expect("submit task closed without result");
+        match result {
+            Ok(job_id) => {
+                polling.push(InFlightJob {
+                    index,
+                    job_id,
+                    next_poll_at: Instant::now() + jittered(Duration::from_secs(5)),
+                    attempt: 0,
+                });
+                eprintln!("submit {:04} · {}/{}", index + 1, submitted + 1, pending.len());
+            }
+            Err(e) => bail!("slice {:04} submit failed: {e:#}", index + 1),
+        }
+    }
+    Ok(polling)
+}
+
 pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
     let client = Arc::new(PaddleOcrClient::from_config(cfg)?);
     let pdf = PdfDocument::open(pdf_path)?;
@@ -1807,24 +1863,10 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
         eprintln!("all slices cached, nothing to OCR");
     }
 
-    let mut submit_limiter = FixedRateLimiter::new(Duration::from_millis(500));
-    let submit_slots = Arc::new(Semaphore::new(4));
-    let mut polling: Vec<InFlightJob> = Vec::new();
-    for (submitted, &index) in pending.iter().enumerate() {
-        submit_limiter.tick().await;
-        let _permit = submit_slots.acquire().await?;
-        let job_id = client.submit(&layout.slice_path(index)).await?;
-        polling.push(InFlightJob {
-            index,
-            job_id,
-            next_poll_at: Instant::now() + jittered(Duration::from_secs(5)),
-            attempt: 0,
-        });
-        eprintln!("submit {:04} · {}/{}", index + 1, submitted + 1, pending.len());
-    }
+    let mut polling = submit_all_slices(&client, &layout, &pending).await?;
 
     let mut poll_limiter = FixedRateLimiter::new(Duration::from_millis(200));
-    let download_slots = Arc::new(Semaphore::new(8));
+    let download_slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
     let (download_tx, mut download_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<()>)>();
     let mut done = 0usize;
     let total_pending = pending.len();

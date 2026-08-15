@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -151,13 +151,78 @@ fn start_mock_server(responses: Vec<(u16, &'static str)>) -> MockServer {
     MockServer { url, requests: rx }
 }
 
+fn start_counting_mock_server(
+    responses: Vec<(u16, &'static str)>,
+    response_delay: Duration,
+) -> (String, Arc<AtomicUsize>, mpsc::Receiver<std::time::Instant>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let url = format!("http://127.0.0.1:{}", addr.port());
+    let peak = Arc::new(AtomicUsize::new(0));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let (arrival_tx, arrival_rx) = mpsc::channel();
+    let peak_for_server = Arc::clone(&peak);
+    thread::spawn(move || {
+        for (status_code, body) in responses {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            let arrival = std::time::Instant::now();
+            let peak = Arc::clone(&peak_for_server);
+            let in_flight = Arc::clone(&in_flight);
+            let arrival_tx = arrival_tx.clone();
+            thread::spawn(move || {
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                peak.fetch_max(in_flight.load(Ordering::SeqCst), Ordering::SeqCst);
+                let mut buffer: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 16384];
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .ok();
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buffer.extend_from_slice(&chunk[..n]);
+                            if full_request_received(&buffer) {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                thread::sleep(response_delay);
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                let status_text = if status_code == 200 {
+                    "OK"
+                } else {
+                    "Internal Server Error"
+                };
+                let response = format!(
+                    "HTTP/1.1 {status_code} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                arrival_tx.send(arrival).ok();
+            });
+        }
+    });
+    (url, peak, arrival_rx)
+}
+
 fn test_client(url: &str) -> PaddleOcrClient {
+    test_client_with_submit_period(url, Duration::from_micros(1))
+}
+
+fn test_client_with_submit_period(url: &str, period: Duration) -> PaddleOcrClient {
     PaddleOcrClient {
         api_base: url.to_string(),
         access_token: "test-token".to_string(),
         model: "PaddleOCR-VL-1.6".to_string(),
         http: reqwest::Client::builder().no_proxy().build().unwrap(),
         retry_delay: Duration::from_millis(1),
+        submit_limiter: Arc::new(RateLimiter::direct(Quota::with_period(period).unwrap())),
     }
 }
 
@@ -439,6 +504,60 @@ async fn submit_bails_on_terminal_code() {
 
     assert!(error.to_string().contains("status 401"), "{error:#}");
     assert!(error.to_string().contains("unauthorized"), "{error:#}");
+}
+
+#[tokio::test]
+async fn submit_all_slices_runs_four_way_concurrent() {
+    let dir = TestDirectory::new();
+    let responses = vec![(200, r#"{"code":0,"job_id":"job"}"#); 4];
+    let (url, peak, arrivals) = start_counting_mock_server(responses, Duration::from_millis(300));
+    let client = Arc::new(test_client(&url));
+    let pdf_path = make_test_pdf(&dir, "concurrent.pdf", 4);
+    let layout = CacheLayout::for_pdf(&pdf_path, 4, "PaddleOCR-VL-1.6").unwrap();
+    fs::create_dir_all(layout.slices_dir()).unwrap();
+    let mut pending = Vec::new();
+    for index in 0..4 {
+        fs::write(layout.slice_path(index), format!("slice {index}")).unwrap();
+        pending.push(index);
+    }
+
+    let jobs = submit_all_slices(&client, &layout, &pending).await.unwrap();
+
+    assert_eq!(jobs.len(), 4);
+    for _ in 0..4 {
+        arrivals.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    assert_eq!(peak.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn submit_retries_respect_submit_rate_limit() {
+    let responses = vec![
+        (429, "{}"),
+        (429, "{}"),
+        (200, r#"{"code":0,"job_id":"job"}"#),
+    ];
+    let (url, _, arrivals) = start_counting_mock_server(responses, Duration::ZERO);
+    let client = test_client_with_submit_period(&url, Duration::from_millis(500));
+    let dir = TestDirectory::new();
+    let slice = make_test_pdf(&dir, "slice.pdf", 1);
+
+    let job_id = client.submit(&slice).await.unwrap();
+
+    assert_eq!(job_id, "job");
+    let times: Vec<std::time::Instant> = (0..3)
+        .map(|_| arrivals.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    assert!(
+        times[1] - times[0] >= Duration::from_millis(400),
+        "first retry fired too soon: {:?}",
+        times[1] - times[0]
+    );
+    assert!(
+        times[2] - times[1] >= Duration::from_millis(400),
+        "second retry fired too soon: {:?}",
+        times[2] - times[1]
+    );
 }
 
 #[tokio::test]
