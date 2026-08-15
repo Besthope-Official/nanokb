@@ -33,7 +33,12 @@ pub mod pipeline;
 pub use pipeline::Pipeline;
 
 pub mod pdf;
-pub use pdf::{ApiErrorKind, CacheLayout, JobState, OcrError, PaddleOcrClient, PdfDocument, cache_key};
+pub use pdf::{
+    ApiErrorKind, Bbox, BlockLabel, CacheLayout, ImageRef, JobState, OcrError, Page, PageBlock,
+    PaddleOcrClient, PdfDocument, ProjectReport, arxiv_id_from_stem, cache_key, frontmatter,
+    image_refs, infer_heading_level, pair_figures, parse_jsonl, project, render_markdown, validate,
+    write_bundle,
+};
 
 pub mod prune;
 pub use prune::PruneRule;

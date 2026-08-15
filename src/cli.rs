@@ -6,8 +6,9 @@ use crate::rerank::RerankClient;
 use crate::retrieve;
 use crate::filter::Filter;
 use crate::{AppConfig, pdf, postgres, task};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::collections::BTreeSet;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -257,6 +258,13 @@ enum PdfCommand {
         #[arg(long)]
         slice_pages: Option<usize>,
     },
+    #[command(about = "Project cached OCR results into a paper bundle (offline)")]
+    Bundle {
+        file: PathBuf,
+        /// Output directory for the paper bundle.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -330,6 +338,9 @@ pub async fn run() -> Result<()> {
         TopLevelCommand::Pdf {
             command: PdfCommand::Probe { file, slice_pages },
         } => run_pdf_probe(&config, &file, slice_pages).await,
+        TopLevelCommand::Pdf {
+            command: PdfCommand::Bundle { file, out },
+        } => run_pdf_bundle(&config, &file, &out).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -340,6 +351,59 @@ async fn run_pdf_slice(config: &AppConfig, file: &Path, slice_pages: Option<usiz
 
 async fn run_pdf_probe(config: &AppConfig, file: &Path, slice_pages: Option<usize>) -> Result<()> {
     pdf::run_probe(&config.pdf, file, slice_pages.unwrap_or(config.pdf.slice_pages)).await
+}
+
+async fn run_pdf_bundle(config: &AppConfig, file: &Path, out: &Path) -> Result<()> {
+    let slice_pages = config.pdf.slice_pages;
+    let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
+    let slice_count = pdf::PdfDocument::open(file, slice_pages)?.slice_count();
+    let mut pages = Vec::new();
+    for index in 0..slice_count {
+        let result_path = layout.result_path(index);
+        if !result_path.exists() {
+            bail!(
+                "cache for {} is incomplete (missing {}); run `nanokb pdf probe {}` first",
+                file.display(),
+                result_path.display(),
+                file.display()
+            );
+        }
+        let jsonl = std::fs::read_to_string(&result_path)
+            .with_context(|| format!("failed to read {}", result_path.display()))?;
+        for mut page in pdf::parse_jsonl(&jsonl)? {
+            page.page_no += index * slice_pages;
+            pages.push(page);
+        }
+    }
+    let stem = file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("PDF path has no usable stem")?;
+    let (doc, report) = pdf::project(&pages, stem)?;
+
+    let mut available = BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(layout.images_dir()) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                available.insert(name.to_string());
+            }
+        }
+    }
+    for warning in pdf::validate(&doc, &report, &available)? {
+        eprintln!("warning: {warning}");
+    }
+
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    pdf::write_bundle(out, stem, &report, &doc, &layout.images_dir(), &at)?;
+    eprintln!(
+        "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings)",
+        file.display(),
+        out.display(),
+        pages.len(),
+        report.pair_count,
+        report.unpaired_images.len() + report.unpaired_captions.len()
+    );
+    Ok(())
 }
 
 async fn run_kb_list(pool: &sqlx::PgPool) -> Result<()> {
@@ -863,28 +927,41 @@ mod tests {
     }
 
     #[test]
+    fn parses_pdf_bundle_with_out() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "pdf", "bundle", "book.pdf", "--out", "papers"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Pdf {
+                command: PdfCommand::Bundle { file, out },
+            } if file.as_path() == Path::new("book.pdf") && out.as_path() == Path::new("papers")
+        ));
+    }
+
+    #[test]
     fn parses_doc_add_with_n_flag() {
         let cli =
-            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./ddia.pdf"]).unwrap();
+            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./demo.pdf"]).unwrap();
 
         assert!(matches!(
             cli.command,
             TopLevelCommand::Doc {
                 command: DocCommand::Add { ref kb, ref source },
-            } if kb == "books" && source == "./ddia.pdf"
+            } if kb == "books" && source == "./demo.pdf"
         ));
     }
 
     #[test]
     fn parses_doc_add_with_long_name_flag() {
         let cli =
-            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./ddia.pdf"]).unwrap();
+            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./demo.pdf"]).unwrap();
 
         assert!(matches!(
             cli.command,
             TopLevelCommand::Doc {
                 command: DocCommand::Add { ref kb, ref source },
-            } if kb == "books" && source == "./ddia.pdf"
+            } if kb == "books" && source == "./demo.pdf"
         ));
     }
 
@@ -977,16 +1054,16 @@ mod tests {
             0,
             0,
             1,
-            vec!["Storage and Indexing for OLTP", "Write amplification"],
+            vec!["Storage Systems", "fake section"],
             "body",
         );
         result.filename = "ch4.md".to_string();
         result.frontmatter = serde_json::json!({
             "type": "chapter",
-            "title": "4. Storage and Retrieval",
-            "resource": "../ddia.pdf#113-178",
-            "generated": { "by": "human:besthope", "at": "2026-08-13" },
-            "book": "ddia",
+            "title": "4. Fake Chapter",
+            "resource": "../demo.pdf#113-178",
+            "generated": { "by": "human:alice", "at": "2026-08-13" },
+            "book": "demo",
             "chapter": 4,
         });
         let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
@@ -995,11 +1072,11 @@ mod tests {
             lines,
             vec![
                 "<result>",
-                "[title]  ddia · ch4 \"4. Storage and Retrieval\" · Write amplification",
-                "[url]    ../ddia.pdf#113-178 · kb://ddia/ch4#write_amplification",
-                "[date]   2026-08-13 (generated: human:besthope)",
+                "[title]  demo · ch4 \"4. Fake Chapter\" · fake section",
+                "[url]    ../demo.pdf#113-178 · kb://demo/ch4#fake_section",
+                "[date]   2026-08-13 (generated: human:alice)",
                 "[score]  0.31 · VEC",
-                "[path]   Storage and Indexing for OLTP > Write amplification",
+                "[path]   Storage Systems > fake section",
                 "body",
                 "</result>",
             ]
@@ -1057,15 +1134,15 @@ mod tests {
     fn result_lines_render_figures_with_decoded_blob_size() {
         let mut result = make_result_in("a", 0, 0, 1, vec!["Guide"], "body");
         result.figures = vec![Figure {
-            src: "fig/ddia_0404.png".to_string(),
-            caption: "Figure 4-4. A Bloom filter".to_string(),
+            src: "fig/demo_0404.png".to_string(),
+            caption: "Figure 4-4. A fake figure".to_string(),
             description: None,
             blob: Some("QUJDRA==".to_string()),
         }];
         let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
 
         assert!(lines.contains(
-            &"[figure] fig/ddia_0404.png · \"Figure 4-4. A Bloom filter\" · blob 4 B".to_string()
+            &"[figure] fig/demo_0404.png · \"Figure 4-4. A fake figure\" · blob 4 B".to_string()
         ));
     }
 
@@ -1108,7 +1185,7 @@ mod tests {
             "-l",
             "type=chapter",
             "-l",
-            "book!=ddia",
+            "book!=demo",
         ])
         .unwrap();
 
@@ -1120,7 +1197,7 @@ mod tests {
                 assert_eq!(filters[0].value, "chapter");
                 assert_eq!(filters[1].key, "book");
                 assert_eq!(filters[1].op, FilterOp::NotEq);
-                assert_eq!(filters[1].value, "ddia");
+                assert_eq!(filters[1].value, "demo");
             }
             _ => panic!("expected query command"),
         }

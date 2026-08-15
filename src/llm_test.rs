@@ -80,7 +80,7 @@ async fn chat_json_parses_response() {
         cache_hit_tokens: AtomicU64::new(0),
         cache_miss_tokens: AtomicU64::new(0),
         reasoning_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
     };
 
     let result: serde_json::Value = client
@@ -116,7 +116,7 @@ async fn chat_errors_on_empty_choices() {
         cache_hit_tokens: AtomicU64::new(0),
         cache_miss_tokens: AtomicU64::new(0),
         reasoning_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
     };
 
     let error: anyhow::Error = client
@@ -148,7 +148,7 @@ async fn chat_json_errors_on_invalid_json() {
         cache_hit_tokens: AtomicU64::new(0),
         cache_miss_tokens: AtomicU64::new(0),
         reasoning_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
     };
 
     let error: anyhow::Error = client
@@ -188,7 +188,7 @@ async fn chat_json_retries_and_succeeds() {
         cache_hit_tokens: AtomicU64::new(0),
         cache_miss_tokens: AtomicU64::new(0),
         reasoning_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
     };
 
     let result: serde_json::Value = client
@@ -229,7 +229,7 @@ async fn chat_json_exhausts_retries_and_fails() {
         cache_hit_tokens: AtomicU64::new(0),
         cache_miss_tokens: AtomicU64::new(0),
         reasoning_tokens: AtomicU64::new(0),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
     };
 
     let error: anyhow::Error = client

@@ -579,9 +579,9 @@ async fn query_filters_filter_documents_by_frontmatter() -> Result<()> {
     let docs = [
         (
             "alpha.md",
-            json!({"type": "chapter", "book": "ddia", "tags": ["database", "replication"]}),
+            json!({"type": "chapter", "book": "demo", "tags": ["database", "replication"]}),
         ),
-        ("beta.md", json!({"type": "appendix", "book": "ddia", "tags": ["database"]})),
+        ("beta.md", json!({"type": "appendix", "book": "demo", "tags": ["database"]})),
         ("gamma.md", json!({"type": "chapter", "book": "other", "tags": ["streaming"]})),
         ("delta.md", json!({"type": "chapter"})),
         ("epsilon.md", json!({})),
@@ -636,7 +636,7 @@ async fn query_filters_filter_documents_by_frontmatter() -> Result<()> {
         KB_NAME_FILTER,
         &embedding,
         5,
-        &filter_set(&["type=chapter", "book=ddia"]),
+        &filter_set(&["type=chapter", "book=demo"]),
     )
     .await?;
     assert_eq!(sorted_filenames(&hits), ["alpha.md"]);

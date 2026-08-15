@@ -1,4 +1,6 @@
 use super::*;
+use crate::parser::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -154,7 +156,7 @@ fn test_client(url: &str) -> PaddleOcrClient {
         api_base: url.to_string(),
         access_token: "test-token".to_string(),
         model: "PaddleOCR-VL-1.6".to_string(),
-        http: reqwest::Client::new(),
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
         retry_delay: Duration::from_millis(1),
     }
 }
@@ -233,7 +235,7 @@ fn cache_layout_paths_and_resume_skip() {
     let layout = CacheLayout::for_pdf(&path, 20, "PaddleOCR-VL-1.6").unwrap();
 
     assert!(layout.slice_path(1).ends_with("slices/0002.pdf"));
-    assert!(layout.result_path(1).ends_with("results/0002.json"));
+    assert!(layout.result_path(1).ends_with("results/0002.jsonl"));
     assert!(layout.root.starts_with(dir.path().join(".nanokb-cache").join("book")));
     assert!(
         layout
@@ -438,6 +440,634 @@ async fn download_retries_transient_then_succeeds() {
     client.download(&server.url, &dest).await.unwrap();
 
     assert_eq!(fs::read(&dest).unwrap(), body.as_bytes());
+}
+
+// ---------------------------------------------------------------
+// project
+// ---------------------------------------------------------------
+
+fn block(label: &str, content: &str, bbox: [i64; 4]) -> String {
+    format!(
+        r#"{{"block_bbox":[{},{},{},{}],"block_content":{},"block_id":0,"block_label":"{}","block_order":1,"group_id":0}}"#,
+        bbox[0],
+        bbox[1],
+        bbox[2],
+        bbox[3],
+        serde_json::to_string(content).unwrap(),
+        label
+    )
+}
+
+fn page_json(blocks: &[String], images: &str) -> String {
+    format!(
+        r#"{{"prunedResult":{{"width":1224.0,"height":1584.0,"model_settings":{{"markdown_ignore_labels":["number","footnote","header"]}},"parsing_res_list":[{}]}},"markdown":{{"text":"","images":{{{images}}}}}}}"#,
+        blocks.join(",")
+    )
+}
+
+fn jsonl_line(pages: &[String]) -> String {
+    format!(
+        r#"{{"logId":"test","result":{{"layoutParsingResults":[{}]}},"errorCode":0,"errorMsg":"Success"}}"#,
+        pages.join(",")
+    )
+}
+
+#[test]
+fn parse_jsonl_parses_pages_blocks_and_images() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block("paragraph_title", "1. Introduction", [82, 200, 400, 227]),
+            block("text", "Some text.", [82, 240, 400, 300]),
+        ],
+        r#""imgs/img_in_image_box_631_326_1150_770.jpg": "http://img""#,
+    );
+    let pages = parse_jsonl(&jsonl_line(&[page])).unwrap();
+
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].page_no, 1);
+    assert_eq!(pages[0].width, 1224.0);
+    assert_eq!(pages[0].blocks.len(), 3);
+    assert_eq!(pages[0].blocks[0].label, BlockLabel::DocTitle);
+    assert_eq!(pages[0].blocks[1].label, BlockLabel::ParagraphTitle);
+    assert_eq!(pages[0].images.len(), 1);
+}
+
+#[test]
+fn parse_jsonl_marks_ignored_labels() {
+    let page = page_json(
+        &[
+            block("header", "running title", [220, 32, 1003, 61]),
+            block("number", "1", [602, 1503, 615, 1524]),
+            block("formula_number", "(2)", [600, 700, 615, 720]),
+            block("text", "body", [82, 100, 400, 200]),
+        ],
+        "",
+    );
+    let pages = parse_jsonl(&jsonl_line(&[page])).unwrap();
+
+    assert!(matches!(
+        &pages[0].blocks[0].label,
+        BlockLabel::Ignored(l) if l == "header"
+    ));
+    assert!(matches!(
+        &pages[0].blocks[1].label,
+        BlockLabel::Ignored(l) if l == "number"
+    ));
+    assert!(matches!(
+        &pages[0].blocks[2].label,
+        BlockLabel::Ignored(l) if l == "formula_number"
+    ));
+    assert_eq!(pages[0].blocks[3].label, BlockLabel::Text);
+}
+
+#[test]
+fn parse_jsonl_bails_on_error_code() {
+    let line = r#"{"errorCode":12001,"errorMsg":"quota"}"#;
+    let error = parse_jsonl(line).unwrap_err();
+    assert!(error.to_string().contains("12001"), "{error:#}");
+    assert!(error.to_string().contains("quota"), "{error:#}");
+}
+
+#[test]
+fn parse_jsonl_bails_on_unknown_label() {
+    let page = page_json(&[block("weird_block", "x", [0, 0, 10, 10])], "");
+    let error = parse_jsonl(&jsonl_line(&[page])).unwrap_err();
+    assert!(format!("{error:#}").contains("weird_block"), "{error:#}");
+}
+
+#[test]
+fn infer_heading_level_table() {
+    assert_eq!(infer_heading_level("1. Introduction"), (1, "Introduction"));
+    assert_eq!(
+        infer_heading_level("2.1. Retrieval-Augmented Generation"),
+        (2, "Retrieval-Augmented Generation")
+    );
+    assert_eq!(
+        infer_heading_level("3.3.1. IRG TRIGGERING PIPELINE."),
+        (3, "IRG TRIGGERING PIPELINE.")
+    );
+    assert_eq!(infer_heading_level("Abstract"), (1, "Abstract"));
+    assert_eq!(infer_heading_level("10. Related Work"), (1, "Related Work"));
+    assert_eq!(infer_heading_level("References"), (1, "References"));
+}
+
+#[test]
+fn project_builds_nested_tree() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block("paragraph_title", "1. Introduction", [82, 200, 400, 227]),
+            block("text", "Intro text.", [82, 240, 400, 300]),
+            block("paragraph_title", "1.1. Background", [82, 320, 400, 347]),
+            block("text", "Background text.", [82, 360, 400, 420]),
+            block("table", "<table><tr><td>a</td></tr></table>", [82, 440, 600, 560]),
+            block("algorithm", "Require: x", [82, 580, 600, 700]),
+            block("display_formula", "$$ E = mc^2 $$", [82, 710, 600, 750]),
+            block("paragraph_title", "References", [82, 760, 400, 787]),
+            block("reference_content", "Ref one.", [82, 800, 600, 840]),
+        ],
+        "",
+    );
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "my-paper").unwrap();
+
+    assert_eq!(report.title.as_deref(), Some("My Paper"));
+    let root = doc.node(doc.root);
+    assert_eq!(root.children.len(), 2);
+    let intro = doc.node(root.children[0]);
+    assert!(matches!(
+        &intro.kind,
+        NodeKind::Heading { level: 1, title } if title == "Introduction"
+    ));
+    assert_eq!(intro.children.len(), 2);
+    let background = doc.node(intro.children[1]);
+    assert!(matches!(
+        &background.kind,
+        NodeKind::Heading { level: 2, title } if title == "Background"
+    ));
+    assert_eq!(background.children.len(), 4);
+    assert!(matches!(
+        &doc.node(background.children[1]).kind,
+        NodeKind::Table { text } if text == "<table><tr><td>a</td></tr></table>"
+    ));
+    assert!(matches!(
+        &doc.node(background.children[2]).kind,
+        NodeKind::CodeBlock { text } if text == "Require: x"
+    ));
+    assert!(matches!(
+        &doc.node(background.children[3]).kind,
+        NodeKind::MathBlock { text } if text == "$$ E = mc^2 $$"
+    ));
+    assert!(matches!(
+        &doc.node(root.children[1]).kind,
+        NodeKind::Heading { level: 1, title } if title == "References"
+    ));
+    assert!(report.dropped.is_empty());
+}
+
+#[test]
+fn project_pairs_figures_and_reports_unpaired() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block("image", "", [631, 326, 1150, 770]),
+            block("figure_title", "Figure 1. Overview.", [625, 787, 1151, 882]),
+            block("image", "", [100, 1000, 400, 1200]),
+            block("figure_title", "Loose caption.", [82, 100, 400, 127]),
+        ],
+        r#""imgs/img_in_image_box_631_326_1150_770.jpg": "http://img1""#,
+    );
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+
+    let root = doc.node(doc.root);
+    assert_eq!(root.children.len(), 3);
+    assert!(matches!(
+        &doc.node(root.children[0]).kind,
+        NodeKind::Figure { src, caption, .. } if src == "fig/1_img_in_image_box_631_326_1150_770.jpg"
+            && caption == "Figure 1. Overview."
+    ));
+    assert!(matches!(
+        &doc.node(root.children[1]).kind,
+        NodeKind::Figure { src, caption, .. } if src == "fig/1_img_in_image_box_100_1000_400_1200.jpg"
+            && caption.is_empty()
+    ));
+    assert!(matches!(
+        &doc.node(root.children[2]).kind,
+        NodeKind::Paragraph { text } if text == "Loose caption."
+    ));
+    assert_eq!(report.pair_count, 1);
+    assert_eq!(report.unpaired_captions, vec!["Loose caption."]);
+    assert_eq!(
+        report.unpaired_images,
+        vec!["fig/1_img_in_image_box_100_1000_400_1200.jpg"]
+    );
+}
+
+#[test]
+fn pair_figures_prefers_caption_below_on_tie() {
+    let page = Page {
+        page_no: 1,
+        width: 100.0,
+        height: 1000.0,
+        blocks: vec![
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "Above.".into(),
+                bbox: Bbox { x1: 0, y1: 25, x2: 50, y2: 75 },
+            },
+            PageBlock {
+                label: BlockLabel::Image,
+                content: String::new(),
+                bbox: Bbox { x1: 0, y1: 100, x2: 50, y2: 200 },
+            },
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "Below.".into(),
+                bbox: Bbox { x1: 0, y1: 225, x2: 50, y2: 275 },
+            },
+        ],
+        images: vec![],
+    };
+    let (pairs, _, _) = pair_figures(&page);
+
+    assert_eq!(pairs, vec![(1, 2)]);
+}
+
+#[test]
+fn project_extracts_marker_style_authors() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block(
+                "text",
+                "Alice Chen $ ^{*1} $ Bob Wu $ ^{*2} $ Carol Zhou $ ^{1} $\nExample University",
+                [153, 246, 1065, 400],
+            ),
+            block("paragraph_title", "Abstract", [282, 500, 392, 529]),
+        ],
+        "",
+    );
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+
+    assert_eq!(report.authors, vec!["Alice Chen", "Bob Wu", "Carol Zhou"]);
+    assert_eq!(report.affiliations, vec!["Example University"]);
+}
+
+#[test]
+fn project_extracts_footnote_affiliations() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block("text", "Alice Chen $ ^{*1} $ Bob Wu $ ^{*2} $", [153, 246, 1065, 284]),
+            block("paragraph_title", "Abstract", [282, 324, 392, 353]),
+            block("footnote", "$ ^{*} $Equal contribution  $ ^{1} $Example University, Springfield  $ ^{2} $Example Labs, Metropolis. Correspondence to: Alice Chen <alice@example.edu>.  $ ^{3} $Proceedings of the", [84, 1252, 600, 1387]),
+        ],
+        "",
+    );
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+
+    assert_eq!(
+        report.affiliations,
+        vec![
+            "Example University, Springfield",
+            "Example Labs, Metropolis"
+        ]
+    );
+}
+
+#[test]
+fn project_extracts_first_line_authors() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block(
+                "text",
+                "Dana Lin\nState University\ndana@example.edu",
+                [153, 246, 1065, 400],
+            ),
+            block(
+                "text",
+                "Erin Ma\nCity College\nerin@example.com",
+                [153, 410, 1065, 500],
+            ),
+            block("paragraph_title", "ABSTRACT", [282, 560, 392, 589]),
+        ],
+        "",
+    );
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "p").unwrap();
+
+    assert_eq!(report.authors, vec!["Dana Lin", "Erin Ma"]);
+    assert_eq!(
+        report.affiliations,
+        vec!["State University", "City College"]
+    );
+}
+
+#[test]
+fn project_bails_on_two_titles() {
+    let page = page_json(
+        &[
+            block("doc_title", "A", [0, 0, 10, 10]),
+            block("doc_title", "B", [0, 20, 10, 30]),
+        ],
+        "",
+    );
+    let error = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "x").unwrap_err();
+    assert!(error.to_string().contains("doc_title"), "{error:#}");
+}
+
+#[test]
+fn project_bails_on_heading_jump() {
+    let page = page_json(
+        &[
+            block("doc_title", "A", [0, 0, 10, 10]),
+            block("paragraph_title", "2.1. Deep", [0, 20, 10, 30]),
+        ],
+        "",
+    );
+    let error = project(&parse_jsonl(&jsonl_line(&[page])).unwrap(), "x").unwrap_err();
+    assert!(error.to_string().contains("level jump"), "{error:#}");
+}
+
+#[test]
+fn validate_reports_warnings() {
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Figure {
+                    src: "fig/1_foo.jpg".into(),
+                    caption: "cap".into(),
+                    description: None,
+                },
+                children: vec![],
+            },
+        ],
+        root: NodeId(0),
+    };
+    let report = ProjectReport {
+        unpaired_images: vec!["fig/1_bar.jpg".into()],
+        unpaired_captions: vec!["Loose.".into()],
+        dropped: BTreeMap::from([("header".to_string(), 3usize)]),
+        ..Default::default()
+    };
+    let warnings = validate(&doc, &report, &BTreeSet::new()).unwrap();
+
+    assert!(warnings.iter().any(|w| w.contains("1_bar.jpg")));
+    assert!(warnings.iter().any(|w| w.contains("Loose.")));
+    assert!(warnings.iter().any(|w| w.contains("1_foo.jpg")));
+    assert!(warnings.iter().any(|w| w.contains("dropped 3 header")));
+}
+
+#[test]
+fn image_refs_lists_page_indices() {
+    let p1 = page_json(&[block("text", "a", [0, 0, 10, 10])], r#""imgs/a.jpg": "http://a""#);
+    let p2 = page_json(&[block("text", "b", [0, 0, 10, 10])], r#""imgs/b.jpg": "http://b""#);
+    let refs = image_refs(&jsonl_line(&[p1, p2])).unwrap();
+
+    assert_eq!(refs.len(), 2);
+    assert_eq!(refs[0].page_in_slice, 0);
+    assert_eq!(refs[1].page_in_slice, 1);
+    assert_eq!(refs[1].url, "http://b");
+}
+
+// ---------------------------------------------------------------
+// bundle
+// ---------------------------------------------------------------
+
+#[test]
+fn arxiv_id_from_stem_parses_and_rejects() {
+    assert_eq!(
+        arxiv_id_from_stem("9999.99999v9").as_deref(),
+        Some("9999.99999")
+    );
+    assert_eq!(
+        arxiv_id_from_stem("9999.99999").as_deref(),
+        Some("9999.99999")
+    );
+    assert_eq!(
+        arxiv_id_from_stem("9998.00001v2").as_deref(),
+        Some("9998.00001")
+    );
+    assert_eq!(arxiv_id_from_stem("my-paper"), None);
+    assert_eq!(arxiv_id_from_stem("12.34"), None);
+    assert_eq!(arxiv_id_from_stem("1234.567890"), None);
+    assert_eq!(arxiv_id_from_stem("9999.99999v9x"), None);
+}
+
+#[test]
+fn frontmatter_golden() {
+    let report = ProjectReport {
+        title: Some("My Paper: A Framework".into()),
+        ..Default::default()
+    };
+    let fm = frontmatter("my-paper", &report, "2026-08-15T10:00:00Z");
+    assert_eq!(
+        fm,
+        "---\n\
+         type: paper\n\
+         title: \"My Paper: A Framework\"\n\
+         description: \"\"\n\
+         resource: ../pdf/my-paper.pdf\n\
+         tags: []\n\
+         generated: { by: process:nanokb-import, at: 2026-08-15T10:00:00Z }\n\
+         sources:\n  - id: my-paper\n    resource: ../pdf/my-paper.pdf\n\
+         owner: machine\n\
+         ---\n"
+    );
+
+    let report = ProjectReport {
+        title: Some("Fake Paper".into()),
+        authors: vec!["Alice Chen".into(), "Bob Wu".into()],
+        affiliations: vec!["Example University".into(), "Example Labs".into()],
+        ..Default::default()
+    };
+    let fm = frontmatter("9999.99999v9", &report, "2026-08-15T10:00:00Z");
+    assert!(fm.contains("authors: [\"Alice Chen\", \"Bob Wu\"]\n"), "{fm}");
+    assert!(
+        fm.contains("affiliations: [\"Example University\", \"Example Labs\"]\n"),
+        "{fm}"
+    );
+    assert!(fm.contains("arxiv: \"9999.99999\"\n"), "{fm}");
+}
+
+#[test]
+fn render_markdown_golden() {
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1), NodeId(3)],
+            },
+            Node {
+                kind: NodeKind::Heading {
+                    level: 1,
+                    title: "Abstract".into(),
+                },
+                children: vec![NodeId(2)],
+            },
+            Node {
+                kind: NodeKind::Paragraph {
+                    text: "Some $x$ text.".into(),
+                },
+                children: vec![],
+            },
+            Node {
+                kind: NodeKind::Heading {
+                    level: 2,
+                    title: "1.1. Sub".into(),
+                },
+                children: vec![NodeId(4), NodeId(5)],
+            },
+            Node {
+                kind: NodeKind::Table {
+                    text: "<table><tr><td>a</td></tr></table>".into(),
+                },
+                children: vec![],
+            },
+            Node {
+                kind: NodeKind::CodeBlock {
+                    text: "x = 1".into(),
+                },
+                children: vec![],
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    let md = render_markdown(&doc, "My Paper");
+
+    assert_eq!(
+        md,
+        "# My Paper\n\n\
+         ## Abstract\n\n\
+         Some $x$ text.\n\n\
+         ### 1.1. Sub\n\n\
+         <table><tr><td>a</td></tr></table>\n\n\
+         ```\n\
+         x = 1\n\
+         ```\n"
+    );
+}
+
+#[test]
+fn write_bundle_creates_rewrites_and_preserves_index() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("papers");
+    let cache = dir.path().join("cache-images");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("1_img.jpg"), b"v1").unwrap();
+
+    let doc = || StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "p.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Figure {
+                    src: "fig/1_img.jpg".into(),
+                    caption: "Fig".into(),
+                    description: None,
+                },
+                children: vec![],
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    let report = ProjectReport {
+        title: Some("My Paper".into()),
+        ..Default::default()
+    };
+    write_bundle(
+        &out,
+        "my-paper",
+        &report,
+        &doc(),
+        &cache,
+        "2026-08-15T10:00:00Z",
+    )
+    .unwrap();
+    let md_path = out.join("my-paper.md");
+    let index_path = out.join("index.md");
+    let fig_path = out.join("fig").join("1_img.jpg");
+    assert!(md_path.exists());
+    assert!(index_path.exists());
+    assert_eq!(fs::read(&fig_path).unwrap(), b"v1");
+    let index_before = fs::read(&index_path).unwrap();
+    assert!(String::from_utf8_lossy(&index_before).contains("My Paper"));
+
+    fs::write(cache.join("1_img.jpg"), b"v2").unwrap();
+    let report = ProjectReport {
+        title: Some("Renamed".into()),
+        ..Default::default()
+    };
+    write_bundle(
+        &out,
+        "my-paper",
+        &report,
+        &doc(),
+        &cache,
+        "2026-08-15T10:00:01Z",
+    )
+    .unwrap();
+    assert!(fs::read_to_string(&md_path).unwrap().contains("Renamed"));
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+    assert_eq!(fs::read(&fig_path).unwrap(), b"v1");
+}
+
+// ---------------------------------------------------------------
+// refresh_images
+// ---------------------------------------------------------------
+
+fn layout_with_result(dir: &TestDirectory, result_jsonl: &str) -> CacheLayout {
+    let pdf_path = dir.path().join("paper.pdf");
+    fs::write(&pdf_path, b"fake pdf bytes").unwrap();
+    let layout = CacheLayout::for_pdf(&pdf_path, 20, "PaddleOCR-VL-1.6").unwrap();
+    fs::create_dir_all(layout.results_dir()).unwrap();
+    fs::write(layout.result_path(0), result_jsonl).unwrap();
+    layout
+}
+
+#[tokio::test]
+async fn refresh_images_downloads_and_skips_existing() {
+    let body = "jpeg-bytes";
+    let server = start_mock_server(vec![(200, body)]);
+    let dir = TestDirectory::new();
+    let jsonl = jsonl_line(&[page_json(
+        &[block("text", "a", [0, 0, 10, 10])],
+        &format!(
+            r#""imgs/img_in_image_box_10_20_30_40.jpg": "{}""#,
+            server.url
+        ),
+    )]);
+    let layout = layout_with_result(&dir, &jsonl);
+    let client = test_client(&server.url);
+
+    refresh_images(&client, &layout, 1, 20).await.unwrap();
+
+    let image = layout.images_dir().join("1_img_in_image_box_10_20_30_40.jpg");
+    assert!(image.exists());
+    assert_eq!(fs::read(&image).unwrap(), body.as_bytes());
+    assert!(server.requests.recv().is_ok());
+
+    refresh_images(&client, &layout, 1, 20).await.unwrap();
+    assert!(server.requests.recv_timeout(std::time::Duration::from_millis(300)).is_err());
+}
+
+#[tokio::test]
+async fn refresh_images_warns_and_continues_on_404() {
+    let server = start_mock_server(vec![(404, "{}")]);
+    let dir = TestDirectory::new();
+    let jsonl = jsonl_line(&[page_json(
+        &[block("text", "a", [0, 0, 10, 10])],
+        &format!(
+            r#""imgs/img_in_image_box_10_20_30_40.jpg": "{}""#,
+            server.url
+        ),
+    )]);
+    let layout = layout_with_result(&dir, &jsonl);
+    let client = test_client(&server.url);
+
+    refresh_images(&client, &layout, 1, 20).await.unwrap();
+
+    assert!(!layout.images_dir().join("1_img_in_image_box_10_20_30_40.jpg").exists());
 }
 
 // ---------------------------------------------------------------

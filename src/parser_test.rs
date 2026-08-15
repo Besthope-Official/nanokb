@@ -150,8 +150,8 @@ fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
     let frontmatter = parse_frontmatter(
         "---\ntype: chapter\ntitle: Guide\ndescription: A short guide.\n\
          resource: https://example.com/guide\ntags: [kb, rust]\n\
-         generated: { by: human:besthope, at: 2026-08-13 }\n\
-         book: ddia\n---\nbody",
+         generated: { by: human:alice, at: 2026-08-13 }\n\
+         book: demo\n---\nbody",
     )
     .unwrap()
     .unwrap();
@@ -162,8 +162,8 @@ fn frontmatter_ext_reads_okf_fields_and_keeps_custom_keys() {
     assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
     assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
     assert_eq!(frontmatter.generated_at(), Some("2026-08-13"));
-    assert_eq!(frontmatter.generated_by(), Some("human:besthope"));
-    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
+    assert_eq!(frontmatter.generated_by(), Some("human:alice"));
+    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("demo"));
 }
 
 #[test]
@@ -174,8 +174,8 @@ fn frontmatter_ext_reads_stored_json_frontmatter() {
         "description": "A short guide.",
         "resource": "https://example.com/guide",
         "tags": ["kb", "rust"],
-        "generated": { "by": "human:besthope", "at": "2026-08-13" },
-        "book": "ddia",
+        "generated": { "by": "human:alice", "at": "2026-08-13" },
+        "book": "demo",
     });
 
     assert_eq!(frontmatter.okf_type(), Some("chapter"));
@@ -184,8 +184,8 @@ fn frontmatter_ext_reads_stored_json_frontmatter() {
     assert_eq!(frontmatter.resource(), Some("https://example.com/guide"));
     assert_eq!(frontmatter.tags(), vec!["kb", "rust"]);
     assert_eq!(frontmatter.generated_at(), Some("2026-08-13"));
-    assert_eq!(frontmatter.generated_by(), Some("human:besthope"));
-    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("ddia"));
+    assert_eq!(frontmatter.generated_by(), Some("human:alice"));
+    assert_eq!(frontmatter.get("book").and_then(|v| v.as_str()), Some("demo"));
 }
 
 #[test]

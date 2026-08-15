@@ -1,10 +1,11 @@
 use crate::config::PdfConfig;
+use crate::parser::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument};
 use anyhow::{Context, Result, bail, ensure};
 use lopdf::{Document, Object, ObjectId, dictionary};
 use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,10 +18,6 @@ const MAX_SLICE_BYTES: u64 = 50 * 1024 * 1024;
 const CLIENT_PLATFORM: &str = "nanokb";
 const CODE_KEYS: &[&str] = &["code", "err_code", "error_code"];
 const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_msg", "errMsg"];
-
-// ---------------------------------------------------------------
-// slice
-// ---------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct PdfDocument {
@@ -227,10 +224,6 @@ fn filter_page_tree(doc: &mut Document, node: ObjectId, kept_pages: &BTreeSet<Ob
     count
 }
 
-// ---------------------------------------------------------------
-// cache
-// ---------------------------------------------------------------
-
 pub fn cache_key(bytes: &[u8], slice_pages: usize, model: &str) -> String {
     let hash = Sha256::digest(bytes);
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
@@ -284,17 +277,799 @@ impl CacheLayout {
     }
 
     pub fn result_path(&self, index: usize) -> PathBuf {
-        self.results_dir().join(format!("{:04}.json", index + 1))
+        self.results_dir().join(format!("{:04}.jsonl", index + 1))
     }
 
     pub fn has_result(&self, index: usize) -> bool {
         self.result_path(index).exists()
     }
+
+    pub fn images_dir(&self) -> PathBuf {
+        self.root.join("images")
+    }
+
+    pub fn image_path(&self, page: usize, basename: &str) -> PathBuf {
+        self.images_dir().join(format!("{page}_{basename}"))
+    }
 }
 
-// ---------------------------------------------------------------
-// ocr client
-// ---------------------------------------------------------------
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bbox {
+    pub x1: i64,
+    pub y1: i64,
+    pub x2: i64,
+    pub y2: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BlockLabel {
+    DocTitle,
+    ParagraphTitle,
+    Text,
+    Abstract,
+    Image,
+    Chart,
+    FigureTitle,
+    Table,
+    Algorithm,
+    DisplayFormula,
+    ReferenceContent,
+    Ignored(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PageBlock {
+    pub label: BlockLabel,
+    pub content: String,
+    pub bbox: Bbox,
+}
+
+#[derive(Clone, Debug)]
+pub struct Page {
+    pub page_no: usize,
+    pub width: f64,
+    pub height: f64,
+    pub blocks: Vec<PageBlock>,
+    pub images: Vec<(String, String)>,
+}
+
+pub struct ImageRef {
+    pub page_in_slice: usize,
+    pub relpath: String,
+    pub url: String,
+}
+
+#[derive(Debug, Default)]
+pub struct ProjectReport {
+    pub title: Option<String>,
+    pub authors: Vec<String>,
+    pub affiliations: Vec<String>,
+    pub doc_title_count: usize,
+    pub unpaired_captions: Vec<String>,
+    pub unpaired_images: Vec<String>,
+    pub dropped: BTreeMap<String, usize>,
+    pub pair_count: usize,
+}
+
+const HARD_IGNORE_LABELS: &[&str] = &["number", "formula_number", "header", "footnote"];
+
+pub fn parse_jsonl(text: &str) -> Result<Vec<Page>> {
+    let mut pages = Vec::new();
+    for (line_no, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .with_context(|| format!("cache JSONL line {} is not JSON", line_no + 1))?;
+        if let Some(code) = value.get("errorCode").and_then(Value::as_i64) {
+            ensure!(
+                code == 0,
+                "cache JSONL line {}: OCR error code {code}: {}",
+                line_no + 1,
+                value
+                    .get("errorMsg")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            );
+        }
+        let results = value
+            .get("result")
+            .and_then(|r| r.get("layoutParsingResults"))
+            .and_then(Value::as_array)
+            .with_context(|| {
+                format!(
+                    "cache JSONL line {} missing result.layoutParsingResults",
+                    line_no + 1
+                )
+            })?;
+        for (page_idx, page) in results.iter().enumerate() {
+            let page = parse_page(page)
+                .with_context(|| format!("cache JSONL line {} page {}", line_no + 1, page_idx + 1))?;
+            pages.push(page);
+        }
+    }
+    for (index, page) in pages.iter_mut().enumerate() {
+        page.page_no = index + 1;
+    }
+    Ok(pages)
+}
+
+fn parse_page(value: &Value) -> Result<Page> {
+    let pruned = value.get("prunedResult").context("page missing prunedResult")?;
+    let width = pruned.get("width").and_then(Value::as_f64).unwrap_or(0.0);
+    let height = pruned.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+    let ignore: BTreeSet<&str> = pruned
+        .get("model_settings")
+        .and_then(|m| m.get("markdown_ignore_labels"))
+        .and_then(Value::as_array)
+        .map(|labels| {
+            labels
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut blocks = Vec::new();
+    for item in pruned
+        .get("parsing_res_list")
+        .and_then(Value::as_array)
+        .context("page missing parsing_res_list")?
+    {
+        let label = item
+            .get("block_label")
+            .and_then(Value::as_str)
+            .context("block missing block_label")?;
+        let label = if ignore.contains(label) || HARD_IGNORE_LABELS.contains(&label) {
+            BlockLabel::Ignored(label.to_string())
+        } else {
+            block_label(label)?
+        };
+        let content = item
+            .get("block_content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let bbox = parse_bbox(item.get("block_bbox").context("block missing block_bbox")?)?;
+        blocks.push(PageBlock { label, content, bbox });
+    }
+    let mut images = Vec::new();
+    if let Some(map) = value
+        .get("markdown")
+        .and_then(|m| m.get("images"))
+        .and_then(Value::as_object)
+    {
+        for (relpath, url) in map {
+            if let Some(url) = url.as_str() {
+                images.push((relpath.clone(), url.to_string()));
+            }
+        }
+    }
+    Ok(Page {
+        page_no: 0,
+        width,
+        height,
+        blocks,
+        images,
+    })
+}
+
+fn block_label(label: &str) -> Result<BlockLabel> {
+    match label {
+        "doc_title" => Ok(BlockLabel::DocTitle),
+        "paragraph_title" => Ok(BlockLabel::ParagraphTitle),
+        "text" => Ok(BlockLabel::Text),
+        "abstract" => Ok(BlockLabel::Abstract),
+        "image" => Ok(BlockLabel::Image),
+        "chart" => Ok(BlockLabel::Chart),
+        "figure_title" => Ok(BlockLabel::FigureTitle),
+        "table" => Ok(BlockLabel::Table),
+        "algorithm" => Ok(BlockLabel::Algorithm),
+        "display_formula" => Ok(BlockLabel::DisplayFormula),
+        "reference_content" => Ok(BlockLabel::ReferenceContent),
+        other => bail!("unknown block_label {other:?}"),
+    }
+}
+
+fn parse_bbox(value: &Value) -> Result<Bbox> {
+    let coords: Vec<i64> = value
+        .as_array()
+        .context("block_bbox is not an array")?
+        .iter()
+        .map(|v| v.as_i64().context("block_bbox coordinate is not an integer"))
+        .collect::<Result<_>>()?;
+    ensure!(
+        coords.len() == 4,
+        "block_bbox has {} coordinates, expected 4",
+        coords.len()
+    );
+    Ok(Bbox {
+        x1: coords[0],
+        y1: coords[1],
+        x2: coords[2],
+        y2: coords[3],
+    })
+}
+
+pub fn infer_heading_level(title: &str) -> (usize, &str) {
+    let trimmed = title.trim();
+    let mut level = 0usize;
+    let mut rest = trimmed;
+    loop {
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end == 0 || digits_end >= rest.len() || rest.as_bytes()[digits_end] != b'.' {
+            break;
+        }
+        level += 1;
+        rest = &rest[digits_end + 1..];
+    }
+    if level == 0 {
+        (1, trimmed)
+    } else {
+        (level, rest.trim())
+    }
+}
+
+pub fn pair_figures(page: &Page) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>) {
+    let image_indices: Vec<usize> = page
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| matches!(b.label, BlockLabel::Image | BlockLabel::Chart))
+        .map(|(i, _)| i)
+        .collect();
+    let caption_indices: Vec<usize> = page
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.label == BlockLabel::FigureTitle)
+        .map(|(i, _)| i)
+        .collect();
+    let threshold = (page.height * 0.25) as i64;
+    let mut paired_captions: BTreeSet<usize> = BTreeSet::new();
+    let mut pairs = Vec::new();
+    for &image in &image_indices {
+        let ib = &page.blocks[image].bbox;
+        let best = caption_indices
+            .iter()
+            .copied()
+            .filter(|c| !paired_captions.contains(c))
+            .map(|c| {
+                let cb = &page.blocks[c].bbox;
+                let gap = if cb.y1 >= ib.y2 {
+                    cb.y1 - ib.y2
+                } else if ib.y1 >= cb.y2 {
+                    ib.y1 - cb.y2
+                } else {
+                    0
+                };
+                let above = ib.y1 >= cb.y2;
+                (gap, above, c)
+            })
+            .filter(|&(gap, _, _)| gap <= threshold)
+            .min_by_key(|&(gap, above, c)| (gap, above, c));
+        if let Some((_, _, caption)) = best {
+            pairs.push((image, caption));
+            paired_captions.insert(caption);
+        }
+    }
+    let unpaired_images = image_indices
+        .iter()
+        .copied()
+        .filter(|i| !pairs.iter().any(|&(image, _)| image == *i))
+        .collect();
+    let unpaired_captions = caption_indices
+        .iter()
+        .copied()
+        .filter(|c| !paired_captions.contains(c))
+        .collect();
+    (pairs, unpaired_images, unpaired_captions)
+}
+
+pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, ProjectReport)> {
+    let mut report = ProjectReport::default();
+    for page in pages {
+        for block in &page.blocks {
+            if let BlockLabel::Ignored(label) = &block.label {
+                *report.dropped.entry(label.clone()).or_insert(0) += 1;
+            }
+            if block.label == BlockLabel::DocTitle {
+                report.doc_title_count += 1;
+                if report.title.is_none() {
+                    report.title = Some(block.content.clone());
+                }
+            }
+        }
+    }
+    ensure!(
+        report.doc_title_count == 1,
+        "expected exactly one doc_title block, found {}",
+        report.doc_title_count
+    );
+    if let Some(first_page) = pages.first() {
+        report.authors = extract_authors(&first_page.blocks);
+        report.affiliations = extract_affiliations(&first_page.blocks);
+    }
+
+    let mut tree = vec![Node {
+        kind: NodeKind::Root,
+        children: Vec::new(),
+    }];
+    let root = NodeId(0);
+    let mut heading_stack: Vec<(NodeId, usize)> = Vec::new();
+    for page in pages {
+        let (pairs, unpaired_images, unpaired_captions) = pair_figures(page);
+        report.pair_count += pairs.len();
+        let pair_map: BTreeMap<usize, usize> =
+            pairs.iter().map(|&(image, caption)| (image, caption)).collect();
+        for &caption in &unpaired_captions {
+            report
+                .unpaired_captions
+                .push(page.blocks[caption].content.clone());
+        }
+        for &image in &unpaired_images {
+            report
+                .unpaired_images
+                .push(figure_src(page, &page.blocks[image]));
+        }
+        for (block_idx, block) in page.blocks.iter().enumerate() {
+            match &block.label {
+                BlockLabel::Ignored(_) | BlockLabel::DocTitle => {}
+                BlockLabel::ParagraphTitle => {
+                    let (level, remainder) = infer_heading_level(&block.content);
+                    while let Some(&(_, top_level)) = heading_stack.last() {
+                        if top_level >= level {
+                            heading_stack.pop();
+                        } else {
+                            break;
+                        }
+                    }
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::Heading {
+                            level,
+                            title: remainder.to_string(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                    heading_stack.push((node_id, level));
+                }
+                BlockLabel::Text | BlockLabel::Abstract | BlockLabel::ReferenceContent => {
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::Paragraph {
+                            text: block.content.clone(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                }
+                BlockLabel::Algorithm => {
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::CodeBlock {
+                            text: block.content.clone(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                }
+                BlockLabel::DisplayFormula => {
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::MathBlock {
+                            text: block.content.clone(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                }
+                BlockLabel::Table => {
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::Table {
+                            text: block.content.clone(),
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                }
+                BlockLabel::Image | BlockLabel::Chart => {
+                    let src = figure_src(page, block);
+                    let caption = pair_map
+                        .get(&block_idx)
+                        .map(|&c| page.blocks[c].content.clone())
+                        .unwrap_or_default();
+                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let node_id = NodeId(tree.len());
+                    tree.push(Node {
+                        kind: NodeKind::Figure {
+                            src,
+                            caption,
+                            description: None,
+                        },
+                        children: Vec::new(),
+                    });
+                    tree[parent.0].children.push(node_id);
+                }
+                BlockLabel::FigureTitle => {
+                    if !pairs.iter().any(|&(_, caption)| caption == block_idx) {
+                        let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                        let node_id = NodeId(tree.len());
+                        tree.push(Node {
+                            kind: NodeKind::Paragraph {
+                                text: block.content.clone(),
+                            },
+                            children: Vec::new(),
+                        });
+                        tree[parent.0].children.push(node_id);
+                    }
+                }
+            }
+        }
+    }
+    check_structure(&tree, root)?;
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: format!("{stem}.md"),
+            frontmatter: None,
+        },
+        tree,
+        root,
+    };
+    Ok((doc, report))
+}
+
+fn extract_authors(blocks: &[PageBlock]) -> Vec<String> {
+    let mut authors = Vec::new();
+    for block in blocks {
+        match &block.label {
+            BlockLabel::ParagraphTitle => break,
+            BlockLabel::Text => {
+                let first_line = block.content.lines().next().unwrap_or_default().trim();
+                if first_line.contains('$') {
+                    let segments: Vec<&str> = first_line.split('$').collect();
+                    for (index, segment) in segments.iter().enumerate() {
+                        let next_is_marker = segments
+                            .get(index + 1)
+                            .is_some_and(|next| next.contains('^') || next.contains('*'));
+                        let name = segment.trim().trim_matches(',').trim();
+                        if next_is_marker
+                            && name.chars().filter(|c| c.is_alphabetic()).count() >= 2
+                            && !name.contains('@')
+                        {
+                            authors.push(name.to_string());
+                        }
+                    }
+                } else if first_line.chars().filter(|c| c.is_alphabetic()).count() >= 2
+                    && !first_line.contains('@')
+                {
+                    authors.push(first_line.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    authors.truncate(30);
+    authors
+}
+
+fn extract_affiliations(blocks: &[PageBlock]) -> Vec<String> {
+    let mut affiliations = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut seen_title = false;
+    for block in blocks {
+        match &block.label {
+            BlockLabel::ParagraphTitle => seen_title = true,
+            BlockLabel::Text if !seen_title => {
+                let rest: Vec<&str> = block
+                    .content
+                    .lines()
+                    .skip(1)
+                    .take_while(|line| !line.contains('@'))
+                    .collect();
+                if rest.is_empty() {
+                    continue;
+                }
+                let joined = rest.join(", ");
+                if joined.contains('$') {
+                    for segment in joined.split('$') {
+                        if !segment.contains('^') && !segment.contains('*') {
+                            push_affiliation(segment, &mut affiliations, &mut seen);
+                        }
+                    }
+                } else {
+                    push_affiliation(&joined, &mut affiliations, &mut seen);
+                }
+            }
+            BlockLabel::Ignored(label) if label == "footnote" => {
+                for segment in block.content.split('$') {
+                    let has_email = segment.contains('@');
+                    let correspondence = segment.to_lowercase().find("correspondence to:");
+                    let cut = correspondence
+                        .map(|index| {
+                            segment
+                                .find('@')
+                                .map(|at| index.min(at))
+                                .unwrap_or(index)
+                        })
+                        .unwrap_or_else(|| segment.find('@').unwrap_or(segment.len()));
+                    let affiliation = &segment[..cut];
+                    if !affiliation.contains('^') && !affiliation.contains('*') {
+                        push_affiliation(affiliation, &mut affiliations, &mut seen);
+                    }
+                    if has_email {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    affiliations
+}
+
+fn push_affiliation(text: &str, affiliations: &mut Vec<String>, seen: &mut BTreeSet<String>) {
+    let cleaned = text
+        .trim()
+        .trim_matches(|c: char| c == ',' || c == '.' || c == ';')
+        .trim()
+        .to_string();
+    let lower = cleaned.to_lowercase();
+    if cleaned.chars().filter(|c| c.is_alphabetic()).count() >= 3
+        && !cleaned.contains('@')
+        && !lower.contains("equal contribution")
+        && !lower.contains("corresponding author")
+        && seen.insert(cleaned.clone())
+    {
+        affiliations.push(cleaned);
+    }
+}
+
+fn figure_src(page: &Page, block: &PageBlock) -> String {
+    let Bbox { x1, y1, x2, y2 } = block.bbox;
+    let needle = format!("{x1}_{y1}_{x2}_{y2}");
+    if let Some((relpath, _)) = page.images.iter().find(|(p, _)| p.contains(&needle)) {
+        let basename = relpath.rsplit('/').next().unwrap_or(relpath);
+        format!("fig/{}_{basename}", page.page_no)
+    } else {
+        let kind = if block.label == BlockLabel::Chart {
+            "chart"
+        } else {
+            "image"
+        };
+        format!("fig/{}_img_in_{kind}_box_{needle}.jpg", page.page_no)
+    }
+}
+
+fn check_structure(tree: &[Node], root: NodeId) -> Result<()> {
+    fn walk(
+        tree: &[Node],
+        node_id: NodeId,
+        parent_level: usize,
+        title_path: &mut Vec<String>,
+    ) -> Result<()> {
+        let node = &tree[node_id.0];
+        if let NodeKind::Heading { level, title } = &node.kind {
+            ensure!(
+                *level <= parent_level + 1,
+                "heading level jump: {title:?} (level {level}) under level {parent_level} ({} > {})",
+                *level,
+                parent_level + 1
+            );
+            title_path.push(title.clone());
+            for &child in &node.children {
+                walk(tree, child, *level, title_path)?;
+            }
+            title_path.pop();
+        } else {
+            for &child in &node.children {
+                walk(tree, child, parent_level, title_path)?;
+            }
+        }
+        Ok(())
+    }
+    walk(tree, root, 0, &mut Vec::new())
+}
+
+pub fn validate(
+    doc: &StructuredDocument,
+    report: &ProjectReport,
+    available_images: &BTreeSet<String>,
+) -> Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    for src in &report.unpaired_images {
+        warnings.push(format!("figure without caption: {src}"));
+    }
+    for caption in &report.unpaired_captions {
+        warnings.push(format!("caption without figure: {caption}"));
+    }
+    for src in figure_srcs(doc) {
+        let basename = src.rsplit('/').next().unwrap_or(&src).to_string();
+        if !available_images.contains(&basename) {
+            warnings.push(format!("image file missing from cache: {basename}"));
+        }
+    }
+    for (label, count) in &report.dropped {
+        warnings.push(format!("dropped {count} {label} blocks"));
+    }
+    Ok(warnings)
+}
+
+fn figure_srcs(doc: &StructuredDocument) -> Vec<String> {
+    let mut srcs = Vec::new();
+    fn walk(doc: &StructuredDocument, node_id: NodeId, srcs: &mut Vec<String>) {
+        for &child in &doc.node(node_id).children {
+            let node = doc.node(child);
+            if let NodeKind::Figure { src, .. } = &node.kind {
+                srcs.push(src.clone());
+            }
+            walk(doc, child, srcs);
+        }
+    }
+    walk(doc, doc.root, &mut srcs);
+    srcs
+}
+
+pub fn image_refs(jsonl: &str) -> Result<Vec<ImageRef>> {
+    let mut refs = Vec::new();
+    for page in parse_jsonl(jsonl)? {
+        for (relpath, url) in &page.images {
+            refs.push(ImageRef {
+                page_in_slice: page.page_no - 1,
+                relpath: relpath.clone(),
+                url: url.clone(),
+            });
+        }
+    }
+    Ok(refs)
+}
+
+pub fn arxiv_id_from_stem(stem: &str) -> Option<String> {
+    let mut parts = stem.split('v');
+    let base = parts.next()?;
+    let version = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let digits: Vec<&str> = base.split('.').collect();
+    if digits.len() != 2
+        || digits[0].len() != 4
+        || !(4..=5).contains(&digits[1].len())
+        || !digits.iter().all(|d| d.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    if let Some(version) = version
+        && (version.is_empty() || !version.chars().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(base.to_string())
+}
+
+fn yaml_quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+pub fn frontmatter(stem: &str, report: &ProjectReport, at: &str) -> String {
+    let title = report.title.as_deref().unwrap_or_default();
+    let arxiv = arxiv_id_from_stem(stem);
+    let mut out = String::from("---\n");
+    out.push_str("type: paper\n");
+    out.push_str(&format!("title: {}\n", yaml_quoted(title)));
+    if !report.authors.is_empty() {
+        let list = report
+            .authors
+            .iter()
+            .map(|author| yaml_quoted(author))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("authors: [{list}]\n"));
+    }
+    if !report.affiliations.is_empty() {
+        let list = report
+            .affiliations
+            .iter()
+            .map(|affiliation| yaml_quoted(affiliation))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("affiliations: [{list}]\n"));
+    }
+    out.push_str("description: \"\"\n");
+    out.push_str(&format!("resource: ../pdf/{stem}.pdf\n"));
+    out.push_str("tags: []\n");
+    out.push_str(&format!(
+        "generated: {{ by: process:nanokb-import, at: {at} }}\n"
+    ));
+    out.push_str(&format!(
+        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
+    ));
+    out.push_str("owner: machine\n");
+    if let Some(id) = arxiv {
+        out.push_str(&format!("arxiv: \"{id}\"\n"));
+    }
+    out.push_str("---\n");
+    out
+}
+
+pub fn render_markdown(doc: &StructuredDocument, title: &str) -> String {
+    let mut blocks = vec![format!("# {title}")];
+    collect_render(doc, doc.root, &mut blocks);
+    format!("{}\n", blocks.join("\n\n"))
+}
+
+fn collect_render(doc: &StructuredDocument, node_id: NodeId, blocks: &mut Vec<String>) {
+    for &child in &doc.node(node_id).children {
+        let node = doc.node(child);
+        let block = match &node.kind {
+            NodeKind::Heading { level, title } => format!("{} {title}", "#".repeat(level + 1)),
+            NodeKind::Paragraph { text } => text.clone(),
+            NodeKind::CodeBlock { text } => format!("```\n{text}\n```"),
+            NodeKind::MathBlock { text } => text.clone(),
+            NodeKind::Table { text } => text.clone(),
+            NodeKind::Figure { src, caption, .. } => format!("![{caption}]({src})"),
+            NodeKind::Root => String::new(),
+        };
+        if !block.is_empty() {
+            blocks.push(block);
+        }
+        collect_render(doc, child, blocks);
+    }
+}
+
+pub fn write_bundle(
+    out: &Path,
+    stem: &str,
+    report: &ProjectReport,
+    doc: &StructuredDocument,
+    cache_images: &Path,
+    at: &str,
+) -> Result<()> {
+    let fig_dir = out.join("fig");
+    fs::create_dir_all(&fig_dir)
+        .with_context(|| format!("failed to create {}", fig_dir.display()))?;
+    let title = report.title.as_deref().unwrap_or_default();
+    let md = format!(
+        "{}\n{}",
+        frontmatter(stem, report, at),
+        render_markdown(doc, title)
+    );
+    let md_path = out.join(format!("{stem}.md"));
+    fs::write(&md_path, md)
+        .with_context(|| format!("failed to write {}", md_path.display()))?;
+
+    for src in figure_srcs(doc) {
+        let basename = src.rsplit('/').next().unwrap_or(&src);
+        let source = cache_images.join(basename);
+        let dest = fig_dir.join(basename);
+        if source.exists() && !dest.exists() {
+            fs::copy(&source, &dest)
+                .with_context(|| format!("failed to copy figure {source:?} to {dest:?}"))?;
+        }
+    }
+    let index_path = out.join("index.md");
+    if !index_path.exists() {
+        let dir_name = out
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Index");
+        fs::write(
+            &index_path,
+            format!("# {dir_name}\n\n- [{title}]({stem}.md)\n"),
+        )
+        .with_context(|| format!("failed to write {}", index_path.display()))?;
+    }
+    Ok(())
+}
 
 pub struct PaddleOcrClient {
     api_base: String,
@@ -612,10 +1387,6 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
     jittered(capped)
 }
 
-// ---------------------------------------------------------------
-// run
-// ---------------------------------------------------------------
-
 struct FixedRateLimiter {
     interval: tokio::time::Interval,
 }
@@ -694,7 +1465,6 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
     }
     if pending.is_empty() {
         eprintln!("all slices cached, nothing to OCR");
-        return Ok(());
     }
 
     let mut submit_limiter = FixedRateLimiter::new(Duration::from_millis(500));
@@ -784,7 +1554,42 @@ pub async fn run_probe(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> 
             Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
         }
     }
+    refresh_images(&client, &layout, total, slice_pages).await?;
     eprintln!("done");
+    Ok(())
+}
+
+pub async fn refresh_images(
+    client: &PaddleOcrClient,
+    layout: &CacheLayout,
+    slice_count: usize,
+    slice_pages: usize,
+) -> Result<()> {
+    fs::create_dir_all(layout.images_dir())
+        .with_context(|| format!("failed to create {}", layout.images_dir().display()))?;
+    for index in 0..slice_count {
+        if !layout.has_result(index) {
+            continue;
+        }
+        let jsonl = fs::read_to_string(layout.result_path(index))
+            .with_context(|| format!("failed to read {}", layout.result_path(index).display()))?;
+        for image_ref in image_refs(&jsonl)? {
+            let page = index * slice_pages + image_ref.page_in_slice + 1;
+            let basename = image_ref
+                .relpath
+                .rsplit('/')
+                .next()
+                .unwrap_or(&image_ref.relpath);
+            let dest = layout.image_path(page, basename);
+            if dest.exists() {
+                continue;
+            }
+            match client.download(&image_ref.url, &dest).await {
+                Ok(()) => eprintln!("image {page}_{basename} cached"),
+                Err(e) => eprintln!("image {page}_{basename} download failed: {e:#}"),
+            }
+        }
+    }
     Ok(())
 }
 
