@@ -8,14 +8,17 @@ anyhow = "1.0.104"
 annotate-snippets = "0.12.16"
 anstream = "0.6"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
+lopdf = "0.39"
 pgvector = { version = "0.4", features = ["sqlx"] }
 pulldown-cmark = "0.13"
 rand = "0.8"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json"] }
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
