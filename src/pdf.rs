@@ -19,6 +19,11 @@ pub const MAX_SLICE_BYTES: u64 = 50 * 1024 * 1024;
 /// PaddleOCR free-tier daily page quota (design doc: 3000 pages/day).
 pub const DAILY_QUOTA_PAGES: u32 = 3000;
 const CLIENT_PLATFORM: &str = "nanokb";
+/// Disables PaddleOCR-VL doc unwarping so `block_bbox` stays in the
+/// original input-image pixel space. With unwarping enabled the server
+/// shifts pixels and bboxes no longer match a local PDF render.
+const OCR_OPTIONAL_PAYLOAD: &str = r#"{"useDocUnwarping":false}"#;
+const OCR_CACHE_VERSION: &str = "unwarp0";
 const CODE_KEYS: &[&str] = &["code", "err_code", "error_code"];
 const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_msg", "errMsg"];
 
@@ -260,7 +265,7 @@ pub fn cache_key(bytes: &[u8], slice_pages: usize, model: &str) -> String {
             }
         })
         .collect();
-    format!("{hex}-{slice_pages}p-{slug}")
+    format!("{hex}-{slice_pages}p-{slug}-{OCR_CACHE_VERSION}")
 }
 
 pub struct CacheLayout {
@@ -348,6 +353,13 @@ pub struct Page {
     pub blocks: Vec<PageBlock>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FigureCrop {
+    pub src: String,
+    pub page_no: usize,
+    pub bbox: Bbox,
+}
+
 /// What kind of document the merge stage should emit.
 ///
 /// This is the *input* shape switch for the bundle stage; the frontmatter
@@ -371,7 +383,6 @@ pub struct ProjectReport {
     pub authors: Vec<String>,
     pub affiliations: Vec<String>,
     pub doc_title_count: usize,
-    pub suspicious_headings: Vec<String>,
     pub doc_title_headings: Vec<(NodeId, usize)>,
     pub root_headings: Vec<(NodeId, usize)>,
     pub total_pages: usize,
@@ -379,6 +390,7 @@ pub struct ProjectReport {
     pub unpaired_images: Vec<String>,
     pub dropped: BTreeMap<String, usize>,
     pub pair_count: usize,
+    pub figure_crops: Vec<FigureCrop>,
 }
 
 const HARD_IGNORE_LABELS: &[&str] = &[
@@ -424,7 +436,7 @@ pub fn parse_jsonl(text: &str, base_page: usize) -> Result<Vec<Page>> {
                 )
             })?;
         for (page_idx, page) in results.iter().enumerate() {
-            let page = parse_page(page, base_page + page_idx)
+            let page = parse_page(page, base_page + pages.len())
                 .with_context(|| format!("cache JSONL line {} page {}", line_no + 1, page_idx + 1))?;
             pages.push(page);
         }
@@ -542,7 +554,23 @@ pub fn infer_heading_level(title: &str) -> (usize, &str) {
     }
 }
 
+#[derive(Debug, Default)]
+struct FigurePairing {
+    pairs: Vec<(usize, usize)>,
+    covered_images: BTreeSet<usize>,
+    unpaired_images: Vec<usize>,
+    unpaired_captions: Vec<usize>,
+}
+
+/// Pair layout images with nearby figure captions. The public tuple is kept
+/// stable; projection uses the detailed result to suppress warnings for
+/// intentionally grouped panels.
 pub fn pair_figures(page: &Page) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>) {
+    let result = pair_figures_detailed(page);
+    (result.pairs, result.unpaired_images, result.unpaired_captions)
+}
+
+fn pair_figures_detailed(page: &Page) -> FigurePairing {
     let image_indices: Vec<usize> = page
         .blocks
         .iter()
@@ -557,46 +585,221 @@ pub fn pair_figures(page: &Page) -> (Vec<(usize, usize)>, Vec<usize>, Vec<usize>
         .filter(|(_, b)| b.label == BlockLabel::FigureTitle)
         .map(|(i, _)| i)
         .collect();
-    let threshold = (page.height * 0.25) as i64;
-    let mut paired_captions: BTreeSet<usize> = BTreeSet::new();
-    let mut pairs = Vec::new();
-    for &image in &image_indices {
-        let ib = &page.blocks[image].bbox;
-        let best = caption_indices
+
+    let mut result = FigurePairing::default();
+    let mut covered_captions = BTreeSet::new();
+
+    // Handle the common PDF pattern where one caption describes a horizontal
+    // row of chart/image panels. Only unambiguous same-row runs are grouped.
+    for group in panel_runs(page, &image_indices) {
+        if group.len() < 2 {
+            continue;
+        }
+        let group_bbox = group_bbox(page, &group);
+        let Some(caption) = caption_indices
             .iter()
             .copied()
-            .filter(|c| !paired_captions.contains(c))
-            .map(|c| {
-                let cb = &page.blocks[c].bbox;
-                let gap = if cb.y1 >= ib.y2 {
-                    cb.y1 - ib.y2
-                } else if ib.y1 >= cb.y2 {
-                    ib.y1 - cb.y2
-                } else {
-                    0
-                };
-                let above = ib.y1 >= cb.y2;
-                (gap, above, c)
+            .filter(|caption| !covered_captions.contains(caption))
+            .filter_map(|caption| {
+                let score = pair_score(page, group_bbox, caption)?;
+                let cb = page.blocks[caption].bbox;
+                let overlap = horizontal_overlap(group_bbox, cb);
+                let group_width = (group_bbox.x2 - group_bbox.x1).max(1);
+                let caption_width = (cb.x2 - cb.x1).max(1);
+                (overlap * 2 >= group_width && caption_width * 2 >= group_width)
+                    .then_some((score, caption))
             })
-            .filter(|&(gap, _, _)| gap <= threshold)
-            .min_by_key(|&(gap, above, c)| (gap, above, c));
-        if let Some((_, _, caption)) = best {
-            pairs.push((image, caption));
-            paired_captions.insert(caption);
+            .max_by_key(|&(score, caption)| (score, std::cmp::Reverse(caption)))
+            .map(|(_, caption)| caption)
+        else {
+            continue;
+        };
+
+        result.pairs.push((group[0], caption));
+        result.covered_images.extend(group.iter().copied());
+        covered_captions.insert(caption);
+    }
+
+    let remaining_images: Vec<usize> = image_indices
+        .iter()
+        .copied()
+        .filter(|image| !result.covered_images.contains(image))
+        .collect();
+    let remaining_captions: Vec<usize> = caption_indices
+        .iter()
+        .copied()
+        .filter(|caption| !covered_captions.contains(caption))
+        .filter(|caption| !is_table_caption(&page.blocks[*caption].content))
+        .collect();
+
+    // A monotonic maximum-weight matching prevents an early image from
+    // greedily stealing the caption that belongs to a later image.
+    let mut image_order = remaining_images;
+    image_order.sort_by_key(|&index| visual_order(page.blocks[index].bbox, index));
+    let mut caption_order = remaining_captions;
+    caption_order.sort_by_key(|&index| visual_order(page.blocks[index].bbox, index));
+    let pairs = monotonic_matches(page, &image_order, &caption_order);
+    for &(image, caption) in &pairs {
+        result.covered_images.insert(image);
+        covered_captions.insert(caption);
+    }
+    result.pairs.extend(pairs);
+
+    result.unpaired_images = image_indices
+        .into_iter()
+        .filter(|image| !result.covered_images.contains(image))
+        .collect();
+    result.unpaired_captions = caption_indices
+        .into_iter()
+        .filter(|caption| !covered_captions.contains(caption))
+        .collect();
+    result
+}
+
+fn visual_order(bbox: Bbox, index: usize) -> (i64, i64, usize) {
+    (bbox.y1, bbox.x1, index)
+}
+
+fn panel_runs(page: &Page, image_indices: &[usize]) -> Vec<Vec<usize>> {
+    let mut images = image_indices.to_vec();
+    images.sort_by_key(|&index| visual_order(page.blocks[index].bbox, index));
+    let row_gap = (page.height * 0.04).max(32.0) as i64;
+    let horizontal_gap = (page.width * 0.08).max(48.0) as i64;
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    for image in images {
+        let current = page.blocks[image].bbox;
+        let row = rows.iter_mut().find(|row| {
+            let reference = page.blocks[row[0]].bbox;
+            vertical_overlap(reference, current) * 2
+                >= (reference.y2 - reference.y1).min(current.y2 - current.y1).max(1)
+                && (current.y1 - reference.y1).abs() <= row_gap
+        });
+        if let Some(row) = row {
+            row.push(image);
+        } else {
+            rows.push(vec![image]);
         }
     }
-    let paired_images: BTreeSet<usize> = pairs.iter().map(|&(image, _)| image).collect();
-    let unpaired_images = image_indices
-        .iter()
-        .copied()
-        .filter(|i| !paired_images.contains(i))
-        .collect();
-    let unpaired_captions = caption_indices
-        .iter()
-        .copied()
-        .filter(|c| !paired_captions.contains(c))
-        .collect();
-    (pairs, unpaired_images, unpaired_captions)
+    let mut runs = Vec::new();
+    for mut row in rows {
+        row.sort_by_key(|&index| (page.blocks[index].bbox.x1, index));
+        let mut run: Vec<usize> = Vec::new();
+        for image in row {
+            if let Some(&previous_index) = run.last() {
+                let previous = page.blocks[previous_index].bbox;
+                let current = page.blocks[image].bbox;
+                let gap = current.x1 - previous.x2;
+                if gap < 0 || gap > horizontal_gap {
+                    if run.len() >= 2 {
+                        runs.push(std::mem::take(&mut run));
+                    } else {
+                        run.clear();
+                    }
+                }
+            }
+            run.push(image);
+        }
+        if run.len() >= 2 {
+            runs.push(run);
+        }
+    }
+    runs
+}
+
+fn group_bbox(page: &Page, group: &[usize]) -> Bbox {
+    group.iter().map(|&index| page.blocks[index].bbox).fold(
+        Bbox { x1: i64::MAX, y1: i64::MAX, x2: i64::MIN, y2: i64::MIN },
+        |bbox, item| Bbox {
+            x1: bbox.x1.min(item.x1),
+            y1: bbox.y1.min(item.y1),
+            x2: bbox.x2.max(item.x2),
+            y2: bbox.y2.max(item.y2),
+        },
+    )
+}
+
+fn monotonic_matches(page: &Page, images: &[usize], captions: &[usize]) -> Vec<(usize, usize)> {
+    let mut dp = vec![vec![0i64; captions.len() + 1]; images.len() + 1];
+    let mut choice = vec![vec![0u8; captions.len() + 1]; images.len() + 1];
+    for i in 1..=images.len() {
+        for j in 1..=captions.len() {
+            let mut best = dp[i - 1][j];
+            let mut selected = 1;
+            if dp[i][j - 1] > best {
+                best = dp[i][j - 1];
+                selected = 2;
+            }
+            if let Some(score) = pair_score(page, page.blocks[images[i - 1]].bbox, captions[j - 1]) {
+                let paired = dp[i - 1][j - 1] + score;
+                if paired > best {
+                    best = paired;
+                    selected = 3;
+                }
+            }
+            dp[i][j] = best;
+            choice[i][j] = selected;
+        }
+    }
+    let mut pairs = Vec::new();
+    let (mut i, mut j) = (images.len(), captions.len());
+    while i > 0 && j > 0 {
+        match choice[i][j] {
+            3 => {
+                pairs.push((images[i - 1], captions[j - 1]));
+                i -= 1;
+                j -= 1;
+            }
+            2 => j -= 1,
+            _ => i -= 1,
+        }
+    }
+    pairs.reverse();
+    pairs
+}
+
+fn pair_score(page: &Page, image: Bbox, caption_index: usize) -> Option<i64> {
+    let caption = &page.blocks[caption_index];
+    if is_table_caption(&caption.content) {
+        return None;
+    }
+    let cb = caption.bbox;
+    let gap = if cb.y1 >= image.y2 {
+        cb.y1 - image.y2
+    } else if image.y1 >= cb.y2 {
+        image.y1 - cb.y2
+    } else {
+        0
+    };
+    let threshold = (page.height * 0.08).max(48.0) as i64;
+    if gap > threshold {
+        return None;
+    }
+    let image_width = (image.x2 - image.x1).max(1);
+    let caption_width = (cb.x2 - cb.x1).max(1);
+    let overlap = horizontal_overlap(image, cb);
+    let center_distance = ((image.x1 + image.x2) - (cb.x1 + cb.x2)).abs();
+    if overlap == 0 && center_distance * 2 > image_width.max(caption_width) {
+        return None;
+    }
+    let overlap_score = overlap * 10_000 / image_width.min(caption_width);
+    let direction_score = if cb.y1 >= image.y2 { 5_000 } else { 0 };
+    Some(100_000 + direction_score + overlap_score - gap * 100 - center_distance)
+}
+
+fn horizontal_overlap(a: Bbox, b: Bbox) -> i64 {
+    (a.x2.min(b.x2) - a.x1.max(b.x1)).max(0)
+}
+
+fn vertical_overlap(a: Bbox, b: Bbox) -> i64 {
+    (a.y2.min(b.y2) - a.y1.max(b.y1)).max(0)
+}
+
+fn is_table_caption(content: &str) -> bool {
+    let normalized = content.trim().to_ascii_lowercase();
+    normalized.starts_with("table ")
+        || normalized.starts_with("table.")
+        || normalized.starts_with("tab. ")
+        || normalized.starts_with("tab.\t")
 }
 
 pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, ProjectReport)> {
@@ -621,6 +824,10 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         report.doc_title_count >= 1,
         "expected at least one doc_title block, found none",
     );
+    ensure!(
+        report.title.as_deref().is_some_and(|title| !title.trim().is_empty()),
+        "expected a non-empty doc_title block",
+    );
     if let Some(first_page) = pages.first() {
         report.authors = extract_authors(&first_page.blocks);
         report.affiliations = extract_affiliations(&first_page.blocks);
@@ -634,19 +841,20 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
     let mut heading_stack: Vec<(NodeId, usize)> = Vec::new();
     let mut title_seen = false;
     for page in pages {
-        let (pairs, unpaired_images, unpaired_captions) = pair_figures(page);
-        report.pair_count += pairs.len();
+        let pairing = pair_figures_detailed(page);
+        let figure_sources = figure_sources(page);
+        report.pair_count += pairing.pairs.len();
         let pair_map: BTreeMap<usize, usize> =
-            pairs.iter().map(|&(image, caption)| (image, caption)).collect();
-        for &caption in &unpaired_captions {
+            pairing.pairs.iter().map(|&(image, caption)| (image, caption)).collect();
+        for &caption in &pairing.unpaired_captions {
             report
                 .unpaired_captions
                 .push(page.blocks[caption].content.clone());
         }
-        for &image in &unpaired_images {
+        for &image in &pairing.unpaired_images {
             report
                 .unpaired_images
-                .push(figure_src(page, &page.blocks[image]));
+                .push(figure_sources[&image].clone());
         }
         let mut push_child = |parent: NodeId, kind: NodeKind| -> NodeId {
             let node_id = NodeId(tree.len());
@@ -665,9 +873,6 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                     if !title_seen {
                         title_seen = true;
                         continue;
-                    }
-                    if block.content.chars().filter(|c| c.is_alphanumeric()).count() < 4 {
-                        report.suspicious_headings.push(block.content.clone());
                     }
                     heading_stack.clear();
                     let node_id = push_child(root, NodeKind::Heading {
@@ -718,11 +923,16 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                     });
                 }
                 BlockLabel::Image | BlockLabel::Chart => {
-                    let src = figure_src(page, block);
+                    let src = figure_sources[&block_idx].clone();
                     let caption = pair_map
                         .get(&block_idx)
                         .map(|&c| page.blocks[c].content.clone())
                         .unwrap_or_default();
+                    report.figure_crops.push(FigureCrop {
+                        src: src.clone(),
+                        page_no: page.page_no,
+                        bbox: block.bbox,
+                    });
                     push_child(parent, NodeKind::Figure {
                         src,
                         caption,
@@ -730,7 +940,7 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                     });
                 }
                 BlockLabel::FigureTitle => {
-                    if unpaired_captions.contains(&block_idx) {
+                    if pairing.unpaired_captions.contains(&block_idx) {
                         push_child(parent, NodeKind::Paragraph {
                             text: block.content.clone(),
                         });
@@ -739,7 +949,6 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
             }
         }
     }
-    check_structure(&tree, root)?;
     let doc = StructuredDocument {
         metadata: DocumentMetadata {
             filename: format!("{stem}.md"),
@@ -748,6 +957,8 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         tree,
         root,
     };
+    validate_structure(&doc)?;
+    validate_figure_crops(&doc, &report.figure_crops)?;
     Ok((doc, report))
 }
 
@@ -847,6 +1058,10 @@ fn push_affiliation(text: &str, affiliations: &mut Vec<String>, seen: &mut BTree
         .trim()
         .to_string();
     let lower = cleaned.to_lowercase();
+    let venue_markers = ["proceedings", "international conference", "copyright", "pmlr"];
+    if venue_markers.iter().any(|m| lower.contains(m)) {
+        return;
+    }
     if cleaned.chars().filter(|c| c.is_alphabetic()).count() >= 3
         && !cleaned.contains('@')
         && !lower.contains("equal contribution")
@@ -857,61 +1072,144 @@ fn push_affiliation(text: &str, affiliations: &mut Vec<String>, seen: &mut BTree
     }
 }
 
-fn figure_src(page: &Page, block: &PageBlock) -> String {
-    let Bbox { x1, y1, x2, y2 } = block.bbox;
-    let kind = if block.label == BlockLabel::Chart {
-        "chart"
-    } else {
-        "image"
-    };
-    format!("fig/{}_img_in_{kind}_box_{x1}_{y1}_{x2}_{y2}.png", page.page_no)
+fn figure_sources(page: &Page) -> BTreeMap<usize, String> {
+    let mut indices = page
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| matches!(block.label, BlockLabel::Image | BlockLabel::Chart))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    indices.sort_by_key(|&index| visual_order(page.blocks[index].bbox, index));
+    indices
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, index)| {
+            (index, format!("fig/p{:04}-{:02}.png", page.page_no, ordinal + 1))
+        })
+        .collect()
 }
 
-fn check_structure(tree: &[Node], root: NodeId) -> Result<()> {
+pub fn validate_structure(doc: &StructuredDocument) -> Result<()> {
     fn walk(
-        tree: &[Node],
+        doc: &StructuredDocument,
         node_id: NodeId,
         parent_level: usize,
-        title_path: &mut Vec<String>,
+        states: &mut [u8],
     ) -> Result<()> {
-        let node = &tree[node_id.0];
-        if let NodeKind::Heading { level, title } = &node.kind {
-            ensure!(
-                *level <= parent_level + 1,
-                "heading level jump: {title:?} (level {level}) under level {parent_level} ({} > {})",
-                *level,
-                parent_level + 1
-            );
-            title_path.push(title.clone());
-            for &child in &node.children {
-                walk(tree, child, *level, title_path)?;
+        ensure!(node_id.0 < doc.tree.len(), "node {} is out of bounds", node_id.0);
+        ensure!(states[node_id.0] == 0, "node {} is referenced more than once or forms a cycle", node_id.0);
+        states[node_id.0] = 1;
+
+        let node = doc.node(node_id);
+        let child_parent_level = match &node.kind {
+            NodeKind::Root => {
+                ensure!(node_id == doc.root, "non-root node {} has Root kind", node_id.0);
+                parent_level
             }
-            title_path.pop();
-        } else {
-            for &child in &node.children {
-                walk(tree, child, parent_level, title_path)?;
+            NodeKind::Heading { level, title } => {
+                ensure!(!title.trim().is_empty(), "heading title is empty");
+                ensure!(
+                    *level <= parent_level + 1,
+                    "heading level jump: {title:?} (level {level}) under level {parent_level} ({} > {})",
+                    *level,
+                    parent_level + 1
+                );
+                *level
             }
+            NodeKind::Figure { .. } => parent_level,
+            NodeKind::Paragraph { .. }
+            | NodeKind::CodeBlock { .. }
+            | NodeKind::MathBlock { .. }
+            | NodeKind::Table { .. } => parent_level,
+        };
+        for &child in &node.children {
+            walk(doc, child, child_parent_level, states)?;
         }
+        states[node_id.0] = 2;
         Ok(())
     }
-    walk(tree, root, 0, &mut Vec::new())
+
+    ensure!(doc.root.0 < doc.tree.len(), "root node {} is out of bounds", doc.root.0);
+    ensure!(matches!(doc.node(doc.root).kind, NodeKind::Root), "document root is not a Root node");
+    let mut states = vec![0; doc.tree.len()];
+    walk(doc, doc.root, 0, &mut states)?;
+    ensure!(states.iter().all(|state| *state == 2), "document contains unreachable nodes");
+    Ok(())
 }
 
-pub fn validate(report: &ProjectReport) -> Result<Vec<String>> {
-    let mut warnings = Vec::new();
+fn validate_figure_crops(doc: &StructuredDocument, crops: &[FigureCrop]) -> Result<()> {
+    let figure_srcs = figure_srcs(doc);
+    let mut crop_srcs = BTreeSet::new();
+    for crop in crops {
+        ensure!(valid_figure_src(&crop.src), "invalid internal figure src {:?}", crop.src);
+        ensure!(crop.page_no >= 1, "figure {} has invalid page number {}", crop.src, crop.page_no);
+        ensure!(
+            crop.bbox.x1 < crop.bbox.x2 && crop.bbox.y1 < crop.bbox.y2,
+            "figure {} has invalid bbox {:?}",
+            crop.src,
+            crop.bbox
+        );
+        ensure!(crop_srcs.insert(crop.src.as_str()), "duplicate figure crop src {:?}", crop.src);
+    }
+    let document_srcs = figure_srcs.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    ensure!(
+        document_srcs == crop_srcs && figure_srcs.len() == crops.len(),
+        "document figures and figure crops do not match"
+    );
+    Ok(())
+}
+
+fn valid_figure_src(src: &str) -> bool {
+    let path = Path::new(src);
+    path.parent() == Some(Path::new("fig"))
+        && path.extension().is_some_and(|extension| extension == "png")
+        && path.file_stem().is_some_and(|stem| !stem.is_empty())
+}
+
+pub fn collect_diagnostics(doc: &StructuredDocument, report: &ProjectReport) -> Vec<String> {
+    let mut diagnostics = Vec::new();
     for src in &report.unpaired_images {
-        warnings.push(format!("figure without caption: {src}"));
+        diagnostics.push(format!("figure without caption: {src}"));
     }
     for caption in &report.unpaired_captions {
-        warnings.push(format!("caption without figure: {caption}"));
+        if is_table_caption(caption) {
+            continue;
+        }
+        diagnostics.push(format!("caption without figure: {caption}"));
     }
-    for (label, count) in &report.dropped {
-        warnings.push(format!("dropped {count} {label} blocks"));
+
+    let has_body = doc.tree.iter().any(node_has_body);
+    if !has_body {
+        diagnostics.push("document has no body content".to_string());
+    } else {
+        for node in &doc.tree {
+            if let NodeKind::Heading { title, .. } = &node.kind
+                && !subtree_has_body(doc, node)
+            {
+                diagnostics.push(format!("section without body content: {title}"));
+            }
+        }
     }
-    for title in &report.suspicious_headings {
-        warnings.push(format!("suspicious doc_title heading: {title}"));
+    diagnostics
+}
+
+fn node_has_body(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::Paragraph { text }
+        | NodeKind::CodeBlock { text }
+        | NodeKind::MathBlock { text }
+        | NodeKind::Table { text } => !text.trim().is_empty(),
+        NodeKind::Figure { .. } => true,
+        NodeKind::Root | NodeKind::Heading { .. } => false,
     }
-    Ok(warnings)
+}
+
+fn subtree_has_body(doc: &StructuredDocument, node: &Node) -> bool {
+    node.children.iter().any(|&child| {
+        let child = doc.node(child);
+        node_has_body(child) || subtree_has_body(doc, child)
+    })
 }
 
 fn figure_srcs(doc: &StructuredDocument) -> Vec<String> {
@@ -930,58 +1228,31 @@ fn figure_srcs(doc: &StructuredDocument) -> Vec<String> {
 }
 
 
-pub fn arxiv_id_from_stem(stem: &str) -> Option<String> {
-    let mut parts = stem.split('v');
-    let base = parts.next()?;
-    let version = parts.next();
-    if parts.next().is_some() {
-        return None;
-    }
-    let digits: Vec<&str> = base.split('.').collect();
-    if digits.len() != 2
-        || digits[0].len() != 4
-        || !(4..=5).contains(&digits[1].len())
-        || !digits.iter().all(|d| d.chars().all(|c| c.is_ascii_digit()))
-    {
-        return None;
-    }
-    if let Some(version) = version
-        && (version.is_empty() || !version.chars().all(|c| c.is_ascii_digit()))
-    {
-        return None;
-    }
-    Some(base.to_string())
-}
-
 fn yaml_quoted(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Shared tail of every frontmatter kind: description/resource/tags/generated/sources.
+/// Shared tail of every frontmatter kind: resource/generated/sources.
 fn push_frontmatter_common(
     out: &mut String,
     stem: &str,
     at: &str,
-    resource: &str,
-    source_title: Option<&str>,
+    pages: (usize, usize),
 ) {
-    out.push_str("description: \"\"\n");
-    out.push_str(&format!("resource: {resource}\n"));
-    out.push_str("tags: []\n");
+    assert!(pages.0 >= 1 && pages.1 >= pages.0);
     out.push_str(&format!(
         "generated: {{ by: process:nanokb-import, at: {at} }}\n"
     ));
     out.push_str(&format!(
-        "sources:\n  - id: {stem}\n    resource: ../pdf/{stem}.pdf\n"
+        "sources:\n  - id: {stem}\n    title: {}\n    pages: {}-{}\n",
+        yaml_quoted(&format!("{stem}.pdf")),
+        pages.0,
+        pages.1
     ));
-    if let Some(title) = source_title {
-        out.push_str(&format!("    title: {}\n", yaml_quoted(title)));
-    }
 }
 
 pub fn frontmatter(stem: &str, report: &ProjectReport, at: &str) -> String {
     let title = report.title.as_deref().unwrap_or_default();
-    let arxiv = arxiv_id_from_stem(stem);
     let mut out = String::from("---\n");
     out.push_str("type: paper\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(title)));
@@ -1003,11 +1274,7 @@ pub fn frontmatter(stem: &str, report: &ProjectReport, at: &str) -> String {
             .join(", ");
         out.push_str(&format!("affiliations: [{list}]\n"));
     }
-    push_frontmatter_common(&mut out, stem, at, &format!("../pdf/{stem}.pdf"), None);
-    out.push_str("owner: machine\n");
-    if let Some(id) = arxiv {
-        out.push_str(&format!("arxiv: \"{id}\"\n"));
-    }
+    push_frontmatter_common(&mut out, stem, at, (1, report.total_pages));
     out.push_str("---\n");
     out
 }
@@ -1078,19 +1345,17 @@ fn chapter_key(title: &str) -> (String, String) {
     (slug.clone(), slug)
 }
 
-fn book_frontmatter(stem: &str, title: &str, at: &str) -> String {
+fn book_frontmatter(stem: &str, title: &str, total_pages: usize, at: &str) -> String {
     let mut out = String::from("---\n");
     out.push_str("type: book\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(title)));
-    push_frontmatter_common(&mut out, stem, at, &format!("../pdf/{stem}.pdf"), None);
-    out.push_str("owner: machine\n");
+    push_frontmatter_common(&mut out, stem, at, (1, total_pages));
     out.push_str("---\n");
     out
 }
 
 fn chapter_frontmatter(
     stem: &str,
-    book_title: &str,
     title: &str,
     chapter: &str,
     pages: (usize, usize),
@@ -1099,16 +1364,9 @@ fn chapter_frontmatter(
     let mut out = String::from("---\n");
     out.push_str("type: chapter\n");
     out.push_str(&format!("title: {}\n", yaml_quoted(title)));
-    push_frontmatter_common(
-        &mut out,
-        stem,
-        at,
-        &format!("../pdf/{stem}.pdf#{}-{}", pages.0, pages.1),
-        Some(book_title),
-    );
+    push_frontmatter_common(&mut out, stem, at, pages);
     out.push_str(&format!("book: {stem}\n"));
     out.push_str(&format!("chapter: {chapter}\n"));
-    out.push_str("owner: machine\n");
     out.push_str("---\n");
     out
 }
@@ -1222,7 +1480,7 @@ fn write_book_single_doc(
     let title = one_line(report.title.as_deref().unwrap_or_default());
     let md = format!(
         "{}\n{}\n",
-        book_frontmatter(stem, &title, at),
+        book_frontmatter(stem, &title, report.total_pages, at),
         render_markdown(doc, &title)
     );
     let md_path = out.join(format!("{stem}.md"));
@@ -1282,7 +1540,7 @@ fn write_book_bundle(
         &book_path,
         format!(
             "{}\n{}\n",
-            book_frontmatter(stem, &title, at),
+            book_frontmatter(stem, &title, report.total_pages, at),
             book_blocks.join("\n\n")
         ),
     )
@@ -1306,17 +1564,25 @@ fn write_book_bundle(
             .get(node_id)
             .copied()
             .with_context(|| format!("chapter {chapter_title:?} has no page"))?;
-        let end = out_chapters
+        let end = match out_chapters
             .get(index + 1)
             .and_then(|(next, _, _)| pages_by_node.get(next))
-            .map(|&next_page| next_page - 1)
-            .unwrap_or(report.total_pages);
+        {
+            Some(&next_page) => {
+                ensure!(
+                    next_page >= page_no,
+                    "chapter {chapter_title:?} starts after the next chapter"
+                );
+                next_page.saturating_sub(1).max(page_no)
+            }
+            None => report.total_pages,
+        };
         let path = out.join(format!("{file_stem}.md"));
         fs::write(
             &path,
             format!(
                 "{}\n{}\n",
-                chapter_frontmatter(stem, &title, chapter_title, &chapter, (page_no, end), at),
+                chapter_frontmatter(stem, chapter_title, &chapter, (page_no, end), at),
                 body.join("\n\n")
             ),
         )
@@ -1344,29 +1610,6 @@ fn write_index_skeleton(out: &Path, entries: &[(String, String)]) -> Result<()> 
         .with_context(|| format!("failed to write {}", index_path.display()))
 }
 
-pub fn parse_figure_src(src: &str) -> Option<(usize, Bbox)> {
-    let rest = src.strip_prefix("fig/")?;
-    let (page_str, rest) = rest.split_once('_')?;
-    let page: usize = page_str.parse().ok()?;
-    let rest = rest.strip_prefix("img_in_")?;
-    let (kind_box, _ext) = rest.split_once('.')?;
-    let (kind, box_str) = kind_box.split_once("_box_")?;
-    if kind != "image" && kind != "chart" {
-        return None;
-    }
-    let mut nums = box_str.split('_');
-    let bbox = Bbox {
-        x1: nums.next()?.parse().ok()?,
-        y1: nums.next()?.parse().ok()?,
-        x2: nums.next()?.parse().ok()?,
-        y2: nums.next()?.parse().ok()?,
-    };
-    if nums.next().is_some() {
-        return None;
-    }
-    Some((page, bbox))
-}
-
 static PDFIUM: std::sync::OnceLock<Result<pdfium_render::prelude::Pdfium, String>> =
     std::sync::OnceLock::new();
 
@@ -1381,21 +1624,26 @@ static PDFIUM_RENDER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn render_figures(
     pdf_path: &Path,
-    doc: &StructuredDocument,
+    crops: &[FigureCrop],
     fig_dir: &Path,
     pages: &[Page],
 ) -> Result<()> {
     let mut by_page: BTreeMap<usize, Vec<(PathBuf, Bbox)>> = BTreeMap::new();
-    for src in figure_srcs(doc) {
-        let dest = fig_dir.join(src.rsplit('/').next().unwrap_or(&src));
-        if dest.exists() {
-            continue;
-        }
-        let Some((page_no, bbox)) = parse_figure_src(&src) else {
-            eprintln!("warning: unrenderable figure src {src}");
-            continue;
-        };
-        by_page.entry(page_no).or_default().push((dest, bbox));
+    for crop in crops {
+        ensure!(valid_figure_src(&crop.src), "invalid internal figure src {:?}", crop.src);
+        ensure!(
+            crop.bbox.x1 < crop.bbox.x2 && crop.bbox.y1 < crop.bbox.y2,
+            "figure {} has invalid bbox {:?}",
+            crop.src,
+            crop.bbox
+        );
+        let filename = Path::new(&crop.src)
+            .file_name()
+            .expect("validated figure src has a filename");
+        by_page
+            .entry(crop.page_no)
+            .or_default()
+            .push((fig_dir.join(filename), crop.bbox));
     }
     if by_page.is_empty() {
         return Ok(());
@@ -1438,9 +1686,11 @@ pub fn render_figures(
             let right = right.min(width.saturating_sub(1)).max(left + 1);
             let bottom = bottom.min(height.saturating_sub(1)).max(top + 1);
             let cropped = image.crop_imm(left, top, right - left, bottom - top);
+            let mut encoded = std::io::Cursor::new(Vec::new());
             cropped
-                .save(dest)
-                .with_context(|| format!("failed to save figure {}", dest.display()))?;
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .with_context(|| format!("failed to encode figure {}", dest.display()))?;
+            write_file_atomic(dest, encoded.get_ref())?;
             eprintln!("figure {} rendered", dest.display());
         }
     }
@@ -1521,7 +1771,8 @@ impl PaddleOcrClient {
                 message: format!("failed to read slice {}: {e}", slice_path.display()),
                 kind: ApiErrorKind::Terminal,
             })?
-            .text("model", self.model.clone());
+            .text("model", self.model.clone())
+            .text("optionalPayload", OCR_OPTIONAL_PAYLOAD);
         let response = self
             .http
             .post(format!("{}/api/v2/ocr/jobs", self.api_base))
@@ -2020,7 +2271,7 @@ pub fn run_merge_with(
     doc_type: DocType,
 ) -> Result<()> {
     let mut pages = Vec::new();
-    for (index, &(start, _)) in plan.iter().enumerate() {
+    for (index, &(start, end)) in plan.iter().enumerate() {
         let result_path = layout.result_path(index);
         if !result_path.exists() {
             bail!(
@@ -2032,7 +2283,23 @@ pub fn run_merge_with(
         }
         let jsonl = std::fs::read_to_string(&result_path)
             .with_context(|| format!("failed to read {}", result_path.display()))?;
-        pages.extend(parse_jsonl(&jsonl, start as usize)?);
+        let slice_pages = parse_jsonl(&jsonl, start as usize)?;
+        let expected_pages = (end - start + 1) as usize;
+        ensure!(
+            slice_pages.len() == expected_pages,
+            "slice {:04} OCR returned {} pages, expected {expected_pages}",
+            index + 1,
+            slice_pages.len()
+        );
+        ensure!(
+            slice_pages
+                .iter()
+                .map(|page| page.page_no)
+                .eq(start as usize..=end as usize),
+            "slice {:04} OCR page numbers are not contiguous from {start} to {end}",
+            index + 1
+        );
+        pages.extend(slice_pages);
     }
     let stem = pdf_path
         .file_stem()
@@ -2040,13 +2307,14 @@ pub fn run_merge_with(
         .context("PDF path has no usable stem")?;
     let (doc, report) = project(&pages, stem)?;
 
-    for warning in validate(&report)? {
+    let warnings = collect_diagnostics(&doc, &report);
+    for warning in &warnings {
         println!("warning: {warning}");
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let chapter_count = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
-    render_figures(pdf_path, &doc, &out.join("fig"), &pages)?;
+    render_figures(pdf_path, &report.figure_crops, &out.join("fig"), &pages)?;
     let chapters = if chapter_count == 0 {
         String::new()
     } else {
@@ -2058,7 +2326,7 @@ pub fn run_merge_with(
         out.display(),
         pages.len(),
         report.pair_count,
-        report.unpaired_images.len() + report.unpaired_captions.len()
+        warnings.len()
     );
     Ok(())
 }

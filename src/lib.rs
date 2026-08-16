@@ -36,10 +36,10 @@ pub use pipeline::Pipeline;
 pub mod pdf;
 #[cfg(feature = "pdf")]
 pub use pdf::{
-    ApiErrorKind, Bbox, BlockLabel, CacheLayout, DocType, JobState, OcrError, Page, PageBlock,
-    PaddleOcrClient, PdfDocument, ProjectReport, arxiv_id_from_stem, cache_key, frontmatter,
-    infer_heading_level, pair_figures, parse_figure_src, parse_jsonl, project, render_figures,
-    render_markdown, validate, write_bundle,
+    ApiErrorKind, Bbox, BlockLabel, CacheLayout, DocType, FigureCrop, JobState, OcrError, Page,
+    PageBlock, PaddleOcrClient, PdfDocument, ProjectReport, cache_key, collect_diagnostics,
+    frontmatter, infer_heading_level, pair_figures, parse_jsonl, project, render_figures,
+    render_markdown, validate_structure, write_bundle,
 };
 
 pub mod prune;

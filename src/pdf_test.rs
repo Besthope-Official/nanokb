@@ -313,6 +313,7 @@ fn cache_key_is_deterministic_and_sensitive() {
     assert_ne!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abc", 10, "PaddleOCR-VL-1.6"));
     assert_ne!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abc", 20, "PaddleOCR-VL-1.5"));
     assert!(key(b"abc", 20, "a/b.c").contains("-a-b-c"));
+    assert!(key(b"abc", 20, "PaddleOCR-VL-1.6").ends_with("-unwarp0"));
 }
 
 #[test]
@@ -331,7 +332,7 @@ fn cache_layout_paths_and_resume_skip() {
             .root
             .to_str()
             .unwrap()
-            .ends_with("-20p-paddleocr-vl-1-6")
+            .ends_with("-20p-paddleocr-vl-1-6-unwarp0")
     );
 
     fs::create_dir_all(layout.results_dir()).unwrap();
@@ -367,6 +368,11 @@ async fn submit_returns_job_id_with_auth_and_multipart() {
     );
     assert!(request.contains(r#"name="file""#), "{request}");
     assert!(request.contains(r#"name="model""#), "{request}");
+    assert!(
+        request.contains(r#"name="optionalPayload""#)
+            && request.contains(r#"{"useDocUnwarping":false}"#),
+        "{request}"
+    );
 }
 
 #[tokio::test]
@@ -649,6 +655,32 @@ fn parse_jsonl_parses_pages_blocks() {
 }
 
 #[test]
+fn parse_jsonl_continues_page_numbers_across_lines() {
+    let first_line = jsonl_line(&[
+        page_json(&[block("doc_title", "My Paper", [0, 0, 10, 10])]),
+        page_json(&[]),
+        page_json(&[]),
+        page_json(&[]),
+    ]);
+    let second_line = jsonl_line(&[page_json(&[
+        block("image", "", [100, 200, 300, 400]),
+        block("figure_title", "Figure 1.", [100, 410, 300, 430]),
+    ])]);
+    let pages = parse_jsonl(&format!("{first_line}\n{second_line}"), 1).unwrap();
+
+    assert_eq!(
+        pages.iter().map(|page| page.page_no).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    let (doc, _) = project(&pages, "paper").unwrap();
+    assert!(doc.tree.iter().any(|node| matches!(
+        &node.kind,
+        NodeKind::Figure { src, .. }
+            if src == "fig/p0005-01.png"
+    )));
+}
+
+#[test]
 fn parse_jsonl_marks_ignored_labels() {
     let page = page_json(
         &[
@@ -782,12 +814,12 @@ fn project_pairs_figures_and_reports_unpaired() {
     assert_eq!(root.children.len(), 3);
     assert!(matches!(
         &doc.node(root.children[0]).kind,
-        NodeKind::Figure { src, caption, .. } if src == "fig/1_img_in_image_box_631_326_1150_770.png"
+        NodeKind::Figure { src, caption, .. } if src == "fig/p0001-01.png"
             && caption == "Figure 1. Overview."
     ));
     assert!(matches!(
         &doc.node(root.children[1]).kind,
-        NodeKind::Figure { src, caption, .. } if src == "fig/1_img_in_image_box_100_1000_400_1200.png"
+        NodeKind::Figure { src, caption, .. } if src == "fig/p0001-02.png"
             && caption.is_empty()
     ));
     assert!(matches!(
@@ -796,9 +828,45 @@ fn project_pairs_figures_and_reports_unpaired() {
     ));
     assert_eq!(report.pair_count, 1);
     assert_eq!(report.unpaired_captions, vec!["Loose caption."]);
+    assert_eq!(report.unpaired_images, vec!["fig/p0001-02.png"]);
     assert_eq!(
-        report.unpaired_images,
-        vec!["fig/1_img_in_image_box_100_1000_400_1200.png"]
+        report.figure_crops,
+        vec![
+            FigureCrop {
+                src: "fig/p0001-01.png".into(),
+                page_no: 1,
+                bbox: Bbox { x1: 631, y1: 326, x2: 1150, y2: 770 },
+            },
+            FigureCrop {
+                src: "fig/p0001-02.png".into(),
+                page_no: 1,
+                bbox: Bbox { x1: 100, y1: 1000, x2: 400, y2: 1200 },
+            },
+        ]
+    );
+}
+
+#[test]
+fn project_numbers_figures_in_visual_order() {
+    let page = page_json(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block("image", "", [100, 600, 400, 800]),
+        block("image", "", [100, 200, 400, 400]),
+    ]);
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
+    let figure_srcs = doc
+        .tree
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Figure { src, .. } => Some(src.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(figure_srcs, vec!["fig/p0001-02.png", "fig/p0001-01.png"]);
+    assert_eq!(
+        report.figure_crops.iter().map(|crop| crop.src.as_str()).collect::<Vec<_>>(),
+        figure_srcs
     );
 }
 
@@ -833,6 +901,135 @@ fn pair_figures_prefers_caption_below_on_tie() {
 }
 
 #[test]
+fn pair_figures_groups_horizontal_panels_under_one_caption() {
+    let page = Page {
+        page_no: 1,
+        width: 1200.0,
+        height: 1600.0,
+        angle: 0.0,
+        blocks: vec![
+            PageBlock {
+                label: BlockLabel::Chart,
+                content: String::new(),
+                bbox: Bbox { x1: 100, y1: 200, x2: 300, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::Chart,
+                content: String::new(),
+                bbox: Bbox { x1: 320, y1: 205, x2: 520, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::Chart,
+                content: String::new(),
+                bbox: Bbox { x1: 540, y1: 200, x2: 740, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "Figure 4. Results by component.".into(),
+                bbox: Bbox { x1: 100, y1: 525, x2: 740, y2: 570 },
+            },
+        ],
+    };
+
+    let (pairs, unpaired_images, unpaired_captions) = pair_figures(&page);
+
+    assert_eq!(pairs, vec![(0, 3)]);
+    assert!(unpaired_images.is_empty());
+    assert!(unpaired_captions.is_empty());
+}
+
+#[test]
+fn pair_figures_does_not_match_table_caption_to_image() {
+    let page = Page {
+        page_no: 1,
+        width: 1200.0,
+        height: 1600.0,
+        angle: 0.0,
+        blocks: vec![
+            PageBlock {
+                label: BlockLabel::Image,
+                content: String::new(),
+                bbox: Bbox { x1: 100, y1: 200, x2: 700, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "Table 1. Baseline comparison.".into(),
+                bbox: Bbox { x1: 100, y1: 525, x2: 700, y2: 570 },
+            },
+        ],
+    };
+
+    let (pairs, unpaired_images, unpaired_captions) = pair_figures(&page);
+
+    assert!(pairs.is_empty());
+    assert_eq!(unpaired_images, vec![0]);
+    assert_eq!(unpaired_captions, vec![1]);
+}
+
+#[test]
+fn pair_figures_keeps_explicit_panel_captions_separate() {
+    let page = Page {
+        page_no: 1,
+        width: 1200.0,
+        height: 1600.0,
+        angle: 0.0,
+        blocks: vec![
+            PageBlock {
+                label: BlockLabel::Chart,
+                content: String::new(),
+                bbox: Bbox { x1: 100, y1: 200, x2: 300, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::Chart,
+                content: String::new(),
+                bbox: Bbox { x1: 320, y1: 200, x2: 520, y2: 500 },
+            },
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "(a) Finance".into(),
+                bbox: Bbox { x1: 100, y1: 525, x2: 300, y2: 570 },
+            },
+            PageBlock {
+                label: BlockLabel::FigureTitle,
+                content: "(b) Medical".into(),
+                bbox: Bbox { x1: 320, y1: 525, x2: 520, y2: 570 },
+            },
+        ],
+    };
+
+    let (pairs, unpaired_images, unpaired_captions) = pair_figures(&page);
+
+    assert_eq!(pairs, vec![(0, 2), (1, 3)]);
+    assert!(unpaired_images.is_empty());
+    assert!(unpaired_captions.is_empty());
+}
+
+#[test]
+fn project_does_not_duplicate_shared_panel_caption() {
+    let page = page_json(&[
+        block("doc_title", "My Paper", [103, 78, 1119, 174]),
+        block("chart", "", [100, 200, 300, 500]),
+        block("chart", "", [320, 205, 520, 500]),
+        block("chart", "", [540, 200, 740, 500]),
+        block("figure_title", "Figure 4. Results by component.", [100, 525, 740, 570]),
+    ]);
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
+    let figures = doc
+        .tree
+        .iter()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Figure { caption, .. } => Some(caption.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(figures, vec!["Figure 4. Results by component.", "", ""]);
+    assert_eq!(report.pair_count, 1);
+    assert!(report.unpaired_images.is_empty());
+    assert!(report.unpaired_captions.is_empty());
+}
+
+#[test]
 fn project_extracts_marker_style_authors() {
     let page = page_json(
         &[
@@ -848,6 +1045,24 @@ fn project_extracts_marker_style_authors() {
 
     assert_eq!(report.authors, vec!["Alice Chen", "Bob Wu", "Carol Zhou"]);
     assert_eq!(report.affiliations, vec!["Example University"]);
+}
+
+#[test]
+fn project_rejects_venue_lines_from_affiliations() {
+    let page = page_json(
+        &[
+            block("doc_title", "My Paper", [103, 78, 1119, 174]),
+            block("text", "Alice Chen $ ^{*1} $ Bob Wu $ ^{*2} $", [153, 246, 1065, 284]),
+            block("paragraph_title", "Abstract", [282, 324, 392, 353]),
+            block(
+                "footnote",
+                "Proceedings of the 41st International Conference on Machine Learning, Seoul, South Korea. PMLR 306, 2026. Copyright 2026 by the author(s).",
+                [84, 1252, 600, 1387],
+            ),
+        ]);
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
+
+    assert_eq!(report.affiliations, Vec::<String>::new());
 }
 
 #[test]
@@ -938,20 +1153,6 @@ fn project_bails_without_doc_title() {
 }
 
 #[test]
-fn project_flags_suspicious_doc_title_headings() {
-    let page = page_json(
-        &[
-            block("doc_title", "My Book", [0, 0, 10, 10]),
-            block("doc_title", "贝贝", [0, 20, 10, 30]),
-        ]);
-    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "my-book").unwrap();
-
-    assert_eq!(report.suspicious_headings, vec!["贝贝".to_string()]);
-    let warnings = validate(&report).unwrap();
-    assert!(warnings.iter().any(|w| w.contains("贝贝")));
-}
-
-#[test]
 fn project_bails_on_heading_jump() {
     let page = page_json(
         &[
@@ -963,44 +1164,174 @@ fn project_bails_on_heading_jump() {
 }
 
 #[test]
-fn validate_reports_warnings() {
-    let report = ProjectReport {
-        unpaired_images: vec!["fig/1_bar.png".into()],
-        unpaired_captions: vec!["Loose.".into()],
-        dropped: BTreeMap::from([("header".to_string(), 3usize)]),
-        ..Default::default()
-    };
-    let warnings = validate(&report).unwrap();
+fn project_bails_on_empty_title() {
+    let page = page_json(&[block("doc_title", "  ", [0, 0, 10, 10])]);
+    let error = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap_err();
 
-    assert!(warnings.iter().any(|w| w.contains("1_bar.png")));
-    assert!(warnings.iter().any(|w| w.contains("Loose.")));
-    assert!(warnings.iter().any(|w| w.contains("dropped 3 header")));
+    assert!(error.to_string().contains("non-empty doc_title"), "{error:#}");
 }
 
 #[test]
-fn arxiv_id_from_stem_parses_and_rejects() {
-    assert_eq!(
-        arxiv_id_from_stem("9999.99999v9").as_deref(),
-        Some("9999.99999")
-    );
-    assert_eq!(
-        arxiv_id_from_stem("9999.99999").as_deref(),
-        Some("9999.99999")
-    );
-    assert_eq!(
-        arxiv_id_from_stem("9998.00001v2").as_deref(),
-        Some("9998.00001")
-    );
-    assert_eq!(arxiv_id_from_stem("my-paper"), None);
-    assert_eq!(arxiv_id_from_stem("12.34"), None);
-    assert_eq!(arxiv_id_from_stem("1234.567890"), None);
-    assert_eq!(arxiv_id_from_stem("9999.99999v9x"), None);
+fn project_bails_on_empty_heading() {
+    let page = page_json(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block("paragraph_title", "  ", [0, 20, 10, 30]),
+    ]);
+    let error = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap_err();
+
+    assert!(error.to_string().contains("heading title is empty"), "{error:#}");
+}
+
+#[test]
+fn collect_diagnostics_reports_structural_warnings() {
+    let report = ProjectReport {
+        unpaired_images: vec!["fig/1_bar.png".into()],
+        unpaired_captions: vec!["Loose.".into(), "Table 1. Baseline comparison.".into()],
+        dropped: BTreeMap::from([("header".to_string(), 3usize)]),
+        ..Default::default()
+    };
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1), NodeId(2)],
+            },
+            Node {
+                kind: NodeKind::Heading {
+                    level: 1,
+                    title: "Empty section".into(),
+                },
+                children: Vec::new(),
+            },
+            Node {
+                kind: NodeKind::Paragraph {
+                    text: "Body".into(),
+                },
+                children: Vec::new(),
+            },
+        ],
+        root: NodeId(0),
+    };
+    let warnings = collect_diagnostics(&doc, &report);
+
+    assert!(warnings.iter().any(|w| w.contains("1_bar.png")));
+    assert!(warnings.iter().any(|w| w.contains("Loose.")));
+    assert!(!warnings.iter().any(|w| w.contains("Table 1.")));
+    assert!(!warnings.iter().any(|w| w.contains("dropped 3 header")));
+    assert!(warnings.iter().any(|w| w == "section without body content: Empty section"));
+    assert!(!warnings.iter().any(|w| w == "document has no body content"));
+}
+
+#[test]
+fn collect_diagnostics_reports_document_without_body() {
+    let page = page_json(&[block("doc_title", "My Paper", [0, 0, 10, 10])]);
+    let (doc, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap();
+
+    assert_eq!(collect_diagnostics(&doc, &report), vec!["document has no body content"]);
+}
+
+#[test]
+fn validate_structure_bails_on_cycle() {
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Heading {
+                    level: 1,
+                    title: "One".into(),
+                },
+                children: vec![NodeId(2)],
+            },
+            Node {
+                kind: NodeKind::Heading {
+                    level: 2,
+                    title: "Two".into(),
+                },
+                children: vec![NodeId(1)],
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    let error = validate_structure(&doc).unwrap_err();
+    assert!(error.to_string().contains("cycle"), "{error:#}");
+}
+
+#[test]
+fn validate_structure_bails_on_unreachable_node() {
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: Vec::new(),
+            },
+            Node {
+                kind: NodeKind::Paragraph {
+                    text: "orphan".into(),
+                },
+                children: Vec::new(),
+            },
+        ],
+        root: NodeId(0),
+    };
+
+    let error = validate_structure(&doc).unwrap_err();
+    assert!(error.to_string().contains("unreachable"), "{error:#}");
+}
+
+#[test]
+fn validate_figure_crops_bails_on_mismatch() {
+    let doc = StructuredDocument {
+        metadata: DocumentMetadata {
+            filename: "x.md".into(),
+            frontmatter: None,
+        },
+        tree: vec![
+            Node {
+                kind: NodeKind::Root,
+                children: vec![NodeId(1)],
+            },
+            Node {
+                kind: NodeKind::Figure {
+                    src: "fig/p0001-01.png".into(),
+                    caption: String::new(),
+                    description: None,
+                },
+                children: Vec::new(),
+            },
+        ],
+        root: NodeId(0),
+    };
+    let crops = [FigureCrop {
+        src: "fig/p0001-02.png".into(),
+        page_no: 1,
+        bbox: Bbox { x1: 100, y1: 100, x2: 400, y2: 300 },
+    }];
+
+    let error = validate_figure_crops(&doc, &crops).unwrap_err();
+    assert!(error.to_string().contains("do not match"), "{error:#}");
 }
 
 #[test]
 fn frontmatter_golden() {
     let report = ProjectReport {
         title: Some("My Paper: A Framework".into()),
+        total_pages: 17,
         ..Default::default()
     };
     let fm = frontmatter("my-paper", &report, "2026-08-15T10:00:00Z");
@@ -1009,12 +1340,8 @@ fn frontmatter_golden() {
         "---\n\
          type: paper\n\
          title: \"My Paper: A Framework\"\n\
-         description: \"\"\n\
-         resource: ../pdf/my-paper.pdf\n\
-         tags: []\n\
          generated: { by: process:nanokb-import, at: 2026-08-15T10:00:00Z }\n\
-         sources:\n  - id: my-paper\n    resource: ../pdf/my-paper.pdf\n\
-         owner: machine\n\
+         sources:\n  - id: my-paper\n    title: \"my-paper.pdf\"\n    pages: 1-17\n\
          ---\n"
     );
 
@@ -1022,6 +1349,7 @@ fn frontmatter_golden() {
         title: Some("Fake Paper".into()),
         authors: vec!["Alice Chen".into(), "Bob Wu".into()],
         affiliations: vec!["Example University".into(), "Example Labs".into()],
+        total_pages: 17,
         ..Default::default()
     };
     let fm = frontmatter("9999.99999v9", &report, "2026-08-15T10:00:00Z");
@@ -1030,7 +1358,6 @@ fn frontmatter_golden() {
         fm.contains("affiliations: [\"Example University\", \"Example Labs\"]\n"),
         "{fm}"
     );
-    assert!(fm.contains("arxiv: \"9999.99999\"\n"), "{fm}");
 }
 
 #[test]
@@ -1097,43 +1424,14 @@ fn render_markdown_golden() {
 }
 
 #[test]
-fn parse_figure_src_round_trips() {
-    let src = "fig/7_img_in_chart_box_451_614_792_892.png";
-    let (page, bbox) = parse_figure_src(src).unwrap();
-    assert_eq!(page, 7);
-    assert_eq!(bbox, Bbox { x1: 451, y1: 614, x2: 792, y2: 892 });
-
-    assert!(parse_figure_src("fig/7_img_in_chart_box_451_614_792_892_extra.png").is_none());
-    assert!(parse_figure_src("other/7_img_in_image_box_1_2_3_4.png").is_none());
-    assert!(parse_figure_src("fig/7_img_out_of_box_1_2_3_4.png").is_none());
-    assert!(parse_figure_src("fig/x_img_in_image_box_1_2_3_4.png").is_none());
-}
-
-#[test]
 fn render_figures_writes_cropped_png() {
     let dir = TestDirectory::new();
     let pdf_path = make_test_pdf(&dir, "paper.pdf", 3);
-    let doc = StructuredDocument {
-        metadata: DocumentMetadata {
-            filename: "p.md".into(),
-            frontmatter: None,
-        },
-        tree: vec![
-            Node {
-                kind: NodeKind::Root,
-                children: vec![NodeId(1)],
-            },
-            Node {
-                kind: NodeKind::Figure {
-                    src: "fig/1_img_in_image_box_100_100_400_300.png".into(),
-                    caption: "Fig".into(),
-                    description: None,
-                },
-                children: vec![],
-            },
-        ],
-        root: NodeId(0),
-    };
+    let crops = vec![FigureCrop {
+        src: "fig/p0001-01.png".into(),
+        page_no: 1,
+        bbox: Bbox { x1: 100, y1: 100, x2: 400, y2: 300 },
+    }];
     let fig_dir = dir.path().join("fig");
     let pages = vec![Page {
         page_no: 1,
@@ -1143,9 +1441,11 @@ fn render_figures_writes_cropped_png() {
         blocks: vec![],
     }];
 
-    render_figures(&pdf_path, &doc, &fig_dir, &pages).unwrap();
+    fs::create_dir_all(&fig_dir).unwrap();
+    let dest = fig_dir.join("p0001-01.png");
+    fs::write(&dest, b"stale").unwrap();
+    render_figures(&pdf_path, &crops, &fig_dir, &pages).unwrap();
 
-    let dest = fig_dir.join("1_img_in_image_box_100_100_400_300.png");
     assert!(dest.exists());
     let image = image::open(&dest).unwrap();
     assert!((image.width() as i64 - 625).abs() <= 2, "{}", image.width());
@@ -1156,27 +1456,11 @@ fn render_figures_writes_cropped_png() {
 fn render_figures_scales_by_page_raster_dims() {
     let dir = TestDirectory::new();
     let pdf_path = make_test_pdf(&dir, "paper.pdf", 1);
-    let doc = StructuredDocument {
-        metadata: DocumentMetadata {
-            filename: "p.md".into(),
-            frontmatter: None,
-        },
-        tree: vec![
-            Node {
-                kind: NodeKind::Root,
-                children: vec![NodeId(1)],
-            },
-            Node {
-                kind: NodeKind::Figure {
-                    src: "fig/1_img_in_image_box_100_100_400_300.png".into(),
-                    caption: "Fig".into(),
-                    description: None,
-                },
-                children: vec![],
-            },
-        ],
-        root: NodeId(0),
-    };
+    let crops = vec![FigureCrop {
+        src: "fig/p0001-01.png".into(),
+        page_no: 1,
+        bbox: Bbox { x1: 100, y1: 100, x2: 400, y2: 300 },
+    }];
     let fig_dir = dir.path().join("fig");
     let pages = vec![Page {
         page_no: 1,
@@ -1186,9 +1470,9 @@ fn render_figures_scales_by_page_raster_dims() {
         blocks: vec![],
     }];
 
-    render_figures(&pdf_path, &doc, &fig_dir, &pages).unwrap();
+    render_figures(&pdf_path, &crops, &fig_dir, &pages).unwrap();
 
-    let dest = fig_dir.join("1_img_in_image_box_100_100_400_300.png");
+    let dest = fig_dir.join("p0001-01.png");
     let image = image::open(&dest).unwrap();
     assert!((image.width() as i64 - 313).abs() <= 2, "{}", image.width());
     assert!((image.height() as i64 - 209).abs() <= 2, "{}", image.height());
@@ -1198,27 +1482,11 @@ fn render_figures_scales_by_page_raster_dims() {
 fn render_figures_bails_on_rotated_page() {
     let dir = TestDirectory::new();
     let pdf_path = make_test_pdf(&dir, "paper.pdf", 1);
-    let doc = StructuredDocument {
-        metadata: DocumentMetadata {
-            filename: "p.md".into(),
-            frontmatter: None,
-        },
-        tree: vec![
-            Node {
-                kind: NodeKind::Root,
-                children: vec![NodeId(1)],
-            },
-            Node {
-                kind: NodeKind::Figure {
-                    src: "fig/1_img_in_image_box_100_100_400_300.png".into(),
-                    caption: "Fig".into(),
-                    description: None,
-                },
-                children: vec![],
-            },
-        ],
-        root: NodeId(0),
-    };
+    let crops = vec![FigureCrop {
+        src: "fig/p0001-01.png".into(),
+        page_no: 1,
+        bbox: Bbox { x1: 100, y1: 100, x2: 400, y2: 300 },
+    }];
     let fig_dir = dir.path().join("fig");
     let pages = vec![Page {
         page_no: 1,
@@ -1228,8 +1496,21 @@ fn render_figures_bails_on_rotated_page() {
         blocks: vec![],
     }];
 
-    let error = render_figures(&pdf_path, &doc, &fig_dir, &pages).unwrap_err();
+    let error = render_figures(&pdf_path, &crops, &fig_dir, &pages).unwrap_err();
     assert!(format!("{error:#}").contains("rotated"), "{error:#}");
+}
+
+#[test]
+fn render_figures_bails_on_invalid_crop_src() {
+    let crop = FigureCrop {
+        src: "../bad.png".into(),
+        page_no: 1,
+        bbox: Bbox { x1: 100, y1: 100, x2: 400, y2: 300 },
+    };
+
+    let error = render_figures(Path::new("missing.pdf"), &[crop], Path::new("fig"), &[])
+        .unwrap_err();
+    assert!(error.to_string().contains("invalid internal figure src"), "{error:#}");
 }
 
 #[test]
@@ -1251,6 +1532,7 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
 
     let report = ProjectReport {
         title: Some("My Paper".into()),
+        total_pages: 1,
         ..Default::default()
     };
     write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
@@ -1263,6 +1545,7 @@ fn write_bundle_creates_rewrites_and_preserves_index() {
 
     let report = ProjectReport {
         title: Some("Renamed".into()),
+        total_pages: 1,
         ..Default::default()
     };
     write_bundle(&out, "my-paper", &report, &doc(), "2026-08-15T10:00:01Z", DocType::Auto).unwrap();
@@ -1311,12 +1594,16 @@ fn write_book_bundle_creates_book_chapters_and_index() {
     let book_md = fs::read_to_string(out.join("my-book.md")).unwrap();
     assert!(book_md.contains("type: book"), "{book_md}");
     assert!(book_md.contains("title: \"My Book\""));
+    assert!(book_md.contains("title: \"my-book.pdf\""), "{book_md}");
+    assert!(book_md.contains("pages: 1-1"), "{book_md}");
     assert!(book_md.contains("# My Book"));
     assert!(book_md.contains("Preface words."));
     assert!(!book_md.contains("Intro body."));
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
     assert!(ch1.contains("type: chapter"), "{ch1}");
+    assert!(ch1.contains("title: \"my-book.pdf\""), "{ch1}");
+    assert!(ch1.contains("pages: 1-1"), "{ch1}");
     assert!(ch1.contains("book: my-book"));
     assert!(ch1.contains("chapter: 1"));
     assert!(ch1.contains("# Chapter 1. Intro"));
@@ -1360,7 +1647,7 @@ fn write_book_bundle_uses_keys_for_parts_appendices_and_noise() {
 }
 
 #[test]
-fn write_book_bundle_writes_page_range_in_resource() {
+fn write_book_bundle_writes_page_range_in_sources() {
     let dir = TestDirectory::new();
     let out = dir.path().join("my-book");
     let pages = parse_jsonl(&jsonl_line(&[
@@ -1376,9 +1663,10 @@ fn write_book_bundle_writes_page_range_in_resource() {
     write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto).unwrap();
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
-    assert!(ch1.contains("resource: ../pdf/my-book.pdf#2-2"), "{ch1}");
+    assert!(ch1.contains("title: \"my-book.pdf\""), "{ch1}");
+    assert!(ch1.contains("pages: 2-2"), "{ch1}");
     let ch2 = fs::read_to_string(out.join("ch2.md")).unwrap();
-    assert!(ch2.contains("resource: ../pdf/my-book.pdf#3-3"), "{ch2}");
+    assert!(ch2.contains("pages: 3-3"), "{ch2}");
 }
 
 #[test]
@@ -1544,7 +1832,8 @@ fn write_bundle_forced_book_finds_chapters_via_heading_prefixes() {
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
     assert!(ch1.contains("type: chapter"), "{ch1}");
-    assert!(ch1.contains("resource: ../pdf/my-book.pdf#1-1"), "{ch1}");
+    assert!(ch1.contains("title: \"my-book.pdf\""), "{ch1}");
+    assert!(ch1.contains("pages: 1-1"), "{ch1}");
     assert!(ch1.contains("# Chapter 1. Intro"), "{ch1}");
     assert!(ch1.contains("Intro body."));
 }
