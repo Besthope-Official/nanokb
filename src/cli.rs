@@ -7,10 +7,8 @@ use crate::retrieve;
 use crate::filter::Filter;
 use crate::{AppConfig, postgres, task};
 #[cfg(feature = "pdf")]
-use crate::pdf;
+use crate::pdf::{self, ConvertStage};
 use anyhow::{Context, Result};
-#[cfg(feature = "pdf")]
-use anyhow::bail;
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -262,17 +260,6 @@ enum DocCommand {
     },
 }
 
-#[cfg(feature = "pdf")]
-#[derive(clap::ValueEnum, Clone, Copy, PartialEq, Eq)]
-enum ConvertStage {
-    /// Slice the PDF into per-slice files in the cache (no API calls).
-    Slice,
-    /// Slice + OCR every slice via PaddleOCR, cache raw results.
-    Ocr,
-    /// Project cached OCR results into the md bundle (offline).
-    Merge,
-}
-
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
@@ -346,67 +333,21 @@ pub async fn run() -> Result<()> {
             dry_run,
             slice_pages,
             doc_type,
-        } => run_convert(&config, &file, out.as_deref(), stage, dry_run, slice_pages, doc_type).await,
-        TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
-    }
-}
-
-#[cfg(feature = "pdf")]
-async fn run_convert(
-    config: &AppConfig,
-    file: &Path,
-    out: Option<&Path>,
-    stage: Option<ConvertStage>,
-    dry_run: bool,
-    slice_pages: Option<usize>,
-    doc_type: Option<pdf::DocType>,
-) -> Result<()> {
-    let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
-    let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
-    if dry_run {
-        let pdf_doc = pdf::PdfDocument::open(file)?;
-        let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
-        let quota_pct = pdf_doc.page_count() as f64 * 100.0 / pdf::DAILY_QUOTA_PAGES as f64;
-        eprintln!(
-            "{} · {quota_pct:.0}% of daily quota",
-            pdf::plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages)
-        );
-        return Ok(());
-    }
-    match (stage, out) {
-        (Some(ConvertStage::Slice), _) => {
-            pdf::slice_to_cache(file, slice_pages, &config.pdf).await
-        }
-        (Some(ConvertStage::Ocr), _) => {
-            let metrics = pdf::run_ocr(&config.pdf, file, slice_pages).await?;
-            if let Some(summary) = pdf::ocr_metrics_summary(metrics) {
-                eprintln!("{summary}");
-            }
-            Ok(())
-        }
-        (Some(ConvertStage::Merge), Some(out)) => {
-            pdf::run_merge(&config.pdf, file, out, slice_pages, doc_type)
-        }
-        (None, Some(out)) => {
-            // Full pipeline: compute plan + cache layout once for both stages.
-            let pdf_doc = pdf::PdfDocument::open(file)?;
-            let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
-            let layout = pdf::CacheLayout::for_pdf(
-                file,
+        } => {
+            let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
+            let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
+            pdf::convert(
+                &config.pdf,
+                &file,
+                out.as_deref(),
+                stage,
+                dry_run,
                 slice_pages,
-                &config.pdf.api_base,
-                &config.pdf.model,
-            )?;
-            eprintln!("{}", pdf::plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages));
-            let metrics = pdf::run_ocr_with(&config.pdf, &pdf_doc, &layout, &plan).await?;
-            if let Some(summary) = pdf::ocr_metrics_summary(metrics) {
-                eprintln!("{summary}");
-            }
-            pdf::run_merge_with(&layout, &plan, file, out, doc_type)
+                doc_type,
+            )
+            .await
         }
-        (Some(ConvertStage::Merge) | None, None) => {
-            bail!("--out <dir> is required unless --stage stops before merge")
-        }
+        TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
 
