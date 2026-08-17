@@ -397,11 +397,19 @@ pub enum DocType {
     Auto,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BundleOutcome {
     pub doc_type: DocType,
     pub forced: bool,
     pub chapter_count: usize,
+    pub evidence: Option<DocTypeEvidence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DocTypeEvidence {
+    ExplicitChapterTitle(String),
+    MultipleChapterCandidates(usize),
+    InsufficientChapterCandidates(usize),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1450,19 +1458,33 @@ fn resolve_bundle_outcome(
     chapters: &[(NodeId, String)],
 ) -> BundleOutcome {
     let forced = doc_type != DocType::Auto;
-    let doc_type = match doc_type {
+    let (doc_type, evidence) = match doc_type {
         DocType::Auto => {
-            if chapters.iter().any(|(_, title)| is_chapter_title(title)) || chapters.len() >= 2 {
-                DocType::Book
+            if let Some((_, title)) = chapters.iter().find(|(_, title)| is_chapter_title(title)) {
+                (
+                    DocType::Book,
+                    Some(DocTypeEvidence::ExplicitChapterTitle(title.clone())),
+                )
+            } else if chapters.len() >= 2 {
+                (
+                    DocType::Book,
+                    Some(DocTypeEvidence::MultipleChapterCandidates(chapters.len())),
+                )
             } else {
-                DocType::Paper
+                (
+                    DocType::Paper,
+                    Some(DocTypeEvidence::InsufficientChapterCandidates(
+                        chapters.len(),
+                    )),
+                )
             }
         }
-        other => other,
+        other => (other, None),
     };
     BundleOutcome {
         doc_type,
         forced,
+        evidence,
         chapter_count: if doc_type == DocType::Book {
             chapters.len()
         } else {
@@ -2616,20 +2638,35 @@ pub fn bundle_outcome_summary(outcome: BundleOutcome) -> String {
         DocType::Book => "book",
         DocType::Auto => unreachable!("bundle outcome must be resolved"),
     };
-    let prefix = if outcome.forced {
+    let mut summary = if outcome.forced {
         format!("document type {doc_type} (forced)")
     } else {
         format!("detected {doc_type}")
     };
+    match outcome.evidence {
+        Some(DocTypeEvidence::ExplicitChapterTitle(title)) => {
+            summary.push_str(&format!(" · matched chapter title {title:?}"));
+        }
+        Some(DocTypeEvidence::MultipleChapterCandidates(count)) => {
+            summary.push_str(&format!(" · found {count} chapter candidates"));
+        }
+        Some(DocTypeEvidence::InsufficientChapterCandidates(0)) => {
+            summary.push_str(" · no chapter candidates");
+        }
+        Some(DocTypeEvidence::InsufficientChapterCandidates(count)) => {
+            summary.push_str(&format!(" · only {count} chapter candidate"));
+        }
+        None => {}
+    }
     if outcome.doc_type == DocType::Book && outcome.chapter_count > 0 {
         let unit = if outcome.chapter_count == 1 {
             "chapter"
         } else {
             "chapters"
         };
-        format!("{prefix} · split into {} {unit}", outcome.chapter_count)
+        format!("{summary} · split into {} {unit}", outcome.chapter_count)
     } else {
-        prefix
+        summary
     }
 }
 

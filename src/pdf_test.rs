@@ -2009,8 +2009,14 @@ fn write_bundle_auto_detects_numbered_chapter_heading() {
     assert_eq!(outcome.doc_type, DocType::Book);
     assert!(!outcome.forced);
     assert_eq!(
-        bundle_outcome_summary(outcome),
-        "detected book · split into 1 chapter"
+        outcome.evidence,
+        Some(DocTypeEvidence::ExplicitChapterTitle(
+            "Chapter 1".to_string()
+        ))
+    );
+    assert_eq!(
+        bundle_outcome_summary(outcome.clone()),
+        "detected book · matched chapter title \"Chapter 1\" · split into 1 chapter"
     );
     assert!(out.join("ch1.md").exists());
     assert!(fs::read_to_string(out.join("ch1.md")).unwrap().contains("# Chapter 1"));
@@ -2031,8 +2037,50 @@ fn write_bundle_auto_ignores_repeated_document_title() {
         write_bundle(&out, "my-paper", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
             .unwrap();
     assert_eq!(outcome.chapter_count, 0);
+    assert_eq!(
+        outcome.evidence,
+        Some(DocTypeEvidence::InsufficientChapterCandidates(0))
+    );
+    assert_eq!(
+        bundle_outcome_summary(outcome.clone()),
+        "detected paper · no chapter candidates"
+    );
     let markdown = fs::read_to_string(out.join("my-paper.md")).unwrap();
     assert!(markdown.contains("type: paper"), "{markdown}");
+}
+
+#[test]
+fn auto_type_evidence_explains_chapter_candidate_threshold() {
+    let (one_doc, one_report) = project_book(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block("doc_title", "Overview", [0, 20, 10, 30]),
+    ]);
+    let one = detect_bundle_outcome(&one_report, &one_doc, DocType::Auto);
+    assert_eq!(one.doc_type, DocType::Paper);
+    assert_eq!(
+        one.evidence,
+        Some(DocTypeEvidence::InsufficientChapterCandidates(1))
+    );
+    assert_eq!(
+        bundle_outcome_summary(one),
+        "detected paper · only 1 chapter candidate"
+    );
+
+    let (two_doc, two_report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("doc_title", "Opening", [0, 20, 10, 30]),
+        block("doc_title", "Closing", [0, 40, 10, 50]),
+    ]);
+    let two = detect_bundle_outcome(&two_report, &two_doc, DocType::Auto);
+    assert_eq!(two.doc_type, DocType::Book);
+    assert_eq!(
+        two.evidence,
+        Some(DocTypeEvidence::MultipleChapterCandidates(2))
+    );
+    assert_eq!(
+        bundle_outcome_summary(two),
+        "detected book · found 2 chapter candidates · split into 2 chapters"
+    );
 }
 
 #[test]
@@ -2078,6 +2126,7 @@ fn write_bundle_forced_book_degrades_to_single_doc() {
             .unwrap();
     assert_eq!(outcome.chapter_count, 0);
     assert!(outcome.forced);
+    assert_eq!(outcome.evidence, None);
     assert_eq!(
         bundle_outcome_summary(outcome),
         "document type book (forced)"
