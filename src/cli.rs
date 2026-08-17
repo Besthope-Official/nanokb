@@ -377,7 +377,13 @@ async fn run_convert(
         (Some(ConvertStage::Slice), _) => {
             pdf::slice_to_cache(file, slice_pages, &config.pdf).await
         }
-        (Some(ConvertStage::Ocr), _) => pdf::run_ocr(&config.pdf, file, slice_pages).await,
+        (Some(ConvertStage::Ocr), _) => {
+            let metrics = pdf::run_ocr(&config.pdf, file, slice_pages).await?;
+            if let Some(summary) = pdf::ocr_metrics_summary(metrics) {
+                eprintln!("{summary}");
+            }
+            Ok(())
+        }
         (Some(ConvertStage::Merge), Some(out)) => {
             pdf::run_merge(&config.pdf, file, out, slice_pages, doc_type)
         }
@@ -392,7 +398,10 @@ async fn run_convert(
                 &config.pdf.model,
             )?;
             eprintln!("{}", pdf::plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages));
-            pdf::run_ocr_with(&config.pdf, &pdf_doc, &layout, &plan).await?;
+            let metrics = pdf::run_ocr_with(&config.pdf, &pdf_doc, &layout, &plan).await?;
+            if let Some(summary) = pdf::ocr_metrics_summary(metrics) {
+                eprintln!("{summary}");
+            }
             pdf::run_merge_with(&layout, &plan, file, out, doc_type)
         }
         (Some(ConvertStage::Merge) | None, None) => {

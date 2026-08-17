@@ -38,7 +38,7 @@ pub mod pdf;
 pub use pdf::{
     ApiErrorKind, Bbox, BlockLabel, CacheLayout, DocType, FigureCrop, JobState, OcrError, Page,
     PageBlock, PaddleOcrClient, PdfDocument, ProjectReport, cache_key, collect_diagnostics,
-    frontmatter, infer_heading_level, pair_figures, parse_jsonl, project, render_figures,
+    frontmatter, pair_figures, parse_jsonl, project, render_figures,
     render_markdown, validate_structure, write_bundle,
 };
 

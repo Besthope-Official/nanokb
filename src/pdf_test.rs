@@ -367,13 +367,32 @@ fn ocr_journal_round_trips_and_rejects_empty_job_id() {
     fs::create_dir_all(&layout.root).unwrap();
 
     let journal = OcrJournal {
-        jobs: BTreeMap::from([(0, "job-1".to_string()), (2, "job-3".to_string())]),
+        jobs: BTreeMap::from([
+            (
+                0,
+                JournalJob {
+                    job_id: "job-1".to_string(),
+                    submitted_at_ms: 1,
+                },
+            ),
+            (
+                2,
+                JournalJob {
+                    job_id: "job-3".to_string(),
+                    submitted_at_ms: 2,
+                },
+            ),
+        ]),
     };
     journal.persist(&layout).unwrap();
     let loaded = OcrJournal::load(&layout).unwrap();
     assert_eq!(loaded.jobs, journal.jobs);
 
-    fs::write(layout.journal_path(), r#"{"jobs":{"0":""}}"#).unwrap();
+    fs::write(
+        layout.journal_path(),
+        r#"{"jobs":{"0":{"job_id":"","submitted_at_ms":1}}}"#,
+    )
+    .unwrap();
     assert!(OcrJournal::load(&layout).is_err());
 }
 
@@ -387,7 +406,8 @@ async fn run_ocr_with_fully_cached_plan_does_not_require_token() {
     fs::create_dir_all(layout.results_dir()).unwrap();
     fs::write(layout.result_path(0), jsonl_line(&[page_json(&[])])).unwrap();
 
-    run_ocr_with(&cfg, &pdf, &layout, &[(1, 1)]).await.unwrap();
+    let metrics = run_ocr_with(&cfg, &pdf, &layout, &[(1, 1)]).await.unwrap();
+    assert_eq!(metrics, OcrMetrics::default());
 }
 
 // ---------------------------------------------------------------
@@ -847,25 +867,7 @@ fn parse_page_rejects_missing_dimensions_and_out_of_bounds_bbox() {
 }
 
 #[test]
-fn infer_heading_level_table() {
-    assert_eq!(infer_heading_level("1. Introduction"), (1, "Introduction"));
-    assert_eq!(infer_heading_level("2.1 Retrieval"), (2, "Retrieval"));
-    assert_eq!(
-        infer_heading_level("2.1. Retrieval-Augmented Generation"),
-        (2, "Retrieval-Augmented Generation")
-    );
-    assert_eq!(
-        infer_heading_level("3.3.1. IRG TRIGGERING PIPELINE."),
-        (3, "IRG TRIGGERING PIPELINE.")
-    );
-    assert_eq!(infer_heading_level("Abstract"), (1, "Abstract"));
-    assert_eq!(infer_heading_level("10. Related Work"), (1, "Related Work"));
-    assert_eq!(infer_heading_level("1."), (1, "1."));
-    assert_eq!(infer_heading_level("References"), (1, "References"));
-}
-
-#[test]
-fn project_builds_nested_tree() {
+fn project_keeps_heading_text_and_structure_flat() {
     let page = page_json(
         &[
             block("doc_title", "My Paper", [103, 78, 1119, 174]),
@@ -883,17 +885,17 @@ fn project_builds_nested_tree() {
 
     assert_eq!(report.title.as_deref(), Some("My Paper"));
     let root = doc.node(doc.root);
-    assert_eq!(root.children.len(), 2);
+    assert_eq!(root.children.len(), 3);
     let intro = doc.node(root.children[0]);
     assert!(matches!(
         &intro.kind,
-        NodeKind::Heading { level: 1, title } if title == "Introduction"
+        NodeKind::Heading { level: 1, title } if title == "1. Introduction"
     ));
-    assert_eq!(intro.children.len(), 2);
-    let background = doc.node(intro.children[1]);
+    assert_eq!(intro.children.len(), 1);
+    let background = doc.node(root.children[1]);
     assert!(matches!(
         &background.kind,
-        NodeKind::Heading { level: 2, title } if title == "Background"
+        NodeKind::Heading { level: 1, title } if title == "1.1. Background"
     ));
     assert_eq!(background.children.len(), 4);
     assert!(matches!(
@@ -909,14 +911,14 @@ fn project_builds_nested_tree() {
         NodeKind::MathBlock { text } if text == "$$ E = mc^2 $$"
     ));
     assert!(matches!(
-        &doc.node(root.children[1]).kind,
+        &doc.node(root.children[2]).kind,
         NodeKind::Heading { level: 1, title } if title == "References"
     ));
     assert!(report.dropped.is_empty());
 }
 
 #[test]
-fn project_keeps_unnumbered_subheadings_under_numbered_sections() {
+fn project_keeps_all_paragraph_titles_as_root_siblings() {
     let page = page_json(&[
         block("doc_title", "My Book", [0, 0, 500, 100]),
         block("paragraph_title", "2. Miscellaneous Math", [0, 110, 500, 140]),
@@ -934,32 +936,21 @@ fn project_keeps_unnumbered_subheadings_under_numbered_sections() {
     let (doc, _) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "book").unwrap();
 
     let root = doc.node(doc.root);
-    let chapter = doc.node(root.children[0]);
-    let section = doc.node(chapter.children[0]);
+    assert_eq!(root.children.len(), 7);
+    for &child in &root.children {
+        assert!(matches!(doc.node(child).kind, NodeKind::Heading { level: 1, .. }));
+    }
     assert!(matches!(
-        &section.kind,
-        NodeKind::Heading { level: 2, .. }
-    ));
-    let numbered = doc.node(section.children[0]);
-    assert!(matches!(
-        &numbered.kind,
-        NodeKind::Heading { level: 3, .. }
+        &doc.node(root.children[3]).kind,
+        NodeKind::Heading { title, .. } if title == "Implicit 2D Lines"
     ));
     assert!(matches!(
-        &doc.node(numbered.children[1]).kind,
-        NodeKind::Heading { level: 4, title } if title == "Implicit 2D Lines"
+        &doc.node(root.children[4]).kind,
+        NodeKind::Heading { title, .. } if title == "Implicit Quadric Curves"
     ));
     assert!(matches!(
-        &doc.node(numbered.children[2]).kind,
-        NodeKind::Heading { level: 4, title } if title == "Implicit Quadric Curves"
-    ));
-    assert!(matches!(
-        &doc.node(section.children[1]).kind,
-        NodeKind::Heading { level: 3, title } if title == "3D Implicit Surfaces"
-    ));
-    assert!(matches!(
-        &doc.node(root.children[1]).kind,
-        NodeKind::Heading { level: 1, title } if title == "References"
+        &doc.node(root.children[6]).kind,
+        NodeKind::Heading { title, .. } if title == "References"
     ));
 }
 
@@ -1333,14 +1324,18 @@ fn project_bails_without_doc_title() {
 }
 
 #[test]
-fn project_bails_on_heading_jump() {
+fn project_accepts_any_heading_text_without_inferring_depth() {
     let page = page_json(
         &[
             block("doc_title", "A", [0, 0, 10, 10]),
             block("paragraph_title", "2.1. Deep", [0, 20, 10, 30]),
         ]);
-    let error = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap_err();
-    assert!(error.to_string().contains("level jump"), "{error:#}");
+    let (doc, _) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "x").unwrap();
+    assert_eq!(doc.node(doc.root).children, vec![NodeId(1)]);
+    assert!(matches!(
+        &doc.node(NodeId(1)).kind,
+        NodeKind::Heading { level: 1, title } if title == "2.1. Deep"
+    ));
 }
 
 #[test]
@@ -1624,12 +1619,28 @@ fn render_figures_writes_cropped_png() {
     fs::create_dir_all(&fig_dir).unwrap();
     let dest = fig_dir.join("p0001-01.png");
     fs::write(&dest, b"stale").unwrap();
-    render_figures(&pdf_path, &crops, &fig_dir, &pages).unwrap();
+    let metrics = render_figures(&pdf_path, &crops, &fig_dir, &pages).unwrap();
 
+    assert_eq!(metrics.rendered, 1);
     assert!(dest.exists());
     let image = image::open(&dest).unwrap();
     assert!((image.width() as i64 - 625).abs() <= 2, "{}", image.width());
     assert!((image.height() as i64 - 417).abs() <= 2, "{}", image.height());
+}
+
+#[test]
+fn figure_progress_is_bounded_to_five_percent_steps() {
+    assert!(!should_report_figure_progress(1, 100, 0));
+    assert!(should_report_figure_progress(5, 100, 0));
+    assert!(!should_report_figure_progress(6, 100, 1));
+    assert!(should_report_figure_progress(10, 100, 1));
+    assert!(!should_report_figure_progress(100, 100, 19));
+}
+
+#[test]
+fn render_figures_with_no_crops_returns_zero_metrics() {
+    let metrics = render_figures(Path::new("missing.pdf"), &[], Path::new("fig"), &[]).unwrap();
+    assert_eq!(metrics, FigureRenderMetrics::default());
 }
 
 #[test]
@@ -1691,6 +1702,30 @@ fn render_figures_bails_on_invalid_crop_src() {
     let error = render_figures(Path::new("missing.pdf"), &[crop], Path::new("fig"), &[])
         .unwrap_err();
     assert!(error.to_string().contains("invalid internal figure src"), "{error:#}");
+}
+
+#[test]
+fn metric_summaries_format_duration_and_throughput() {
+    assert_eq!(format_duration(Duration::from_millis(4250)), "4.2s");
+    assert_eq!(format_duration(Duration::from_secs(252)), "4m12s");
+    assert_eq!(format_duration(Duration::from_secs(3723)), "1h02m03s");
+    assert_eq!(
+        ocr_metrics_summary(OcrMetrics {
+            completed_tasks: 2,
+            total_task_time: Duration::from_secs(504),
+        })
+        .as_deref(),
+        Some("ocr 2 tasks · avg 4m12s/task")
+    );
+    assert_eq!(ocr_metrics_summary(OcrMetrics::default()), None);
+    assert_eq!(
+        figure_metrics_summary(FigureRenderMetrics {
+            rendered: 10,
+            elapsed: Duration::from_secs(2),
+        })
+        .as_deref(),
+        Some("figures 10/10 · 5.0 figs/s")
+    );
 }
 
 #[test]
@@ -1809,7 +1844,7 @@ fn write_book_bundle_creates_book_chapters_and_index() {
     assert!(ch1.contains("book: my-book"));
     assert!(ch1.contains("chapter: 1"));
     assert!(ch1.contains("# Chapter 1. Intro"));
-    assert!(ch1.contains("### Background"), "{ch1}");
+    assert!(ch1.contains("## 1.1. Background"), "{ch1}");
     assert!(ch1.contains("Intro body."));
 
     let ch2 = fs::read_to_string(out.join("ch2.md")).unwrap();
@@ -1941,10 +1976,10 @@ fn write_bundle_forced_paper_ignores_doc_title_headings() {
     ]);
     assert!(!report.doc_title_headings.is_empty());
 
-    let chapters =
+    let outcome =
         write_bundle(&out, "my-paper", &report, &doc, "2026-08-15T10:00:00Z", DocType::Paper)
             .unwrap();
-    assert_eq!(chapters, 0);
+    assert_eq!(outcome.chapter_count, 0);
 
     let md = fs::read_to_string(out.join("my-paper.md")).unwrap();
     assert!(md.contains("type: paper"), "{md}");
@@ -1967,10 +2002,16 @@ fn write_bundle_auto_detects_numbered_chapter_heading() {
         block("text", "Body words.", [0, 40, 10, 50]),
     ]);
 
-    let chapters =
+    let outcome =
         write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
             .unwrap();
-    assert_eq!(chapters, 1);
+    assert_eq!(outcome.chapter_count, 1);
+    assert_eq!(outcome.doc_type, DocType::Book);
+    assert!(!outcome.forced);
+    assert_eq!(
+        bundle_outcome_summary(outcome),
+        "detected book · split into 1 chapter"
+    );
     assert!(out.join("ch1.md").exists());
     assert!(fs::read_to_string(out.join("ch1.md")).unwrap().contains("# Chapter 1"));
 }
@@ -1986,10 +2027,10 @@ fn write_bundle_auto_ignores_repeated_document_title() {
         block("text", "Second page.", [0, 60, 10, 70]),
     ]);
 
-    let chapters =
+    let outcome =
         write_bundle(&out, "my-paper", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
             .unwrap();
-    assert_eq!(chapters, 0);
+    assert_eq!(outcome.chapter_count, 0);
     let markdown = fs::read_to_string(out.join("my-paper.md")).unwrap();
     assert!(markdown.contains("type: paper"), "{markdown}");
 }
@@ -2008,16 +2049,16 @@ fn write_bundle_forced_book_with_chapters_matches_auto() {
 
     // Same directory name so index.md's dir-name title matches across both.
     let out_auto = dir.path().join("case-a").join("my-book");
-    let auto_count =
+    let auto_outcome =
         write_bundle(&out_auto, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
             .unwrap();
     let out_book = dir.path().join("case-b").join("my-book");
-    let book_count =
+    let book_outcome =
         write_bundle(&out_book, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
             .unwrap();
 
-    assert_eq!(auto_count, 2);
-    assert_eq!(book_count, auto_count);
+    assert_eq!(auto_outcome.chapter_count, 2);
+    assert_eq!(book_outcome.chapter_count, auto_outcome.chapter_count);
     let auto_files = read_dir_files(&out_auto);
     assert_eq!(read_dir_files(&out_book), auto_files);
 }
@@ -2032,10 +2073,15 @@ fn write_bundle_forced_book_degrades_to_single_doc() {
     ]);
     assert!(report.doc_title_headings.is_empty());
 
-    let chapters =
+    let outcome =
         write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
             .unwrap();
-    assert_eq!(chapters, 0);
+    assert_eq!(outcome.chapter_count, 0);
+    assert!(outcome.forced);
+    assert_eq!(
+        bundle_outcome_summary(outcome),
+        "document type book (forced)"
+    );
 
     let md = fs::read_to_string(out.join("my-book.md")).unwrap();
     assert!(md.contains("type: book"), "{md}");
@@ -2064,10 +2110,10 @@ fn write_bundle_forced_book_finds_chapters_via_heading_prefixes() {
         block("text", "Intro body.", [0, 40, 10, 50]),
     ]);
 
-    let chapters =
+    let outcome =
         write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Book)
             .unwrap();
-    assert_eq!(chapters, 1);
+    assert_eq!(outcome.chapter_count, 1);
 
     let ch1 = fs::read_to_string(out.join("ch1.md")).unwrap();
     assert!(ch1.contains("type: chapter"), "{ch1}");

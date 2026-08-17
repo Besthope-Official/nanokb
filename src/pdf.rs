@@ -397,6 +397,39 @@ pub enum DocType {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BundleOutcome {
+    pub doc_type: DocType,
+    pub forced: bool,
+    pub chapter_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OcrMetrics {
+    pub completed_tasks: usize,
+    pub total_task_time: Duration,
+}
+
+impl OcrMetrics {
+    pub fn average_task_time(&self) -> Option<Duration> {
+        (self.completed_tasks > 0)
+            .then(|| self.total_task_time.div_f64(self.completed_tasks as f64))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FigureRenderMetrics {
+    pub rendered: usize,
+    pub elapsed: Duration,
+}
+
+impl FigureRenderMetrics {
+    pub fn throughput(&self) -> Option<f64> {
+        (self.rendered > 0 && !self.elapsed.is_zero())
+            .then(|| self.rendered as f64 / self.elapsed.as_secs_f64())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ProjectReport {
     pub title: Option<String>,
@@ -568,66 +601,6 @@ fn parse_bbox(value: &Value) -> Result<Bbox> {
         x2: coords[2],
         y2: coords[3],
     })
-}
-
-pub fn infer_heading_level(title: &str) -> (usize, &str) {
-    let trimmed = title.trim();
-    let Some(separator) = trimmed.find(char::is_whitespace) else {
-        return (1, trimmed);
-    };
-    let prefix = &trimmed[..separator];
-    let number = prefix.trim_end_matches('.');
-    let level = number.split('.').count();
-    let numbered = prefix.contains('.')
-        && !number.is_empty()
-        && number.split('.').all(|part| {
-            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
-        });
-    let remainder = trimmed[separator..].trim();
-    if numbered && !remainder.is_empty() {
-        (level, remainder)
-    } else {
-        (1, trimmed)
-    }
-}
-
-fn is_root_heading_title(title: &str) -> bool {
-    matches!(
-        title.trim().to_ascii_lowercase().as_str(),
-        "abstract"
-            | "acknowledgement"
-            | "acknowledgements"
-            | "bibliography"
-            | "conclusion"
-            | "conclusions"
-            | "contents"
-            | "index"
-            | "preface"
-            | "references"
-            | "table of contents"
-    )
-}
-
-fn infer_project_heading_level<'a>(
-    title: &'a str,
-    heading_stack: &[(NodeId, usize, bool)],
-) -> (usize, &'a str, bool) {
-    let trimmed = title.trim();
-    let (numbered_level, remainder) = infer_heading_level(trimmed);
-    let numbered = remainder != trimmed;
-    if numbered {
-        return (numbered_level, remainder, false);
-    }
-    if is_root_heading_title(remainder) || is_chapter_title(remainder) || heading_stack.is_empty() {
-        return (1, remainder, true);
-    }
-    let (_, parent_level, parent_is_unnumbered) = *heading_stack.last().unwrap();
-    let level = if parent_is_unnumbered {
-        parent_level
-    } else {
-        parent_level.saturating_add(1)
-    };
-    (level, remainder, true)
 }
 
 #[derive(Debug, Default)]
@@ -914,7 +887,10 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         children: Vec::new(),
     }];
     let root = NodeId(0);
-    let mut heading_stack: Vec<(NodeId, usize, bool)> = Vec::new();
+    // OCR gives us a title label, not reliable semantic heading depth. Keep
+    // every projected title at one level and preserve its text verbatim;
+    // an agent can infer semantic nesting later without irreversible guesses.
+    let mut current_heading: Option<NodeId> = None;
     let mut title_seen = false;
     for page in pages {
         let pairing = pair_figures_detailed(page);
@@ -942,7 +918,7 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
             node_id
         };
         for (block_idx, block) in page.blocks.iter().enumerate() {
-            let parent = heading_stack.last().map(|&(id, _, _)| id).unwrap_or(root);
+            let parent = current_heading.unwrap_or(root);
             match &block.label {
                 BlockLabel::Ignored(_) => {}
                 BlockLabel::DocTitle => {
@@ -950,34 +926,21 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                         title_seen = true;
                         continue;
                     }
-                    heading_stack.clear();
                     let node_id = push_child(root, NodeKind::Heading {
                         level: 1,
                         title: block.content.clone(),
                     });
-                    heading_stack.push((node_id, 1, false));
+                    current_heading = Some(node_id);
                     report.doc_title_headings.push((node_id, page.page_no));
                     report.root_headings.push((node_id, page.page_no));
                 }
                 BlockLabel::ParagraphTitle => {
-                    let (level, remainder, is_unnumbered) =
-                        infer_project_heading_level(&block.content, &heading_stack);
-                    while let Some(&(_, top_level, _)) = heading_stack.last() {
-                        if top_level >= level {
-                            heading_stack.pop();
-                        } else {
-                            break;
-                        }
-                    }
-                    let parent = heading_stack.last().map(|&(id, _, _)| id).unwrap_or(root);
-                    let node_id = push_child(parent, NodeKind::Heading {
-                        level,
-                        title: remainder.to_string(),
+                    let node_id = push_child(root, NodeKind::Heading {
+                        level: 1,
+                        title: block.content.clone(),
                     });
-                    heading_stack.push((node_id, level, is_unnumbered));
-                    if parent == root {
-                        report.root_headings.push((node_id, page.page_no));
-                    }
+                    current_heading = Some(node_id);
+                    report.root_headings.push((node_id, page.page_no));
                 }
                 BlockLabel::Text | BlockLabel::Abstract | BlockLabel::ReferenceContent => {
                     push_child(parent, NodeKind::Paragraph {
@@ -1175,11 +1138,12 @@ fn figure_sources(page: &Page) -> BTreeMap<usize, String> {
         .collect()
 }
 
+/// Validate AST graph invariants only; semantic heading depth is intentionally
+/// left to downstream agent processing.
 pub fn validate_structure(doc: &StructuredDocument) -> Result<()> {
     fn walk(
         doc: &StructuredDocument,
         node_id: NodeId,
-        parent_level: usize,
         states: &mut [u8],
     ) -> Result<()> {
         ensure!(node_id.0 < doc.tree.len(), "node {} is out of bounds", node_id.0);
@@ -1187,29 +1151,21 @@ pub fn validate_structure(doc: &StructuredDocument) -> Result<()> {
         states[node_id.0] = 1;
 
         let node = doc.node(node_id);
-        let child_parent_level = match &node.kind {
+        match &node.kind {
             NodeKind::Root => {
                 ensure!(node_id == doc.root, "non-root node {} has Root kind", node_id.0);
-                parent_level
             }
-            NodeKind::Heading { level, title } => {
+            NodeKind::Heading { title, .. } => {
                 ensure!(!title.trim().is_empty(), "heading title is empty");
-                ensure!(
-                    *level <= parent_level + 1,
-                    "heading level jump: {title:?} (level {level}) under level {parent_level} ({} > {})",
-                    *level,
-                    parent_level + 1
-                );
-                *level
             }
-            NodeKind::Figure { .. } => parent_level,
+            NodeKind::Figure { .. } => {}
             NodeKind::Paragraph { .. }
             | NodeKind::CodeBlock { .. }
             | NodeKind::MathBlock { .. }
-            | NodeKind::Table { .. } => parent_level,
-        };
+            | NodeKind::Table { .. } => {}
+        }
         for &child in &node.children {
-            walk(doc, child, child_parent_level, states)?;
+            walk(doc, child, states)?;
         }
         states[node_id.0] = 2;
         Ok(())
@@ -1218,7 +1174,7 @@ pub fn validate_structure(doc: &StructuredDocument) -> Result<()> {
     ensure!(doc.root.0 < doc.tree.len(), "root node {} is out of bounds", doc.root.0);
     ensure!(matches!(doc.node(doc.root).kind, NodeKind::Root), "document root is not a Root node");
     let mut states = vec![0; doc.tree.len()];
-    walk(doc, doc.root, 0, &mut states)?;
+    walk(doc, doc.root, &mut states)?;
     ensure!(states.iter().all(|state| *state == 2), "document contains unreachable nodes");
     Ok(())
 }
@@ -1463,9 +1419,37 @@ pub fn write_bundle(
     doc: &StructuredDocument,
     at: &str,
     doc_type: DocType,
-) -> Result<usize> {
+) -> Result<BundleOutcome> {
     fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
     let chapters = detect_chapters(report, doc);
+    let outcome = resolve_bundle_outcome(doc_type, &chapters);
+    match outcome.doc_type {
+        DocType::Paper => {
+            write_paper_bundle(out, stem, report, doc, at)?;
+            Ok(outcome)
+        }
+        DocType::Book => {
+            let chapter_count = if chapters.is_empty() {
+                write_book_single_doc(out, stem, report, doc, at)?;
+                println!("warning: {}", book_degradation_warning(stem));
+                0
+            } else {
+                write_book_bundle(out, stem, report, doc, at, &chapters)?
+            };
+            Ok(BundleOutcome {
+                chapter_count,
+                ..outcome
+            })
+        }
+        DocType::Auto => unreachable!("resolved above"),
+    }
+}
+
+fn resolve_bundle_outcome(
+    doc_type: DocType,
+    chapters: &[(NodeId, String)],
+) -> BundleOutcome {
+    let forced = doc_type != DocType::Auto;
     let doc_type = match doc_type {
         DocType::Auto => {
             if chapters.iter().any(|(_, title)| is_chapter_title(title)) || chapters.len() >= 2 {
@@ -1476,22 +1460,23 @@ pub fn write_bundle(
         }
         other => other,
     };
-    match doc_type {
-        DocType::Paper => {
-            write_paper_bundle(out, stem, report, doc, at)?;
-            Ok(0)
-        }
-        DocType::Book => {
-            if chapters.is_empty() {
-                write_book_single_doc(out, stem, report, doc, at)?;
-                eprintln!("warning: {}", book_degradation_warning(stem));
-                Ok(0)
-            } else {
-                write_book_bundle(out, stem, report, doc, at, &chapters)
-            }
-        }
-        DocType::Auto => unreachable!("resolved above"),
+    BundleOutcome {
+        doc_type,
+        forced,
+        chapter_count: if doc_type == DocType::Book {
+            chapters.len()
+        } else {
+            0
+        },
     }
+}
+
+pub fn detect_bundle_outcome(
+    report: &ProjectReport,
+    doc: &StructuredDocument,
+    doc_type: DocType,
+) -> BundleOutcome {
+    resolve_bundle_outcome(doc_type, &detect_chapters(report, doc))
 }
 
 fn write_paper_bundle(
@@ -1533,7 +1518,9 @@ fn is_chapter_title(text: &str) -> bool {
 }
 
 /// Chapter starts in document order: root headings that are doc_title
-/// headings or match the chapter/part/appendix prefix convention.
+/// headings or match the chapter/part/appendix prefix convention. This is
+/// intentionally independent of semantic heading depth; PDF projection keeps
+/// all titles flat so chapter detection can rely only on title text and order.
 fn detect_chapters(report: &ProjectReport, doc: &StructuredDocument) -> Vec<(NodeId, String)> {
     let doc_title_nodes: BTreeSet<NodeId> = report
         .doc_title_headings
@@ -1717,7 +1704,7 @@ pub fn render_figures(
     crops: &[FigureCrop],
     fig_dir: &Path,
     pages: &[Page],
-) -> Result<()> {
+) -> Result<FigureRenderMetrics> {
     let mut by_page: BTreeMap<usize, Vec<(PathBuf, Bbox)>> = BTreeMap::new();
     for crop in crops {
         ensure!(valid_figure_src(&crop.src), "invalid internal figure src {:?}", crop.src);
@@ -1737,7 +1724,7 @@ pub fn render_figures(
             .push((fig_dir.join(filename), crop.bbox));
     }
     if by_page.is_empty() {
-        return Ok(());
+        return Ok(FigureRenderMetrics::default());
     }
     fs::create_dir_all(fig_dir)
         .with_context(|| format!("failed to create {}", fig_dir.display()))?;
@@ -1770,6 +1757,10 @@ pub fn render_figures(
             .get((page_no - 1) as pdfium_render::prelude::PdfPageIndex)
             .with_context(|| format!("PDF has no page {page_no}"))?;
     }
+    let started_at = std::time::Instant::now();
+    let total = crops.len();
+    let mut rendered = 0usize;
+    let mut last_progress_bucket = 0usize;
     for (page_no, figures) in &by_page {
         let ocr_page = pages
             .get(page_no - 1)
@@ -1801,10 +1792,22 @@ pub fn render_figures(
                 .write_to(&mut encoded, image::ImageFormat::Png)
                 .with_context(|| format!("failed to encode figure {}", dest.display()))?;
             write_file_atomic(dest, encoded.get_ref())?;
-            eprintln!("figure {} rendered", dest.display());
+            rendered += 1;
+            if should_report_figure_progress(rendered, total, last_progress_bucket) {
+                last_progress_bucket = rendered.saturating_mul(20) / total;
+                eprintln!("figures {rendered}/{total}");
+            }
         }
     }
-    Ok(())
+    Ok(FigureRenderMetrics {
+        rendered,
+        elapsed: started_at.elapsed(),
+    })
+}
+
+fn should_report_figure_progress(done: usize, total: usize, last_bucket: usize) -> bool {
+    assert!(total > 0 && done <= total);
+    done < total && done.saturating_mul(20) / total > last_bucket
 }
 
 pub struct PaddleOcrClient {
@@ -2133,13 +2136,20 @@ fn backoff(base: Duration, attempt: u32) -> Duration {
 struct InFlightJob {
     index: usize,
     job_id: String,
+    submitted_at_ms: i64,
     next_poll_at: Instant,
     attempt: u32,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct JournalJob {
+    job_id: String,
+    submitted_at_ms: i64,
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct OcrJournal {
-    jobs: BTreeMap<usize, String>,
+    jobs: BTreeMap<usize, JournalJob>,
 }
 
 impl OcrJournal {
@@ -2153,8 +2163,11 @@ impl OcrJournal {
         let journal: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse OCR journal {}", path.display()))?;
         ensure!(
-            journal.jobs.values().all(|job_id| !job_id.trim().is_empty()),
-            "OCR journal {} contains an empty job id",
+            journal
+                .jobs
+                .values()
+                .all(|job| !job.job_id.trim().is_empty() && job.submitted_at_ms > 0),
+            "OCR journal {} contains an invalid job record",
             path.display()
         );
         Ok(journal)
@@ -2262,11 +2275,19 @@ async fn submit_all_slices(
             .expect("submit task closed without result");
         match result {
             Ok(job_id) => {
-                journal.jobs.insert(index, job_id.clone());
+                let submitted_at_ms = chrono::Utc::now().timestamp_millis();
+                journal.jobs.insert(
+                    index,
+                    JournalJob {
+                        job_id: job_id.clone(),
+                        submitted_at_ms,
+                    },
+                );
                 journal.persist(layout)?;
                 polling.push(InFlightJob {
                     index,
                     job_id,
+                    submitted_at_ms,
                     next_poll_at: Instant::now() + jittered(Duration::from_secs(5)),
                     attempt: 0,
                 });
@@ -2288,7 +2309,11 @@ async fn submit_all_slices(
     Ok(polling)
 }
 
-pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
+pub async fn run_ocr(
+    cfg: &PdfConfig,
+    pdf_path: &Path,
+    slice_pages: usize,
+) -> Result<OcrMetrics> {
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.api_base, &cfg.model)?;
@@ -2303,7 +2328,7 @@ pub async fn run_ocr_with(
     pdf: &PdfDocument,
     layout: &CacheLayout,
     plan: &[(u32, u32)],
-) -> Result<()> {
+) -> Result<OcrMetrics> {
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
     fs::create_dir_all(layout.results_dir())
@@ -2315,9 +2340,10 @@ pub async fn run_ocr_with(
         "OCR journal references a slice outside the current plan"
     );
     let mut pending = Vec::new();
+    let mut cached = 0usize;
     for (index, &(start, end)) in plan.iter().enumerate() {
         if read_cached_slice(layout, index, start, end)?.is_some() {
-            eprintln!("slice {:04} cached, skipping", index + 1);
+            cached += 1;
             journal.jobs.remove(&index);
             continue;
         }
@@ -2326,10 +2352,10 @@ pub async fn run_ocr_with(
         }
         pending.push(index);
     }
+    eprintln!("ocr cache {cached}/{} · pending {}", plan.len(), pending.len());
     if pending.is_empty() {
         journal.persist(layout)?;
-        eprintln!("all slices cached, nothing to OCR");
-        return Ok(());
+        return Ok(OcrMetrics::default());
     }
 
     journal.persist(layout)?;
@@ -2337,9 +2363,10 @@ pub async fn run_ocr_with(
     let mut polling = pending
         .iter()
         .filter_map(|index| {
-            journal.jobs.get(index).map(|job_id| InFlightJob {
+            journal.jobs.get(index).map(|job| InFlightJob {
                 index: *index,
-                job_id: job_id.clone(),
+                job_id: job.job_id.clone(),
+                submitted_at_ms: job.submitted_at_ms,
                 next_poll_at: Instant::now(),
                 attempt: 0,
             })
@@ -2358,21 +2385,29 @@ pub async fn run_ocr_with(
     let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
     let poll_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
     let download_slots = Arc::new(Semaphore::new(MAX_DOWNLOAD_CONCURRENCY));
-    let (download_tx, mut download_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<()>)>();
+    let (download_tx, mut download_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(usize, i64, Result<()>)>();
     let (poll_tx, mut poll_rx) =
         tokio::sync::mpsc::unbounded_channel::<(InFlightJob, Result<JobState, OcrError>)>();
     let mut done = 0usize;
+    let mut total_task_time = Duration::ZERO;
     let total_pending = pending.len();
 
     while done < total_pending {
         poll_tick.tick().await;
-        while let Ok((index, result)) = download_rx.try_recv() {
+        while let Ok((index, submitted_at_ms, result)) = download_rx.try_recv() {
             match result {
                 Ok(()) => {
                     journal.jobs.remove(&index);
                     journal.persist(layout)?;
+                    let elapsed_ms = chrono::Utc::now()
+                        .timestamp_millis()
+                        .checked_sub(submitted_at_ms)
+                        .context("OCR task timestamp overflow")?;
+                    ensure!(elapsed_ms >= 0, "OCR task completion predates submission");
+                    total_task_time += Duration::from_millis(elapsed_ms as u64);
                     done += 1;
-                    eprintln!("ocr done {:04} · {}/{}", index + 1, done, total_pending);
+                    eprintln!("slice {:04} OCR done · {}/{}", index + 1, done, total_pending);
                 }
                 Err(e) => bail!("slice {:04} download failed: {e:#}", index + 1),
             }
@@ -2380,13 +2415,13 @@ pub async fn run_ocr_with(
         while let Ok((job, result)) = poll_rx.try_recv() {
             match result {
                 Ok(JobState::Running) => {
+                    eprintln!("slice {:04} OCR running", job.index + 1);
                     polling.push(InFlightJob {
                         next_poll_at: Instant::now() + jittered(Duration::from_secs(10)),
                         ..job
                     });
                 }
                 Ok(JobState::Done(url)) => {
-                    eprintln!("slice {:04} OCR done, downloading", job.index + 1);
                     let client = Arc::clone(&client);
                     let slots = Arc::clone(&download_slots);
                     let tx = download_tx.clone();
@@ -2396,7 +2431,7 @@ pub async fn run_ocr_with(
                             Ok(_permit) => client.download(&url, &dest).await,
                             Err(e) => Err(anyhow::anyhow!("download semaphore closed: {e}")),
                         };
-                        let _ = tx.send((job.index, result));
+                        let _ = tx.send((job.index, job.submitted_at_ms, result));
                     });
                 }
                 Ok(JobState::Failed(message)) => {
@@ -2465,8 +2500,10 @@ pub async fn run_ocr_with(
             });
         }
     }
-    eprintln!("done");
-    Ok(())
+    Ok(OcrMetrics {
+        completed_tasks: done,
+        total_task_time,
+    })
 }
 
 /// Merge stage: project cached raw OCR results into an md bundle (offline).
@@ -2515,12 +2552,17 @@ pub fn run_merge_with(
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    render_figures(pdf_path, &report.figure_crops, &out.join("fig"), &pages)?;
-    let chapter_count = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
-    let chapters = if chapter_count == 0 {
+    let detected_bundle = detect_bundle_outcome(&report, &doc, doc_type);
+    eprintln!("{}", bundle_outcome_summary(detected_bundle));
+    let figure_metrics = render_figures(pdf_path, &report.figure_crops, &out.join("fig"), &pages)?;
+    if let Some(summary) = figure_metrics_summary(figure_metrics) {
+        eprintln!("{summary}");
+    }
+    let bundle = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
+    let chapters = if bundle.chapter_count == 0 {
         String::new()
     } else {
-        format!(", {chapter_count} chapters")
+        format!(", {} chapters", bundle.chapter_count)
     };
     println!(
         "{} -> {}/{stem}.md ({} pages, {} figures, {} warnings{chapters})",
@@ -2531,6 +2573,64 @@ pub fn run_merge_with(
         warnings.len()
     );
     Ok(())
+}
+
+pub fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs_f64();
+    if total_seconds < 60.0 {
+        return format!("{total_seconds:.1}s");
+    }
+    let total_seconds = total_seconds.round() as u64;
+    let hours = total_seconds / 3600;
+    let minutes = total_seconds % 3600 / 60;
+    let seconds = total_seconds % 60;
+    if hours == 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    }
+}
+
+pub fn ocr_metrics_summary(metrics: OcrMetrics) -> Option<String> {
+    metrics.average_task_time().map(|average| {
+        format!(
+            "ocr {} tasks · avg {}/task",
+            metrics.completed_tasks,
+            format_duration(average)
+        )
+    })
+}
+
+pub fn figure_metrics_summary(metrics: FigureRenderMetrics) -> Option<String> {
+    metrics.throughput().map(|throughput| {
+        format!(
+            "figures {}/{} · {throughput:.1} figs/s",
+            metrics.rendered, metrics.rendered
+        )
+    })
+}
+
+pub fn bundle_outcome_summary(outcome: BundleOutcome) -> String {
+    let doc_type = match outcome.doc_type {
+        DocType::Paper => "paper",
+        DocType::Book => "book",
+        DocType::Auto => unreachable!("bundle outcome must be resolved"),
+    };
+    let prefix = if outcome.forced {
+        format!("document type {doc_type} (forced)")
+    } else {
+        format!("detected {doc_type}")
+    };
+    if outcome.doc_type == DocType::Book && outcome.chapter_count > 0 {
+        let unit = if outcome.chapter_count == 1 {
+            "chapter"
+        } else {
+            "chapters"
+        };
+        format!("{prefix} · split into {} {unit}", outcome.chapter_count)
+    } else {
+        prefix
+    }
 }
 
 
