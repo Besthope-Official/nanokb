@@ -1,6 +1,6 @@
 use super::merge::{DocType, run_merge_with};
 use super::ocr::{
-    CacheLayout, DAILY_QUOTA_PAGES, OcrMetrics, ocr_metrics_summary, run_ocr_with,
+    CacheLayout, DAILY_QUOTA_PAGES, OcrMetrics, StatusLine, ocr_metrics_summary, run_ocr_with,
 };
 use super::slice::{MAX_SLICE_BYTES, PdfDocument};
 use crate::config::PdfConfig;
@@ -59,7 +59,7 @@ pub async fn convert(
                 "{}",
                 plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages)
             );
-            let metrics = run_ocr_with(cfg, &pdf_doc, &layout, &plan).await?;
+            let metrics = run_ocr_with(cfg, &pdf_doc, &layout, &plan, &stem_label(file)?).await?;
             if let Some(summary) = ocr_metrics_summary(metrics) {
                 eprintln!("{summary}");
             }
@@ -86,14 +86,22 @@ async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, cfg: &PdfConfig) ->
     eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
+    let label = pdf_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let status = StatusLine::new(label);
+    let mut written = 0usize;
     for (index, &(start, end)) in plan.iter().enumerate() {
         let dest = layout.slice_path(index);
         if dest.exists() {
             continue;
         }
         pdf.write_slice(start, end, &dest)?;
-        eprintln!("slice {:04} (pages {start}-{end})", index + 1);
+        written += 1;
+        status.update(&format!("slices {written}/{}", plan.len()));
     }
+    status.clear();
     Ok(())
 }
 
@@ -102,7 +110,15 @@ async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.api_base, &cfg.model)?;
     eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
-    run_ocr_with(cfg, &pdf, &layout, &plan).await
+    run_ocr_with(cfg, &pdf, &layout, &plan, &stem_label(pdf_path)?).await
+}
+
+fn stem_label(pdf_path: &Path) -> Result<String> {
+    pdf_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .context("PDF path has no usable stem")
 }
 
 /// Merge stage: project cached raw OCR results into an md bundle (offline).

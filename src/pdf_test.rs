@@ -406,7 +406,7 @@ async fn run_ocr_with_fully_cached_plan_does_not_require_token() {
     fs::create_dir_all(layout.results_dir()).unwrap();
     fs::write(layout.result_path(0), jsonl_line(&[page_json(&[])])).unwrap();
 
-    let metrics = run_ocr_with(&cfg, &pdf, &layout, &[(1, 1)]).await.unwrap();
+    let metrics = run_ocr_with(&cfg, &pdf, &layout, &[(1, 1)], "cached").await.unwrap();
     assert_eq!(metrics, OcrMetrics::default());
 }
 
@@ -497,11 +497,13 @@ async fn poll_parses_real_nested_result_url_shape() {
 #[tokio::test]
 async fn poll_state_machine() {
     let server = start_mock_server(vec![
+        (200, r#"{"state":"pending"}"#),
         (200, r#"{"state":"running"}"#),
         (200, r#"{"state":"done","resultJsonUrl":"http://mock/res"}"#),
     ]);
     let client = test_client(&server.url);
 
+    assert_eq!(client.poll("job-1").await.unwrap(), JobState::Running);
     assert_eq!(client.poll("job-1").await.unwrap(), JobState::Running);
     assert_eq!(
         client.poll("job-1").await.unwrap(),
@@ -596,7 +598,7 @@ async fn submit_all_slices_runs_four_way_concurrent() {
     }
 
     let mut journal = OcrJournal::default();
-    let jobs = submit_all_slices(&client, &layout, &pending, &mut journal)
+    let jobs = submit_all_slices(&client, &layout, &pending, &mut journal, &StatusLine::disabled())
         .await
         .unwrap();
 
@@ -622,7 +624,7 @@ async fn submit_all_slices_journals_successes_before_returning_error() {
     fs::write(layout.slice_path(1), b"slice 1").unwrap();
     let mut journal = OcrJournal::default();
 
-    let error = match submit_all_slices(&client, &layout, &[0, 1], &mut journal).await {
+    let error = match submit_all_slices(&client, &layout, &[0, 1], &mut journal, &StatusLine::disabled()).await {
         Ok(_) => panic!("submission should fail"),
         Err(error) => error,
     };

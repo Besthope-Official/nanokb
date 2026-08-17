@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -489,7 +490,8 @@ impl PaddleOcrClient {
                 })?,
             )),
             "failed" => Ok(JobState::Failed(response_message(&body))),
-            "running" => Ok(JobState::Running),
+            // `pending` is the server-side queue (排队中); poll again later.
+            "pending" | "running" => Ok(JobState::Running),
             other => Err(OcrError {
                 status,
                 code: None,
@@ -742,11 +744,63 @@ const MAX_SUBMIT_CONCURRENCY: usize = 4;
 const MAX_DOWNLOAD_CONCURRENCY: usize = 8;
 const SUBMIT_PERIOD: Duration = Duration::from_millis(500);
 
+/// Single-line, in-place stderr progress for long-running stages: redraws the
+/// same terminal line (CR + erase-line) instead of appending one line per
+/// event. Draws nothing when stderr is not a tty, so piped logs keep only the
+/// milestone lines.
+pub(crate) struct StatusLine {
+    enabled: bool,
+    label: String,
+}
+
+impl StatusLine {
+    pub(crate) fn new(label: &str) -> Self {
+        Self {
+            enabled: std::io::stderr().is_terminal(),
+            label: label.to_string(),
+        }
+    }
+
+    /// A line that never draws (tests, non-interactive callers).
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self { enabled: false, label: String::new() }
+    }
+
+    /// Redraw the status in place.
+    pub(crate) fn update(&self, status: &str) {
+        if !self.enabled {
+            return;
+        }
+        if self.label.is_empty() {
+            eprint!("\r\x1b[2K{status}");
+        } else {
+            eprint!("\r\x1b[2K[{}] {status}", self.label);
+        }
+    }
+
+    /// Print a milestone on its own line above the status area.
+    pub(crate) fn log(&self, message: &str) {
+        if self.enabled {
+            eprint!("\r\x1b[2K");
+        }
+        eprintln!("{message}");
+    }
+
+    /// Erase the status line, leaving a clean slate for following output.
+    pub(crate) fn clear(&self) {
+        if self.enabled {
+            eprint!("\r\x1b[2K");
+        }
+    }
+}
+
 pub(crate) async fn submit_all_slices(
     client: &Arc<PaddleOcrClient>,
     layout: &CacheLayout,
     pending: &[usize],
     journal: &mut OcrJournal,
+    status: &StatusLine,
 ) -> Result<Vec<InFlightJob>> {
     let submit_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<String>)>();
@@ -792,7 +846,7 @@ pub(crate) async fn submit_all_slices(
                     next_poll_at: Instant::now() + jittered(Duration::from_secs(5)),
                     attempt: 0,
                 });
-                eprintln!("submit {:04} · {}/{}", index + 1, submitted + 1, pending.len());
+                status.update(&format!("submit {}/{}", submitted + 1, pending.len()));
             }
             Err(e) => {
                 if first_error.is_none() {
@@ -811,13 +865,16 @@ pub(crate) async fn submit_all_slices(
 }
 
 /// OCR every uncached slice using a precomputed plan and layout, so a
-/// full-pipeline run shares one PDF open/hash/plan across stages.
+/// full-pipeline run shares one PDF open/hash/plan across stages. `label`
+/// prefixes the in-place progress line (the pdf stem).
 pub(crate) async fn run_ocr_with(
     cfg: &PdfConfig,
     pdf: &PdfDocument,
     layout: &CacheLayout,
     plan: &[(u32, u32)],
+    label: &str,
 ) -> Result<OcrMetrics> {
+    let status = StatusLine::new(label);
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
     fs::create_dir_all(layout.results_dir())
@@ -830,6 +887,7 @@ pub(crate) async fn run_ocr_with(
     );
     let mut pending = Vec::new();
     let mut cached = 0usize;
+    let mut written = 0usize;
     for (index, &(start, end)) in plan.iter().enumerate() {
         if read_cached_slice(layout, index, start, end)?.is_some() {
             cached += 1;
@@ -838,6 +896,8 @@ pub(crate) async fn run_ocr_with(
         }
         if !layout.slice_path(index).exists() {
             pdf.write_slice(start, end, &layout.slice_path(index))?;
+            written += 1;
+            status.update(&format!("slices {written} written"));
         }
         pending.push(index);
     }
@@ -869,7 +929,9 @@ pub(crate) async fn run_ocr_with(
     if !polling.is_empty() {
         eprintln!("re-polling {} in-flight OCR jobs", polling.len());
     }
-    polling.extend(submit_all_slices(&client, layout, &to_submit, &mut journal).await?);
+    polling.extend(
+        submit_all_slices(&client, layout, &to_submit, &mut journal, &status).await?,
+    );
 
     let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
     let poll_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
@@ -896,19 +958,22 @@ pub(crate) async fn run_ocr_with(
                     ensure!(elapsed_ms >= 0, "OCR task completion predates submission");
                     total_task_time += Duration::from_millis(elapsed_ms as u64);
                     done += 1;
-                    eprintln!("slice {:04} OCR done · {}/{}", index + 1, done, total_pending);
+                    status.update(&format!("ocr done {done}/{total_pending} · running {}", polling.len()));
                 }
-                Err(e) => bail!("slice {:04} download failed: {e:#}", index + 1),
+                Err(e) => {
+                    status.clear();
+                    bail!("slice {:04} download failed: {e:#}", index + 1);
+                }
             }
         }
         while let Ok((job, result)) = poll_rx.try_recv() {
             match result {
                 Ok(JobState::Running) => {
-                    eprintln!("slice {:04} OCR running", job.index + 1);
                     polling.push(InFlightJob {
                         next_poll_at: Instant::now() + jittered(Duration::from_secs(10)),
                         ..job
                     });
+                    status.update(&format!("ocr done {done}/{total_pending} · running {}", polling.len()));
                 }
                 Ok(JobState::Done(url)) => {
                     let client = Arc::clone(&client);
@@ -926,15 +991,16 @@ pub(crate) async fn run_ocr_with(
                 Ok(JobState::Failed(message)) => {
                     journal.jobs.remove(&job.index);
                     journal.persist(layout)?;
+                    status.clear();
                     bail!("slice {:04} OCR job failed: {message}", job.index + 1)
                 }
                 Err(e) if e.kind == ApiErrorKind::Transient => {
                     let delay = backoff(Duration::from_secs(10), job.attempt);
-                    eprintln!(
+                    status.log(&format!(
                         "slice {:04} poll transient ({}), retrying in {delay:?}",
                         job.index + 1,
                         e.message
-                    );
+                    ));
                     polling.push(InFlightJob {
                         next_poll_at: Instant::now() + delay,
                         attempt: job.attempt + 1,
@@ -944,6 +1010,7 @@ pub(crate) async fn run_ocr_with(
                 Err(e) => {
                     journal.jobs.remove(&job.index);
                     journal.persist(layout)?;
+                    status.clear();
                     bail!("slice {:04} poll failed: {e}", job.index + 1)
                 }
             }
@@ -989,6 +1056,7 @@ pub(crate) async fn run_ocr_with(
             });
         }
     }
+    status.clear();
     Ok(OcrMetrics {
         completed_tasks: done,
         total_task_time,

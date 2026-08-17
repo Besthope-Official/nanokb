@@ -1,4 +1,6 @@
-use super::ocr::{Bbox, BlockLabel, CacheLayout, Page, PageBlock, read_cached_slice, write_file_atomic};
+use super::ocr::{
+    Bbox, BlockLabel, CacheLayout, Page, PageBlock, StatusLine, read_cached_slice, write_file_atomic,
+};
 use crate::parser::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1242,6 +1244,7 @@ pub fn render_figures(
             .with_context(|| format!("PDF has no page {page_no}"))?;
     }
     let started_at = std::time::Instant::now();
+    let status = StatusLine::new(pdf_path.file_stem().and_then(|s| s.to_str()).unwrap_or_default());
     let total = crops.len();
     let mut rendered = 0usize;
     let mut last_progress_bucket = 0usize;
@@ -1279,10 +1282,11 @@ pub fn render_figures(
             rendered += 1;
             if should_report_figure_progress(rendered, total, last_progress_bucket) {
                 last_progress_bucket = rendered.saturating_mul(20) / total;
-                eprintln!("figures {rendered}/{total}");
+                status.update(&format!("figures {rendered}/{total}"));
             }
         }
     }
+    status.clear();
     Ok(FigureRenderMetrics {
         rendered,
         elapsed: started_at.elapsed(),

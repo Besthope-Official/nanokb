@@ -24,7 +24,7 @@ pub(crate) use merge::{
 };
 #[cfg(test)]
 pub(crate) use ocr::{
-    JournalJob, OcrJournal, classify_error, format_duration, ocr_metrics_summary,
+    JournalJob, OcrJournal, StatusLine, classify_error, format_duration, ocr_metrics_summary,
     read_cached_slice, run_ocr_with, submit_all_slices, write_file_atomic,
 };
 // Names pdf_test.rs expects to inherit via `use super::*` from the former
