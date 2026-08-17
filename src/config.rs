@@ -15,6 +15,8 @@ pub struct AppConfig {
     pub model: ModelConfig,
     #[serde(default)]
     pub pipeline: PipelineConfig,
+    #[serde(default)]
+    pub pdf: PdfConfig,
 }
 
 /// Chunking parameters picked at kb-creation time and frozen into kb_meta.
@@ -106,6 +108,43 @@ impl Default for PipelineConfig {
             worker_error_retry_secs: default_worker_error_retry_secs(),
         }
     }
+}
+
+/// PaddleOCR import settings for the `nanokb pdf` commands; not part of kb state.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdfConfig {
+    #[serde(default = "default_pdf_api_base")]
+    pub api_base: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default = "default_pdf_model")]
+    pub model: String,
+    #[serde(default = "default_pdf_slice_pages")]
+    pub slice_pages: usize,
+}
+
+impl Default for PdfConfig {
+    fn default() -> Self {
+        Self {
+            api_base: default_pdf_api_base(),
+            access_token: String::new(),
+            model: default_pdf_model(),
+            slice_pages: default_pdf_slice_pages(),
+        }
+    }
+}
+
+fn default_pdf_api_base() -> String {
+    "https://paddleocr.aistudio-app.com".to_string()
+}
+
+fn default_pdf_model() -> String {
+    "PaddleOCR-VL-1.6".to_string()
+}
+
+fn default_pdf_slice_pages() -> usize {
+    20
 }
 
 impl PipelineConfig {
@@ -559,8 +598,13 @@ fn load_from_sources(
     if let Some(name) = unresolved_placeholder(&value) {
         bail!("unresolved configuration placeholder: {name}");
     }
-    let config: AppConfig = yaml_serde::from_value(value)
+    let mut config: AppConfig = yaml_serde::from_value(value)
         .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))?;
+    if config.pdf.access_token.is_empty()
+        && let Some(access_token) = variables.get("PADDLEOCR_ACCESS_TOKEN")
+    {
+        config.pdf.access_token = access_token.clone();
+    }
     if let Some(mode) = &config.pipeline.retrieval.mode {
         QueryMode::parse(mode)?;
     }

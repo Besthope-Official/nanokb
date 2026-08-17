@@ -32,6 +32,16 @@ pub mod task;
 pub mod pipeline;
 pub use pipeline::Pipeline;
 
+#[cfg(feature = "pdf")]
+pub mod pdf;
+#[cfg(feature = "pdf")]
+pub use pdf::{
+    ApiErrorKind, Bbox, BlockLabel, CacheLayout, DocType, FigureCrop, JobState, OcrError, Page,
+    PageBlock, PaddleOcrClient, PdfDocument, ProjectReport, cache_key, collect_diagnostics,
+    frontmatter, pair_figures, parse_jsonl, project, render_figures,
+    render_markdown, validate_structure, write_bundle,
+};
+
 pub mod prune;
 pub use prune::PruneRule;
 

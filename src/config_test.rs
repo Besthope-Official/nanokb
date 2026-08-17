@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-const MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: BAAI/bge-m3\n      api_base: \"https://api.siliconflow.cn/v1\"\n      api_key: \"sk-test-key\"\n";
+const MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: test-embed-model\n      api_base: \"https://api.example.com/v1\"\n      api_key: \"sk-test-key\"\n";
 
 struct TestDirectory(PathBuf);
 
@@ -35,12 +35,12 @@ fn loads_placeholders_from_adjacent_dotenv() {
     let config_path = directory.path().join("config.yaml");
     fs::write(
         &config_path,
-        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embeddings:\n    bge_m3:\n      model_name: BAAI/bge-m3\n      api_base: \"{BGE_M3_EMBED_API_BASE}\"\n      api_key: \"{BGE_M3_EMBED_API_KEY}\"\npipeline:\n  embedding: bge_m3\n",
+        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/nanokb\"\nmodel:\n  embeddings:\n    bge_m3:\n      model_name: test-embed-model\n      api_base: \"{BGE_M3_EMBED_API_BASE}\"\n      api_key: \"{BGE_M3_EMBED_API_KEY}\"\npipeline:\n  embedding: bge_m3\n",
     )
     .unwrap();
     fs::write(
         directory.path().join(".env"),
-        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\nBGE_M3_EMBED_API_BASE=https://api.siliconflow.cn/v1\nBGE_M3_EMBED_API_KEY=sk-test-key\n",
+        "DB_USER=nanokb\nDB_PASSWORD=secret\nDB_HOST=postgres\nDB_PORT=5432\nBGE_M3_EMBED_API_BASE=https://api.example.com/v1\nBGE_M3_EMBED_API_KEY=sk-test-key\n",
     )
     .unwrap();
 
@@ -51,7 +51,7 @@ fn loads_placeholders_from_adjacent_dotenv() {
         "postgres://nanokb:secret@postgres:5432/nanokb"
     );
     let embedding = config.embedding().unwrap();
-    assert_eq!(embedding.api_base, "https://api.siliconflow.cn/v1");
+    assert_eq!(embedding.api_base, "https://api.example.com/v1");
     assert_eq!(embedding.api_key, "sk-test-key");
 }
 
@@ -77,6 +77,31 @@ fn process_environment_overrides_dotenv() {
     let config = load_from_sources(&config_path, &[], process_environment).unwrap();
 
     assert_eq!(config.database.url, "postgres://from-process");
+}
+
+#[test]
+fn pdf_access_token_is_optional_and_loaded_from_environment() {
+    let directory = TestDirectory::new();
+    let config_path = directory.path().join("config.yaml");
+    fs::write(
+        &config_path,
+        format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}"),
+    )
+    .unwrap();
+
+    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
+    assert!(config.pdf.access_token.is_empty());
+
+    let config = load_from_sources(
+        &config_path,
+        &[],
+        HashMap::from([(
+            "PADDLEOCR_ACCESS_TOKEN".to_string(),
+            "pdf-token".to_string(),
+        )]),
+    )
+    .unwrap();
+    assert_eq!(config.pdf.access_token, "pdf-token");
 }
 
 #[test]
@@ -130,7 +155,7 @@ fn rejects_unknown_configuration_fields() {
 fn rejects_pipeline_reference_to_undefined_embedding_provider() {
     let config = parse_config(
         &format!(
-            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  embedding: qwen3\n"
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pipeline:\n  embedding: other\n"
         ),
         &HashMap::new(),
     )
@@ -140,7 +165,7 @@ fn rejects_pipeline_reference_to_undefined_embedding_provider() {
 
     assert_eq!(
         error.to_string(),
-        "pipeline.embedding refers to unknown provider \"qwen3\"; \
+        "pipeline.embedding refers to unknown provider \"other\"; \
          model.embeddings defines: default"
     );
 }
@@ -295,10 +320,10 @@ fn index_config_rejects_unknown_field() {
 #[test]
 fn parses_llm_config_with_defaults() {
     let config: LlmConfig = serde_json::from_str(
-        r#"{"model_name":"deepseek-v4-flash-0731","api_base":"https://api.deepseek.com/v1","api_key":"sk-test"}"#,
+        r#"{"model_name":"test-llm-model","api_base":"https://api.example.com/v1","api_key":"sk-test"}"#,
     )
     .unwrap();
-    assert_eq!(config.model_name, "deepseek-v4-flash-0731");
+    assert_eq!(config.model_name, "test-llm-model");
     assert_eq!(config.temperature, 0.2);
     assert_eq!(config.max_tokens, 512);
     assert_eq!(config.concurrency, 4);
@@ -319,7 +344,38 @@ fn pipeline_config_defaults_llm_to_none() {
     assert!(config.llm.is_none());
 }
 
-const FULL_MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: BAAI/bge-m3\n      api_base: \"https://api.siliconflow.cn/v1\"\n      api_key: \"sk-test-key\"\n  llms:\n    deepseek:\n      model_name: deepseek-v4-flash-0731\n      api_base: https://api.deepseek.com/v1\n      api_key: sk-test\n";
+#[test]
+fn pdf_config_defaults_when_absent() {
+    let config = parse_config(
+        &format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}"),
+        &HashMap::new(),
+    )
+    .unwrap();
+
+    assert_eq!(config.pdf.api_base, "https://paddleocr.aistudio-app.com");
+    assert_eq!(config.pdf.model, "PaddleOCR-VL-1.6");
+    assert_eq!(config.pdf.slice_pages, 20);
+    assert!(config.pdf.access_token.is_empty());
+}
+
+#[test]
+fn pdf_config_rejects_unknown_field() {
+    let error = parse_config(
+        &format!(
+            "database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}pdf:\n  wat: 1\n"
+        ),
+        &HashMap::new(),
+    )
+    .err()
+    .unwrap();
+
+    assert!(
+        error.to_string().contains("unknown field `wat`"),
+        "{error:#}"
+    );
+}
+
+const FULL_MODEL_BLOCK: &str = "model:\n  embeddings:\n    default:\n      model_name: test-embed-model\n      api_base: \"https://api.example.com/v1\"\n      api_key: \"sk-test-key\"\n  llms:\n    deepseek:\n      model_name: test-llm-model\n      api_base: https://api.example.com/v1\n      api_key: sk-test\n";
 
 const LLM_PIPELINE_BLOCK: &str = "pipeline:\n  llm: deepseek\n";
 
@@ -334,7 +390,7 @@ fn llm_resolves_provider_by_name() {
     .unwrap();
 
     let llm = config.llm().unwrap();
-    assert_eq!(llm.model_name, "deepseek-v4-flash-0731");
+    assert_eq!(llm.model_name, "test-llm-model");
 }
 
 #[test]
@@ -365,8 +421,8 @@ fn llm_for_model_looks_up_by_model_name() {
     )
     .unwrap();
 
-    let llm = config.llm_for_model("deepseek-v4-flash-0731").unwrap();
-    assert_eq!(llm.model_name, "deepseek-v4-flash-0731");
+    let llm = config.llm_for_model("test-llm-model").unwrap();
+    assert_eq!(llm.model_name, "test-llm-model");
 }
 
 #[test]

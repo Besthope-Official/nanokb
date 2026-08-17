@@ -20,3 +20,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Build (pdf feature)
+      run: cargo build --verbose --features pdf
+    - name: Run tests (pdf feature)
+      run: cargo test --verbose --features pdf
