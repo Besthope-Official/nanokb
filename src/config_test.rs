@@ -80,6 +80,31 @@ fn process_environment_overrides_dotenv() {
 }
 
 #[test]
+fn pdf_access_token_is_optional_and_loaded_from_environment() {
+    let directory = TestDirectory::new();
+    let config_path = directory.path().join("config.yaml");
+    fs::write(
+        &config_path,
+        format!("database:\n  url: postgres://localhost/nanokb\n{MODEL_BLOCK}"),
+    )
+    .unwrap();
+
+    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
+    assert!(config.pdf.access_token.is_empty());
+
+    let config = load_from_sources(
+        &config_path,
+        &[],
+        HashMap::from([(
+            "PADDLEOCR_ACCESS_TOKEN".to_string(),
+            "pdf-token".to_string(),
+        )]),
+    )
+    .unwrap();
+    assert_eq!(config.pdf.access_token, "pdf-token");
+}
+
+#[test]
 fn rejects_unresolved_placeholders() {
     let variables = HashMap::from([("DB_USER".to_string(), "nanokb".to_string())]);
     let error = parse_config(

@@ -3,6 +3,7 @@ use crate::parser::{DocumentMetadata, Node, NodeId, NodeKind, StructuredDocument
 use anyhow::{Context, Result, bail, ensure};
 use lopdf::{Document, Object, ObjectId, dictionary};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -24,7 +25,7 @@ const CLIENT_PLATFORM: &str = "nanokb";
 /// shifts pixels and bboxes no longer match a local PDF render.
 const OCR_OPTIONAL_PAYLOAD: &str = r#"{"useDocUnwarping":false}"#;
 const OCR_CACHE_VERSION: &str = "unwarp0";
-const CODE_KEYS: &[&str] = &["code", "err_code", "error_code"];
+const CODE_KEYS: &[&str] = &["code", "errorCode", "err_code", "error_code"];
 const MESSAGE_KEYS: &[&str] = &["message", "Message", "msg", "errorMsg", "error_msg", "errMsg"];
 
 #[derive(Debug)]
@@ -128,7 +129,12 @@ impl PdfDocument {
 
         let mut slice = Document::with_version(self.doc.version.clone());
         for &id in &kept_objects {
-            slice.objects.insert(id, self.doc.objects[&id].clone());
+            let object = self
+                .doc
+                .objects
+                .get(&id)
+                .with_context(|| format!("PDF object {id:?} is referenced but missing"))?;
+            slice.objects.insert(id, object.clone());
         }
         slice.max_id = self.doc.max_id;
         slice.objects.insert(
@@ -252,7 +258,7 @@ fn filter_page_tree(doc: &mut Document, node: ObjectId, kept_pages: &BTreeSet<Ob
     count
 }
 
-pub fn cache_key(bytes: &[u8], slice_pages: usize, model: &str) -> String {
+pub fn cache_key(bytes: &[u8], slice_pages: usize, api_base: &str, model: &str) -> String {
     let hash = Sha256::digest(bytes);
     let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
     let slug: String = model
@@ -265,7 +271,16 @@ pub fn cache_key(bytes: &[u8], slice_pages: usize, model: &str) -> String {
             }
         })
         .collect();
-    format!("{hex}-{slice_pages}p-{slug}-{OCR_CACHE_VERSION}")
+    let mut ocr = Sha256::new();
+    ocr.update(api_base.trim_end_matches('/').as_bytes());
+    ocr.update([0]);
+    ocr.update(model.as_bytes());
+    ocr.update([0]);
+    ocr.update(OCR_OPTIONAL_PAYLOAD.as_bytes());
+    ocr.update([0]);
+    ocr.update(OCR_CACHE_VERSION.as_bytes());
+    let ocr_hash = format!("{:x}", ocr.finalize());
+    format!("{hex}-{slice_pages}p-{slug}-{}", &ocr_hash[..16])
 }
 
 pub struct CacheLayout {
@@ -273,7 +288,12 @@ pub struct CacheLayout {
 }
 
 impl CacheLayout {
-    pub fn for_pdf(pdf_path: &Path, slice_pages: usize, model: &str) -> Result<Self> {
+    pub fn for_pdf(
+        pdf_path: &Path,
+        slice_pages: usize,
+        api_base: &str,
+        model: &str,
+    ) -> Result<Self> {
         let bytes = fs::read(pdf_path)
             .with_context(|| format!("failed to read {}", pdf_path.display()))?;
         let stem = pdf_path
@@ -288,7 +308,7 @@ impl CacheLayout {
             root: parent
                 .join(".nanokb-cache")
                 .join(stem)
-                .join(cache_key(&bytes, slice_pages, model)),
+                .join(cache_key(&bytes, slice_pages, api_base, model)),
         })
     }
 
@@ -308,8 +328,8 @@ impl CacheLayout {
         self.results_dir().join(format!("{:04}.jsonl", index + 1))
     }
 
-    pub fn has_result(&self, index: usize) -> bool {
-        self.result_path(index).exists()
+    fn journal_path(&self) -> PathBuf {
+        self.root.join("in-flight.json")
     }
 }
 
@@ -446,8 +466,16 @@ pub fn parse_jsonl(text: &str, base_page: usize) -> Result<Vec<Page>> {
 
 fn parse_page(value: &Value, page_no: usize) -> Result<Page> {
     let pruned = value.get("prunedResult").context("page missing prunedResult")?;
-    let width = pruned.get("width").and_then(Value::as_f64).unwrap_or(0.0);
-    let height = pruned.get("height").and_then(Value::as_f64).unwrap_or(0.0);
+    let width = pruned
+        .get("width")
+        .and_then(Value::as_f64)
+        .context("page missing numeric width")?;
+    let height = pruned
+        .get("height")
+        .and_then(Value::as_f64)
+        .context("page missing numeric height")?;
+    ensure!(width.is_finite() && width > 0.0, "page width must be positive");
+    ensure!(height.is_finite() && height > 0.0, "page height must be positive");
     let angle = pruned
         .get("doc_preprocessor_res")
         .and_then(|p| p.get("angle"))
@@ -485,6 +513,15 @@ fn parse_page(value: &Value, page_no: usize) -> Result<Page> {
             .unwrap_or_default()
             .to_string();
         let bbox = parse_bbox(item.get("block_bbox").context("block missing block_bbox")?)?;
+        ensure!(
+            bbox.x1 >= 0
+                && bbox.y1 >= 0
+                && bbox.x1 < bbox.x2
+                && bbox.y1 < bbox.y2
+                && bbox.x2 as f64 <= width
+                && bbox.y2 as f64 <= height,
+            "block_bbox {bbox:?} is outside page bounds {width}x{height}"
+        );
         blocks.push(PageBlock { label, content, bbox });
     }
     Ok(Page {
@@ -535,22 +572,22 @@ fn parse_bbox(value: &Value) -> Result<Bbox> {
 
 pub fn infer_heading_level(title: &str) -> (usize, &str) {
     let trimmed = title.trim();
-    let mut level = 0usize;
-    let mut rest = trimmed;
-    loop {
-        let digits_end = rest
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(rest.len());
-        if digits_end == 0 || digits_end >= rest.len() || rest.as_bytes()[digits_end] != b'.' {
-            break;
-        }
-        level += 1;
-        rest = &rest[digits_end + 1..];
-    }
-    if level == 0 {
-        (1, trimmed)
+    let Some(separator) = trimmed.find(char::is_whitespace) else {
+        return (1, trimmed);
+    };
+    let prefix = &trimmed[..separator];
+    let number = prefix.trim_end_matches('.');
+    let level = number.split('.').count();
+    let numbered = prefix.contains('.')
+        && !number.is_empty()
+        && number.split('.').all(|part| {
+            !part.is_empty() && part.chars().all(|character| character.is_ascii_digit())
+        });
+    let remainder = trimmed[separator..].trim();
+    if numbered && !remainder.is_empty() {
+        (level, remainder)
     } else {
-        (level, rest.trim())
+        (1, trimmed)
     }
 }
 
@@ -1027,7 +1064,7 @@ fn extract_affiliations(blocks: &[PageBlock]) -> Vec<String> {
             BlockLabel::Ignored(label) if label == "footnote" => {
                 for segment in block.content.split('$') {
                     let has_email = segment.contains('@');
-                    let correspondence = segment.to_lowercase().find("correspondence to:");
+                    let correspondence = find_ascii_case_insensitive(segment, "correspondence to:");
                     let cut = correspondence
                         .map(|index| {
                             segment
@@ -1049,6 +1086,14 @@ fn extract_affiliations(blocks: &[PageBlock]) -> Vec<String> {
         }
     }
     affiliations
+}
+
+fn find_ascii_case_insensitive(text: &str, needle: &str) -> Option<usize> {
+    text.char_indices().find_map(|(index, _)| {
+        text.get(index..index + needle.len())
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
+            .then_some(index)
+    })
 }
 
 fn push_affiliation(text: &str, affiliations: &mut Vec<String>, seen: &mut BTreeSet<String>) {
@@ -1380,12 +1425,13 @@ pub fn write_bundle(
     doc_type: DocType,
 ) -> Result<usize> {
     fs::create_dir_all(out).with_context(|| format!("failed to create {}", out.display()))?;
+    let chapters = detect_chapters(report, doc);
     let doc_type = match doc_type {
         DocType::Auto => {
-            if report.doc_title_headings.is_empty() {
-                DocType::Paper
-            } else {
+            if chapters.iter().any(|(_, title)| is_chapter_title(title)) || chapters.len() >= 2 {
                 DocType::Book
+            } else {
+                DocType::Paper
             }
         }
         other => other,
@@ -1396,7 +1442,6 @@ pub fn write_bundle(
             Ok(0)
         }
         DocType::Book => {
-            let chapters = detect_chapters(report, doc);
             if chapters.is_empty() {
                 write_book_single_doc(out, stem, report, doc, at)?;
                 eprintln!("warning: {}", book_degradation_warning(stem));
@@ -1438,10 +1483,10 @@ fn is_chapter_title(text: &str) -> bool {
     let lower = text.trim_start().to_ascii_lowercase();
     for prefix in ["chapter ", "part ", "appendix "] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.split('.').next().unwrap_or(rest);
+            let token = rest.split('.').next().unwrap_or(rest).trim();
             return !token.is_empty()
                 && token.chars().all(|c| c.is_alphanumeric())
-                && rest.len() > token.len();
+                && (rest.trim() == token || rest.trim_start().starts_with(&format!("{token}.")));
         }
     }
     false
@@ -1463,7 +1508,12 @@ fn detect_chapters(report: &ProjectReport, doc: &StructuredDocument) -> Vec<(Nod
                 return None;
             };
             let title = one_line(title);
-            (doc_title_nodes.contains(&child) || is_chapter_title(&title)).then_some((child, title))
+            let repeated_title = report
+                .title
+                .as_deref()
+                .is_some_and(|document_title| one_line(document_title).eq_ignore_ascii_case(&title));
+            ((doc_title_nodes.contains(&child) && !repeated_title) || is_chapter_title(&title))
+                .then_some((child, title))
         })
         .collect()
 }
@@ -1631,6 +1681,7 @@ pub fn render_figures(
     let mut by_page: BTreeMap<usize, Vec<(PathBuf, Bbox)>> = BTreeMap::new();
     for crop in crops {
         ensure!(valid_figure_src(&crop.src), "invalid internal figure src {:?}", crop.src);
+        ensure!(crop.page_no >= 1, "figure {} has invalid page number {}", crop.src, crop.page_no);
         ensure!(
             crop.bbox.x1 < crop.bbox.x2 && crop.bbox.y1 < crop.bbox.y2,
             "figure {} has invalid bbox {:?}",
@@ -1657,20 +1708,38 @@ pub fn render_figures(
     let document = pdfium
         .load_pdf_from_file(pdf_path, None)
         .with_context(|| format!("failed to open PDF {}", pdf_path.display()))?;
-    for (page_no, figures) in &by_page {
+    for page_no in by_page.keys() {
         let ocr_page = pages
             .get(page_no - 1)
             .with_context(|| format!("no OCR page data for page {page_no}"))?;
+        ensure!(
+            ocr_page.width.is_finite() && ocr_page.width > 0.0,
+            "OCR page {page_no} width must be positive"
+        );
+        ensure!(
+            ocr_page.height.is_finite() && ocr_page.height > 0.0,
+            "OCR page {page_no} height must be positive"
+        );
         ensure!(
             ocr_page.angle == 0.0,
             "page {page_no} is rotated by {} degrees; figure rendering does not support it",
             ocr_page.angle
         );
+        document
+            .pages()
+            .get((page_no - 1) as pdfium_render::prelude::PdfPageIndex)
+            .with_context(|| format!("PDF has no page {page_no}"))?;
+    }
+    for (page_no, figures) in &by_page {
+        let ocr_page = pages
+            .get(page_no - 1)
+            .with_context(|| format!("no OCR page data for page {page_no}"))?;
         let page = document
             .pages()
             .get((page_no - 1) as pdfium_render::prelude::PdfPageIndex)
             .with_context(|| format!("PDF has no page {page_no}"))?;
         let px_per_pt = ocr_page.width / page.width().value as f64;
+        ensure!(px_per_pt.is_finite() && px_per_pt > 0.0, "page {page_no} has invalid render scale");
         let to_render_px = |value: i64| (value as f64 / px_per_pt * 300.0 / 72.0).round() as u32;
         let bitmap = page
             .render_with_config(
@@ -1683,8 +1752,9 @@ pub fn render_figures(
         for (dest, bbox) in figures {
             let (left, top) = (to_render_px(bbox.x1), to_render_px(bbox.y1));
             let (right, bottom) = (to_render_px(bbox.x2), to_render_px(bbox.y2));
-            let right = right.min(width.saturating_sub(1)).max(left + 1);
-            let bottom = bottom.min(height.saturating_sub(1)).max(top + 1);
+            ensure!(left < width && top < height, "figure {} starts outside rendered page", dest.display());
+            let right = right.min(width).max(left + 1);
+            let bottom = bottom.min(height).max(top + 1);
             let cropped = image.crop_imm(left, top, right - left, bottom - top);
             let mut encoded = std::io::Cursor::new(Vec::new());
             cropped
@@ -2027,6 +2097,67 @@ struct InFlightJob {
     attempt: u32,
 }
 
+#[derive(Default, Deserialize, Serialize)]
+struct OcrJournal {
+    jobs: BTreeMap<usize, String>,
+}
+
+impl OcrJournal {
+    fn load(layout: &CacheLayout) -> Result<Self> {
+        let path = layout.journal_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read OCR journal {}", path.display()))?;
+        let journal: Self = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse OCR journal {}", path.display()))?;
+        ensure!(
+            journal.jobs.values().all(|job_id| !job_id.trim().is_empty()),
+            "OCR journal {} contains an empty job id",
+            path.display()
+        );
+        Ok(journal)
+    }
+
+    fn persist(&self, layout: &CacheLayout) -> Result<()> {
+        let bytes = serde_json::to_vec(self).context("failed to serialize OCR journal")?;
+        write_file_atomic(&layout.journal_path(), &bytes)
+    }
+}
+
+fn read_cached_slice(
+    layout: &CacheLayout,
+    index: usize,
+    start: u32,
+    end: u32,
+) -> Result<Option<Vec<Page>>> {
+    let result_path = layout.result_path(index);
+    if !result_path.exists() {
+        return Ok(None);
+    }
+    let jsonl = fs::read_to_string(&result_path)
+        .with_context(|| format!("failed to read {}", result_path.display()))?;
+    let pages = parse_jsonl(&jsonl, start as usize)
+        .with_context(|| format!("cached OCR result {} is invalid", result_path.display()))?;
+    let expected_pages = (end - start + 1) as usize;
+    ensure!(
+        pages.len() == expected_pages,
+        "slice {:04} OCR returned {} pages, expected {expected_pages}",
+        index + 1,
+        pages.len()
+    );
+    ensure!(
+        pages
+            .iter()
+            .map(|page| page.page_no)
+            .eq(start as usize..=end as usize),
+        "slice {:04} OCR page numbers are not contiguous from {start} to {end}",
+        index + 1
+    );
+    Ok(Some(pages))
+}
+
 /// One-line plan summary, shared by dry-run and every stage entry point.
 pub fn plan_summary(pdf_path: &Path, page_count: u32, slices: usize, slice_pages: usize) -> String {
     format!(
@@ -2035,10 +2166,10 @@ pub fn plan_summary(pdf_path: &Path, page_count: u32, slices: usize, slice_pages
     )
 }
 
-pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, model: &str) -> Result<()> {
+pub async fn slice_to_cache(pdf_path: &Path, slice_pages: usize, cfg: &PdfConfig) -> Result<()> {
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
-    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, model)?;
+    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.api_base, &cfg.model)?;
     eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
     fs::create_dir_all(layout.slices_dir())
         .with_context(|| format!("failed to create {}", layout.slices_dir().display()))?;
@@ -2061,6 +2192,7 @@ async fn submit_all_slices(
     client: &Arc<PaddleOcrClient>,
     layout: &CacheLayout,
     pending: &[usize],
+    journal: &mut OcrJournal,
 ) -> Result<Vec<InFlightJob>> {
     let submit_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
     let (submit_tx, mut submit_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, Result<String>)>();
@@ -2082,6 +2214,7 @@ async fn submit_all_slices(
     drop(submit_tx);
 
     let mut polling = Vec::with_capacity(spawned);
+    let mut first_error = None;
     for submitted in 0..spawned {
         let (index, result) = submit_rx
             .recv()
@@ -2089,6 +2222,8 @@ async fn submit_all_slices(
             .expect("submit task closed without result");
         match result {
             Ok(job_id) => {
+                journal.jobs.insert(index, job_id.clone());
+                journal.persist(layout)?;
                 polling.push(InFlightJob {
                     index,
                     job_id,
@@ -2097,25 +2232,34 @@ async fn submit_all_slices(
                 });
                 eprintln!("submit {:04} · {}/{}", index + 1, submitted + 1, pending.len());
             }
-            Err(e) => bail!("slice {:04} submit failed: {e:#}", index + 1),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(anyhow::anyhow!(
+                        "slice {:04} submit failed: {e:#}",
+                        index + 1
+                    ));
+                }
+            }
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
     }
     Ok(polling)
 }
 
 pub async fn run_ocr(cfg: &PdfConfig, pdf_path: &Path, slice_pages: usize) -> Result<()> {
-    let client = Arc::new(PaddleOcrClient::from_config(cfg)?);
     let pdf = PdfDocument::open(pdf_path)?;
     let plan = pdf.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
-    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
+    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.api_base, &cfg.model)?;
     eprintln!("{}", plan_summary(pdf_path, pdf.page_count(), plan.len(), slice_pages));
-    run_ocr_with(&client, &pdf, &layout, &plan).await
+    run_ocr_with(cfg, &pdf, &layout, &plan).await
 }
 
 /// OCR every uncached slice using a precomputed plan and layout, so a
 /// full-pipeline run shares one PDF open/hash/plan across stages.
 pub async fn run_ocr_with(
-    client: &Arc<PaddleOcrClient>,
+    cfg: &PdfConfig,
     pdf: &PdfDocument,
     layout: &CacheLayout,
     plan: &[(u32, u32)],
@@ -2125,10 +2269,16 @@ pub async fn run_ocr_with(
     fs::create_dir_all(layout.results_dir())
         .with_context(|| format!("failed to create {}", layout.results_dir().display()))?;
 
+    let mut journal = OcrJournal::load(layout)?;
+    ensure!(
+        journal.jobs.keys().all(|index| *index < plan.len()),
+        "OCR journal references a slice outside the current plan"
+    );
     let mut pending = Vec::new();
     for (index, &(start, end)) in plan.iter().enumerate() {
-        if layout.has_result(index) {
+        if read_cached_slice(layout, index, start, end)?.is_some() {
             eprintln!("slice {:04} cached, skipping", index + 1);
+            journal.jobs.remove(&index);
             continue;
         }
         if !layout.slice_path(index).exists() {
@@ -2137,10 +2287,33 @@ pub async fn run_ocr_with(
         pending.push(index);
     }
     if pending.is_empty() {
+        journal.persist(layout)?;
         eprintln!("all slices cached, nothing to OCR");
+        return Ok(());
     }
 
-    let mut polling = submit_all_slices(client, layout, &pending).await?;
+    journal.persist(layout)?;
+    let client = Arc::new(PaddleOcrClient::from_config(cfg)?);
+    let mut polling = pending
+        .iter()
+        .filter_map(|index| {
+            journal.jobs.get(index).map(|job_id| InFlightJob {
+                index: *index,
+                job_id: job_id.clone(),
+                next_poll_at: Instant::now(),
+                attempt: 0,
+            })
+        })
+        .collect::<Vec<_>>();
+    let to_submit = pending
+        .iter()
+        .copied()
+        .filter(|index| !journal.jobs.contains_key(index))
+        .collect::<Vec<_>>();
+    if !polling.is_empty() {
+        eprintln!("re-polling {} in-flight OCR jobs", polling.len());
+    }
+    polling.extend(submit_all_slices(&client, layout, &to_submit, &mut journal).await?);
 
     let mut poll_tick = tokio::time::interval(Duration::from_millis(200));
     let poll_slots = Arc::new(Semaphore::new(MAX_SUBMIT_CONCURRENCY));
@@ -2156,6 +2329,8 @@ pub async fn run_ocr_with(
         while let Ok((index, result)) = download_rx.try_recv() {
             match result {
                 Ok(()) => {
+                    journal.jobs.remove(&index);
+                    journal.persist(layout)?;
                     done += 1;
                     eprintln!("ocr done {:04} · {}/{}", index + 1, done, total_pending);
                 }
@@ -2172,7 +2347,7 @@ pub async fn run_ocr_with(
                 }
                 Ok(JobState::Done(url)) => {
                     eprintln!("slice {:04} OCR done, downloading", job.index + 1);
-                    let client = Arc::clone(client);
+                    let client = Arc::clone(&client);
                     let slots = Arc::clone(&download_slots);
                     let tx = download_tx.clone();
                     let dest = layout.result_path(job.index);
@@ -2185,6 +2360,8 @@ pub async fn run_ocr_with(
                     });
                 }
                 Ok(JobState::Failed(message)) => {
+                    journal.jobs.remove(&job.index);
+                    journal.persist(layout)?;
                     bail!("slice {:04} OCR job failed: {message}", job.index + 1)
                 }
                 Err(e) if e.kind == ApiErrorKind::Transient => {
@@ -2200,7 +2377,11 @@ pub async fn run_ocr_with(
                         ..job
                     });
                 }
-                Err(e) => bail!("slice {:04} poll failed: {e}", job.index + 1),
+                Err(e) => {
+                    journal.jobs.remove(&job.index);
+                    journal.persist(layout)?;
+                    bail!("slice {:04} poll failed: {e}", job.index + 1)
+                }
             }
         }
         if polling.is_empty() {
@@ -2227,7 +2408,7 @@ pub async fn run_ocr_with(
             continue;
         }
         for job in due {
-            let client = Arc::clone(client);
+            let client = Arc::clone(&client);
             let slots = Arc::clone(&poll_slots);
             let tx = poll_tx.clone();
             tokio::spawn(async move {
@@ -2256,7 +2437,7 @@ pub fn run_merge(
     slice_pages: usize,
     doc_type: DocType,
 ) -> Result<()> {
-    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.model)?;
+    let layout = CacheLayout::for_pdf(pdf_path, slice_pages, &cfg.api_base, &cfg.model)?;
     let pdf_doc = PdfDocument::open(pdf_path)?;
     let plan = pdf_doc.plan_slices(slice_pages, MAX_SLICE_BYTES)?;
     run_merge_with(&layout, &plan, pdf_path, out, doc_type)
@@ -2272,33 +2453,14 @@ pub fn run_merge_with(
 ) -> Result<()> {
     let mut pages = Vec::new();
     for (index, &(start, end)) in plan.iter().enumerate() {
-        let result_path = layout.result_path(index);
-        if !result_path.exists() {
+        let Some(slice_pages) = read_cached_slice(layout, index, start, end)? else {
             bail!(
                 "cache for {} is incomplete (missing {}); run `nanokb convert {} --stage ocr` first",
                 pdf_path.display(),
-                result_path.display(),
+                layout.result_path(index).display(),
                 pdf_path.display()
             );
-        }
-        let jsonl = std::fs::read_to_string(&result_path)
-            .with_context(|| format!("failed to read {}", result_path.display()))?;
-        let slice_pages = parse_jsonl(&jsonl, start as usize)?;
-        let expected_pages = (end - start + 1) as usize;
-        ensure!(
-            slice_pages.len() == expected_pages,
-            "slice {:04} OCR returned {} pages, expected {expected_pages}",
-            index + 1,
-            slice_pages.len()
-        );
-        ensure!(
-            slice_pages
-                .iter()
-                .map(|page| page.page_no)
-                .eq(start as usize..=end as usize),
-            "slice {:04} OCR page numbers are not contiguous from {start} to {end}",
-            index + 1
-        );
+        };
         pages.extend(slice_pages);
     }
     let stem = pdf_path
@@ -2313,8 +2475,8 @@ pub fn run_merge_with(
     }
 
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let chapter_count = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
     render_figures(pdf_path, &report.figure_crops, &out.join("fig"), &pages)?;
+    let chapter_count = write_bundle(out, stem, &report, &doc, &at, doc_type)?;
     let chapters = if chapter_count == 0 {
         String::new()
     } else {

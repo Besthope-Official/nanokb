@@ -598,8 +598,13 @@ fn load_from_sources(
     if let Some(name) = unresolved_placeholder(&value) {
         bail!("unresolved configuration placeholder: {name}");
     }
-    let config: AppConfig = yaml_serde::from_value(value)
+    let mut config: AppConfig = yaml_serde::from_value(value)
         .map_err(|error| anyhow::anyhow!("invalid application configuration: {error}"))?;
+    if config.pdf.access_token.is_empty()
+        && let Some(access_token) = variables.get("PADDLEOCR_ACCESS_TOKEN")
+    {
+        config.pdf.access_token = access_token.clone();
+    }
     if let Some(mode) = &config.pipeline.retrieval.mode {
         QueryMode::parse(mode)?;
     }

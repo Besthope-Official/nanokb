@@ -306,14 +306,16 @@ fn plan_slices_bails_when_single_page_exceeds_cap() {
 
 #[test]
 fn cache_key_is_deterministic_and_sensitive() {
-    let key = |bytes: &[u8], pages: usize, model: &str| cache_key(bytes, pages, model);
+    let key = |bytes: &[u8], pages: usize, api_base: &str, model: &str| {
+        cache_key(bytes, pages, api_base, model)
+    };
 
-    assert_eq!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abc", 20, "PaddleOCR-VL-1.6"));
-    assert_ne!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abd", 20, "PaddleOCR-VL-1.6"));
-    assert_ne!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abc", 10, "PaddleOCR-VL-1.6"));
-    assert_ne!(key(b"abc", 20, "PaddleOCR-VL-1.6"), key(b"abc", 20, "PaddleOCR-VL-1.5"));
-    assert!(key(b"abc", 20, "a/b.c").contains("-a-b-c"));
-    assert!(key(b"abc", 20, "PaddleOCR-VL-1.6").ends_with("-unwarp0"));
+    assert_eq!(key(b"abc", 20, "https://a", "m"), key(b"abc", 20, "https://a", "m"));
+    assert_ne!(key(b"abc", 20, "https://a", "m"), key(b"abd", 20, "https://a", "m"));
+    assert_ne!(key(b"abc", 20, "https://a", "m"), key(b"abc", 10, "https://a", "m"));
+    assert_ne!(key(b"abc", 20, "https://a", "m"), key(b"abc", 20, "https://b", "m"));
+    assert_ne!(key(b"abc", 20, "https://a", "A/B"), key(b"abc", 20, "https://a", "a-b"));
+    assert!(key(b"abc", 20, "https://a", "a/b.c").contains("-a-b-c-"));
 }
 
 #[test]
@@ -322,7 +324,13 @@ fn cache_layout_paths_and_resume_skip() {
     let path = dir.path().join("book.pdf");
     fs::write(&path, b"fake pdf bytes").unwrap();
 
-    let layout = CacheLayout::for_pdf(&path, 20, "PaddleOCR-VL-1.6").unwrap();
+    let layout = CacheLayout::for_pdf(
+        &path,
+        20,
+        "https://paddleocr.aistudio-app.com",
+        "PaddleOCR-VL-1.6",
+    )
+    .unwrap();
 
     assert!(layout.slice_path(1).ends_with("slices/0002.pdf"));
     assert!(layout.result_path(1).ends_with("results/0002.jsonl"));
@@ -332,13 +340,54 @@ fn cache_layout_paths_and_resume_skip() {
             .root
             .to_str()
             .unwrap()
-            .ends_with("-20p-paddleocr-vl-1-6-unwarp0")
+            .contains("-20p-paddleocr-vl-1-6-")
     );
 
     fs::create_dir_all(layout.results_dir()).unwrap();
     fs::write(layout.result_path(1), b"").unwrap();
-    assert!(layout.has_result(1));
-    assert!(!layout.has_result(2));
+    assert!(read_cached_slice(&layout, 1, 2, 2).is_err());
+    assert!(read_cached_slice(&layout, 2, 3, 3).unwrap().is_none());
+
+    fs::write(
+        layout.result_path(1),
+        jsonl_line(&[page_json(&[block("text", "cached", [0, 0, 10, 10])])]),
+    )
+    .unwrap();
+    let pages = read_cached_slice(&layout, 1, 2, 2).unwrap().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].page_no, 2);
+}
+
+#[test]
+fn ocr_journal_round_trips_and_rejects_empty_job_id() {
+    let dir = TestDirectory::new();
+    let path = dir.path().join("book.pdf");
+    fs::write(&path, b"fake pdf bytes").unwrap();
+    let layout = CacheLayout::for_pdf(&path, 20, "https://api.example", "model").unwrap();
+    fs::create_dir_all(&layout.root).unwrap();
+
+    let journal = OcrJournal {
+        jobs: BTreeMap::from([(0, "job-1".to_string()), (2, "job-3".to_string())]),
+    };
+    journal.persist(&layout).unwrap();
+    let loaded = OcrJournal::load(&layout).unwrap();
+    assert_eq!(loaded.jobs, journal.jobs);
+
+    fs::write(layout.journal_path(), r#"{"jobs":{"0":""}}"#).unwrap();
+    assert!(OcrJournal::load(&layout).is_err());
+}
+
+#[tokio::test]
+async fn run_ocr_with_fully_cached_plan_does_not_require_token() {
+    let dir = TestDirectory::new();
+    let pdf_path = make_test_pdf(&dir, "cached.pdf", 1);
+    let cfg = PdfConfig::default();
+    let pdf = PdfDocument::open(&pdf_path).unwrap();
+    let layout = CacheLayout::for_pdf(&pdf_path, 20, &cfg.api_base, &cfg.model).unwrap();
+    fs::create_dir_all(layout.results_dir()).unwrap();
+    fs::write(layout.result_path(0), jsonl_line(&[page_json(&[])])).unwrap();
+
+    run_ocr_with(&cfg, &pdf, &layout, &[(1, 1)]).await.unwrap();
 }
 
 // ---------------------------------------------------------------
@@ -518,7 +567,7 @@ async fn submit_all_slices_runs_four_way_concurrent() {
     let (url, peak, arrivals) = start_counting_mock_server(responses, Duration::from_millis(300));
     let client = Arc::new(test_client(&url));
     let pdf_path = make_test_pdf(&dir, "concurrent.pdf", 4);
-    let layout = CacheLayout::for_pdf(&pdf_path, 4, "PaddleOCR-VL-1.6").unwrap();
+    let layout = CacheLayout::for_pdf(&pdf_path, 4, "http://mock", "PaddleOCR-VL-1.6").unwrap();
     fs::create_dir_all(layout.slices_dir()).unwrap();
     let mut pending = Vec::new();
     for index in 0..4 {
@@ -526,13 +575,41 @@ async fn submit_all_slices_runs_four_way_concurrent() {
         pending.push(index);
     }
 
-    let jobs = submit_all_slices(&client, &layout, &pending).await.unwrap();
+    let mut journal = OcrJournal::default();
+    let jobs = submit_all_slices(&client, &layout, &pending, &mut journal)
+        .await
+        .unwrap();
 
     assert_eq!(jobs.len(), 4);
     for _ in 0..4 {
         arrivals.recv_timeout(Duration::from_secs(5)).unwrap();
     }
     assert_eq!(peak.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn submit_all_slices_journals_successes_before_returning_error() {
+    let dir = TestDirectory::new();
+    let server = start_mock_server(vec![
+        (401, r#"{"code":401,"message":"unauthorized"}"#),
+        (200, r#"{"code":0,"job_id":"accepted"}"#),
+    ]);
+    let client = Arc::new(test_client(&server.url));
+    let pdf_path = make_test_pdf(&dir, "partial.pdf", 2);
+    let layout = CacheLayout::for_pdf(&pdf_path, 2, &server.url, "model").unwrap();
+    fs::create_dir_all(layout.slices_dir()).unwrap();
+    fs::write(layout.slice_path(0), b"slice 0").unwrap();
+    fs::write(layout.slice_path(1), b"slice 1").unwrap();
+    let mut journal = OcrJournal::default();
+
+    let error = match submit_all_slices(&client, &layout, &[0, 1], &mut journal).await {
+        Ok(_) => panic!("submission should fail"),
+        Err(error) => error,
+    };
+
+    assert!(format!("{error:#}").contains("unauthorized"), "{error:#}");
+    assert_eq!(journal.jobs.len(), 1);
+    assert_eq!(OcrJournal::load(&layout).unwrap().jobs, journal.jobs);
 }
 
 #[tokio::test]
@@ -732,8 +809,23 @@ fn parse_jsonl_bails_on_unknown_label() {
 }
 
 #[test]
+fn parse_page_rejects_missing_dimensions_and_out_of_bounds_bbox() {
+    let missing_width = page_json(&[block("text", "x", [0, 0, 10, 10])])
+        .replace("\"width\":1224.0,", "");
+    assert!(parse_jsonl(&jsonl_line(&[missing_width]), 1).is_err());
+
+    let zero_width = page_json(&[block("text", "x", [0, 0, 10, 10])])
+        .replace("\"width\":1224.0", "\"width\":0");
+    assert!(parse_jsonl(&jsonl_line(&[zero_width]), 1).is_err());
+
+    let out_of_bounds = page_json(&[block("text", "x", [0, 0, 2000, 10])]);
+    assert!(parse_jsonl(&jsonl_line(&[out_of_bounds]), 1).is_err());
+}
+
+#[test]
 fn infer_heading_level_table() {
     assert_eq!(infer_heading_level("1. Introduction"), (1, "Introduction"));
+    assert_eq!(infer_heading_level("2.1 Retrieval"), (2, "Retrieval"));
     assert_eq!(
         infer_heading_level("2.1. Retrieval-Augmented Generation"),
         (2, "Retrieval-Augmented Generation")
@@ -744,6 +836,7 @@ fn infer_heading_level_table() {
     );
     assert_eq!(infer_heading_level("Abstract"), (1, "Abstract"));
     assert_eq!(infer_heading_level("10. Related Work"), (1, "Related Work"));
+    assert_eq!(infer_heading_level("1."), (1, "1."));
     assert_eq!(infer_heading_level("References"), (1, "References"));
 }
 
@@ -1083,6 +1176,21 @@ fn project_extracts_footnote_affiliations() {
             "Example Labs, Metropolis"
         ]
     );
+}
+
+#[test]
+fn project_extracts_unicode_affiliation_before_correspondence_marker() {
+    let page = page_json(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block(
+            "footnote",
+            "Université de Paris, Correspondence to: author@example.com",
+            [0, 20, 500, 40],
+        ),
+    ]);
+    let (_, report) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "p").unwrap();
+
+    assert_eq!(report.affiliations, vec!["Université de Paris"]);
 }
 
 #[test]
@@ -1514,6 +1622,28 @@ fn render_figures_bails_on_invalid_crop_src() {
 }
 
 #[test]
+fn extract_pages_reports_dangling_referenced_object() {
+    let dir = TestDirectory::new();
+    let pdf_path = make_test_pdf(&dir, "broken.pdf", 1);
+    let mut pdf = PdfDocument::open(&pdf_path).unwrap();
+    let page_id = *pdf.doc.get_pages().get(&1).unwrap();
+    let contents_id = pdf
+        .doc
+        .get_object(page_id)
+        .unwrap()
+        .as_dict()
+        .unwrap()
+        .get(b"Contents")
+        .unwrap()
+        .as_reference()
+        .unwrap();
+    pdf.doc.objects.remove(&contents_id);
+
+    let error = pdf.write_slice(1, 1, &dir.path().join("broken-slice.pdf")).unwrap_err();
+    assert!(format!("{error:#}").contains("referenced but missing"), "{error:#}");
+}
+
+#[test]
 fn write_bundle_creates_rewrites_and_preserves_index() {
     let dir = TestDirectory::new();
     let out = dir.path().join("papers");
@@ -1753,6 +1883,43 @@ fn write_bundle_forced_paper_ignores_doc_title_headings() {
     let index = fs::read_to_string(out.join("index.md")).unwrap();
     assert!(index.contains("(my-paper.md)"), "{index}");
     assert!(!index.contains("(ch1.md)"));
+}
+
+#[test]
+fn write_bundle_auto_detects_numbered_chapter_heading() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-book");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Book", [0, 0, 10, 10]),
+        block("paragraph_title", "Chapter 1", [0, 20, 10, 30]),
+        block("text", "Body words.", [0, 40, 10, 50]),
+    ]);
+
+    let chapters =
+        write_bundle(&out, "my-book", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
+            .unwrap();
+    assert_eq!(chapters, 1);
+    assert!(out.join("ch1.md").exists());
+    assert!(fs::read_to_string(out.join("ch1.md")).unwrap().contains("# Chapter 1"));
+}
+
+#[test]
+fn write_bundle_auto_ignores_repeated_document_title() {
+    let dir = TestDirectory::new();
+    let out = dir.path().join("my-paper");
+    let (doc, report) = project_book(&[
+        block("doc_title", "My Paper", [0, 0, 10, 10]),
+        block("text", "First page.", [0, 20, 10, 30]),
+        block("doc_title", "My Paper", [0, 40, 10, 50]),
+        block("text", "Second page.", [0, 60, 10, 70]),
+    ]);
+
+    let chapters =
+        write_bundle(&out, "my-paper", &report, &doc, "2026-08-15T10:00:00Z", DocType::Auto)
+            .unwrap();
+    assert_eq!(chapters, 0);
+    let markdown = fs::read_to_string(out.join("my-paper.md")).unwrap();
+    assert!(markdown.contains("type: paper"), "{markdown}");
 }
 
 #[test]

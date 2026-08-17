@@ -375,7 +375,7 @@ async fn run_convert(
     }
     match (stage, out) {
         (Some(ConvertStage::Slice), _) => {
-            pdf::slice_to_cache(file, slice_pages, &config.pdf.model).await
+            pdf::slice_to_cache(file, slice_pages, &config.pdf).await
         }
         (Some(ConvertStage::Ocr), _) => pdf::run_ocr(&config.pdf, file, slice_pages).await,
         (Some(ConvertStage::Merge), Some(out)) => {
@@ -383,12 +383,16 @@ async fn run_convert(
         }
         (None, Some(out)) => {
             // Full pipeline: compute plan + cache layout once for both stages.
-            let client = Arc::new(pdf::PaddleOcrClient::from_config(&config.pdf)?);
             let pdf_doc = pdf::PdfDocument::open(file)?;
             let plan = pdf_doc.plan_slices(slice_pages, pdf::MAX_SLICE_BYTES)?;
-            let layout = pdf::CacheLayout::for_pdf(file, slice_pages, &config.pdf.model)?;
+            let layout = pdf::CacheLayout::for_pdf(
+                file,
+                slice_pages,
+                &config.pdf.api_base,
+                &config.pdf.model,
+            )?;
             eprintln!("{}", pdf::plan_summary(file, pdf_doc.page_count(), plan.len(), slice_pages));
-            pdf::run_ocr_with(&client, &pdf_doc, &layout, &plan).await?;
+            pdf::run_ocr_with(&config.pdf, &pdf_doc, &layout, &plan).await?;
             pdf::run_merge_with(&layout, &plan, file, out, doc_type)
         }
         (Some(ConvertStage::Merge) | None, None) => {
