@@ -537,14 +537,14 @@ fn block_label(label: &str) -> Result<BlockLabel> {
     match label {
         "doc_title" => Ok(BlockLabel::DocTitle),
         "paragraph_title" => Ok(BlockLabel::ParagraphTitle),
-        "text" => Ok(BlockLabel::Text),
+        "text" | "content" => Ok(BlockLabel::Text),
         "abstract" => Ok(BlockLabel::Abstract),
         "image" => Ok(BlockLabel::Image),
         "chart" => Ok(BlockLabel::Chart),
         "figure_title" => Ok(BlockLabel::FigureTitle),
         "table" => Ok(BlockLabel::Table),
         "algorithm" => Ok(BlockLabel::Algorithm),
-        "display_formula" => Ok(BlockLabel::DisplayFormula),
+        "display_formula" | "inline_formula" => Ok(BlockLabel::DisplayFormula),
         "reference_content" => Ok(BlockLabel::ReferenceContent),
         other => bail!("unknown block_label {other:?}"),
     }
@@ -589,6 +589,45 @@ pub fn infer_heading_level(title: &str) -> (usize, &str) {
     } else {
         (1, trimmed)
     }
+}
+
+fn is_root_heading_title(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "abstract"
+            | "acknowledgement"
+            | "acknowledgements"
+            | "bibliography"
+            | "conclusion"
+            | "conclusions"
+            | "contents"
+            | "index"
+            | "preface"
+            | "references"
+            | "table of contents"
+    )
+}
+
+fn infer_project_heading_level<'a>(
+    title: &'a str,
+    heading_stack: &[(NodeId, usize, bool)],
+) -> (usize, &'a str, bool) {
+    let trimmed = title.trim();
+    let (numbered_level, remainder) = infer_heading_level(trimmed);
+    let numbered = remainder != trimmed;
+    if numbered {
+        return (numbered_level, remainder, false);
+    }
+    if is_root_heading_title(remainder) || is_chapter_title(remainder) || heading_stack.is_empty() {
+        return (1, remainder, true);
+    }
+    let (_, parent_level, parent_is_unnumbered) = *heading_stack.last().unwrap();
+    let level = if parent_is_unnumbered {
+        parent_level
+    } else {
+        parent_level.saturating_add(1)
+    };
+    (level, remainder, true)
 }
 
 #[derive(Debug, Default)]
@@ -875,7 +914,7 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
         children: Vec::new(),
     }];
     let root = NodeId(0);
-    let mut heading_stack: Vec<(NodeId, usize)> = Vec::new();
+    let mut heading_stack: Vec<(NodeId, usize, bool)> = Vec::new();
     let mut title_seen = false;
     for page in pages {
         let pairing = pair_figures_detailed(page);
@@ -903,7 +942,7 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
             node_id
         };
         for (block_idx, block) in page.blocks.iter().enumerate() {
-            let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+            let parent = heading_stack.last().map(|&(id, _, _)| id).unwrap_or(root);
             match &block.label {
                 BlockLabel::Ignored(_) => {}
                 BlockLabel::DocTitle => {
@@ -916,25 +955,26 @@ pub fn project(pages: &[Page], stem: &str) -> Result<(StructuredDocument, Projec
                         level: 1,
                         title: block.content.clone(),
                     });
-                    heading_stack.push((node_id, 1));
+                    heading_stack.push((node_id, 1, false));
                     report.doc_title_headings.push((node_id, page.page_no));
                     report.root_headings.push((node_id, page.page_no));
                 }
                 BlockLabel::ParagraphTitle => {
-                    let (level, remainder) = infer_heading_level(&block.content);
-                    while let Some(&(_, top_level)) = heading_stack.last() {
+                    let (level, remainder, is_unnumbered) =
+                        infer_project_heading_level(&block.content, &heading_stack);
+                    while let Some(&(_, top_level, _)) = heading_stack.last() {
                         if top_level >= level {
                             heading_stack.pop();
                         } else {
                             break;
                         }
                     }
-                    let parent = heading_stack.last().map(|&(id, _)| id).unwrap_or(root);
+                    let parent = heading_stack.last().map(|&(id, _, _)| id).unwrap_or(root);
                     let node_id = push_child(parent, NodeKind::Heading {
                         level,
                         title: remainder.to_string(),
                     });
-                    heading_stack.push((node_id, level));
+                    heading_stack.push((node_id, level, is_unnumbered));
                     if parent == root {
                         report.root_headings.push((node_id, page.page_no));
                     }

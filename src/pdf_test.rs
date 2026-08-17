@@ -732,6 +732,30 @@ fn parse_jsonl_parses_pages_blocks() {
 }
 
 #[test]
+fn parse_jsonl_accepts_content_blocks_as_text() {
+    let page = page_json(&[block("content", "Table of contents", [0, 0, 500, 100])]);
+    let pages = parse_jsonl(&jsonl_line(&[page]), 1).unwrap();
+
+    assert_eq!(pages[0].blocks[0].label, BlockLabel::Text);
+    assert_eq!(pages[0].blocks[0].content, "Table of contents");
+}
+
+#[test]
+fn project_accepts_inline_formula_as_math_block() {
+    let page = page_json(&[
+        block("doc_title", "My Paper", [0, 0, 500, 100]),
+        block("text", "The result is", [0, 110, 300, 140]),
+        block("inline_formula", " $$ x^2 $$ ", [310, 110, 400, 140]),
+    ]);
+    let (doc, _) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "paper").unwrap();
+
+    assert!(doc.tree.iter().any(|node| matches!(
+        &node.kind,
+        NodeKind::MathBlock { text } if text == " $$ x^2 $$ "
+    )));
+}
+
+#[test]
 fn parse_jsonl_continues_page_numbers_across_lines() {
     let first_line = jsonl_line(&[
         page_json(&[block("doc_title", "My Paper", [0, 0, 10, 10])]),
@@ -889,6 +913,54 @@ fn project_builds_nested_tree() {
         NodeKind::Heading { level: 1, title } if title == "References"
     ));
     assert!(report.dropped.is_empty());
+}
+
+#[test]
+fn project_keeps_unnumbered_subheadings_under_numbered_sections() {
+    let page = page_json(&[
+        block("doc_title", "My Book", [0, 0, 500, 100]),
+        block("paragraph_title", "2. Miscellaneous Math", [0, 110, 500, 140]),
+        block("paragraph_title", "2.5 Curves and Surfaces", [0, 150, 500, 180]),
+        block("paragraph_title", "2.5.2 The 2D Gradient", [0, 190, 500, 220]),
+        block("text", "Gradient body.", [0, 230, 500, 260]),
+        block("paragraph_title", "Implicit 2D Lines", [0, 270, 500, 300]),
+        block("text", "Lines body.", [0, 310, 500, 340]),
+        block("paragraph_title", "Implicit Quadric Curves", [0, 350, 500, 380]),
+        block("text", "Curves body.", [0, 390, 500, 420]),
+        block("paragraph_title", "2.5.3 3D Implicit Surfaces", [0, 430, 500, 460]),
+        block("text", "Surfaces body.", [0, 470, 500, 500]),
+        block("paragraph_title", "References", [0, 510, 500, 540]),
+    ]);
+    let (doc, _) = project(&parse_jsonl(&jsonl_line(&[page]), 1).unwrap(), "book").unwrap();
+
+    let root = doc.node(doc.root);
+    let chapter = doc.node(root.children[0]);
+    let section = doc.node(chapter.children[0]);
+    assert!(matches!(
+        &section.kind,
+        NodeKind::Heading { level: 2, .. }
+    ));
+    let numbered = doc.node(section.children[0]);
+    assert!(matches!(
+        &numbered.kind,
+        NodeKind::Heading { level: 3, .. }
+    ));
+    assert!(matches!(
+        &doc.node(numbered.children[1]).kind,
+        NodeKind::Heading { level: 4, title } if title == "Implicit 2D Lines"
+    ));
+    assert!(matches!(
+        &doc.node(numbered.children[2]).kind,
+        NodeKind::Heading { level: 4, title } if title == "Implicit Quadric Curves"
+    ));
+    assert!(matches!(
+        &doc.node(section.children[1]).kind,
+        NodeKind::Heading { level: 3, title } if title == "3D Implicit Surfaces"
+    ));
+    assert!(matches!(
+        &doc.node(root.children[1]).kind,
+        NodeKind::Heading { level: 1, title } if title == "References"
+    ));
 }
 
 #[test]
