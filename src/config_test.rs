@@ -600,15 +600,14 @@ fn try_load_overlay_with_placeholders() {
 fn falls_back_to_user_config_when_local_missing() {
     let local_dir = TestDirectory::new();
     let home = TestDirectory::new();
-    let user_config = home.path().join(".nanokb").join("config.yaml");
-    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    let user_config = home.path().join("config.yaml");
     fs::write(
         &user_config,
         "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@postgres:5432/nanokb\"\nmodel:\n  embeddings: {}\n",
     )
     .unwrap();
     fs::write(
-        user_config.parent().unwrap().join(".env"),
+        home.path().join(".env"),
         "DB_USER=nanokb\nDB_PASSWORD=secret\n",
     )
     .unwrap();
@@ -636,8 +635,7 @@ fn prefers_local_config_over_user_config() {
         "database:\n  url: \"postgres://local@localhost/nanokb\"\nmodel:\n  embeddings: {}\n",
     )
     .unwrap();
-    let user_config = home.path().join(".nanokb").join("config.yaml");
-    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    let user_config = home.path().join("config.yaml");
     fs::write(
         &user_config,
         "database:\n  url: \"postgres://user@localhost/nanokb\"\nmodel:\n  embeddings: {}\n",
@@ -689,7 +687,9 @@ fn errors_when_local_missing_and_home_is_unset() {
     };
 
     assert!(
-        error.to_string().contains("$HOME is not set"),
+        error
+            .to_string()
+            .contains("neither XDG_CONFIG_HOME nor HOME is set"),
         "unexpected error: {error}"
     );
 }

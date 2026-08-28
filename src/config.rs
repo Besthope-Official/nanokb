@@ -512,7 +512,7 @@ impl AppConfig {
             path.as_ref(),
             &[],
             process_environment,
-            home_dir().as_deref(),
+            user_config_dir().as_deref(),
         )
     }
 
@@ -525,26 +525,39 @@ impl AppConfig {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(base.as_ref(), overlays, process_environment, home_dir().as_deref())
+        load_from_sources(
+            base.as_ref(),
+            overlays,
+            process_environment,
+            user_config_dir().as_deref(),
+        )
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+/// User-level config directory per the XDG Base Directory Specification:
+/// `$XDG_CONFIG_HOME/nanokb`, defaulting to `~/.config/nanokb`.
+fn user_config_dir() -> Option<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("nanokb")),
+        _ => std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".config").join("nanokb")),
+    }
 }
 
-/// Prefer the local config file (development); fall back to `~/.nanokb/config.yaml`.
+/// Prefer the local config file (development); fall back to the user-level
+/// config directory (`config.yaml` inside `user_dir`).
 ///
-/// `home` is `None` when `$HOME` is unavailable, which disables the fallback.
-fn resolve_config_path(config_path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+/// `user_dir` is `None` when neither `$XDG_CONFIG_HOME` nor `$HOME` is set,
+/// which disables the fallback.
+fn resolve_config_path(config_path: &Path, user_dir: Option<&Path>) -> Result<PathBuf> {
     if config_path.exists() {
         return Ok(config_path.to_path_buf());
     }
-    let user_config = match home {
-        Some(home) => home.join(".nanokb").join("config.yaml"),
+    let user_config = match user_dir {
+        Some(user_dir) => user_dir.join("config.yaml"),
         None => {
             bail!(
-                "configuration file {} does not exist, and $HOME is not set so ~/.nanokb/config.yaml cannot be used",
+                "configuration file {} does not exist, and neither XDG_CONFIG_HOME nor HOME is set to locate the user config",
                 config_path.display()
             )
         }
@@ -593,9 +606,9 @@ fn load_from_sources(
     config_path: &Path,
     overlays: &[PathBuf],
     process_environment: HashMap<String, String>,
-    home: Option<&Path>,
+    user_dir: Option<&Path>,
 ) -> Result<AppConfig> {
-    let config_path = resolve_config_path(config_path, home)?;
+    let config_path = resolve_config_path(config_path, user_dir)?;
     let mut value: Value = yaml_serde::from_str(
         &fs::read_to_string(&config_path).with_context(|| {
             format!(
