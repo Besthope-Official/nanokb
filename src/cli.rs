@@ -6,6 +6,8 @@ use crate::rerank::RerankClient;
 use crate::retrieve;
 use crate::filter::Filter;
 use crate::{AppConfig, postgres, task};
+#[cfg(feature = "pdf")]
+use crate::pdf::{self, ConvertStage};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::{IsTerminal, Write};
@@ -185,6 +187,28 @@ enum TopLevelCommand {
         #[arg(short = 'l', long = "filter")]
         filters: Vec<Filter>,
     },
+    #[cfg(feature = "pdf")]
+    #[command(about = "Convert a PDF into an md bundle: slice → ocr → merge (resumable via cache)")]
+    Convert {
+        file: PathBuf,
+        /// Output directory for the md bundle; required unless --stage stops before merge.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Stop after this stage (default: run the whole pipeline).
+        #[arg(long, value_enum)]
+        stage: Option<ConvertStage>,
+        /// Print the slice plan and quota estimate, then exit (no API calls).
+        #[arg(long)]
+        dry_run: bool,
+        /// Pages per slice; defaults to config pdf.slice_pages.
+        #[arg(long)]
+        slice_pages: Option<usize>,
+        /// Bundle shape for the merge stage: paper -> one `type: paper` md;
+        /// book -> concept + `type: chapter` files (degrades to one `type: book`
+        /// md without chapter boundaries); auto = detect from the projection.
+        #[arg(long = "type", value_enum)]
+        doc_type: Option<pdf::DocType>,
+    },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
 }
@@ -301,6 +325,28 @@ pub async fn run() -> Result<()> {
             expand_depth,
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
+        #[cfg(feature = "pdf")]
+        TopLevelCommand::Convert {
+            file,
+            out,
+            stage,
+            dry_run,
+            slice_pages,
+            doc_type,
+        } => {
+            let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
+            let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
+            pdf::convert(
+                &config.pdf,
+                &file,
+                out.as_deref(),
+                stage,
+                dry_run,
+                slice_pages,
+                doc_type,
+            )
+            .await
+        }
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
     }
 }
@@ -800,29 +846,102 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_full_pipeline() {
+        let cli =
+            Cli::try_parse_from(["nanokb", "convert", "book.pdf", "--out", "papers"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert {
+                file,
+                out,
+                stage: None,
+                dry_run: false,
+                doc_type: None,
+                ..
+            } if file.as_path() == Path::new("book.pdf")
+                && out.as_deref() == Some(Path::new("papers"))
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_stage_ocr_without_out() {
+        let cli = Cli::try_parse_from(["nanokb", "convert", "book.pdf", "--stage", "ocr"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { out: None, stage: Some(ConvertStage::Ocr), .. }
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_dry_run_with_slice_pages() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--dry-run", "--slice-pages", "30",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { dry_run: true, slice_pages: Some(30), .. }
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_with_type_book() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--type", "book",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { doc_type: Some(pdf::DocType::Book), .. }
+        ));
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn parses_convert_with_type_paper() {
+        let cli = Cli::try_parse_from([
+            "nanokb", "convert", "book.pdf", "--out", "papers", "--type", "paper",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            TopLevelCommand::Convert { doc_type: Some(pdf::DocType::Paper), .. }
+        ));
+    }
+
     #[test]
     fn parses_doc_add_with_n_flag() {
         let cli =
-            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./ddia.pdf"]).unwrap();
+            Cli::try_parse_from(["nanokb", "doc", "add", "-n", "books", "./demo.pdf"]).unwrap();
 
         assert!(matches!(
             cli.command,
             TopLevelCommand::Doc {
                 command: DocCommand::Add { ref kb, ref source },
-            } if kb == "books" && source == "./ddia.pdf"
+            } if kb == "books" && source == "./demo.pdf"
         ));
     }
 
     #[test]
     fn parses_doc_add_with_long_name_flag() {
         let cli =
-            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./ddia.pdf"]).unwrap();
+            Cli::try_parse_from(["nanokb", "doc", "add", "--name", "books", "./demo.pdf"]).unwrap();
 
         assert!(matches!(
             cli.command,
             TopLevelCommand::Doc {
                 command: DocCommand::Add { ref kb, ref source },
-            } if kb == "books" && source == "./ddia.pdf"
+            } if kb == "books" && source == "./demo.pdf"
         ));
     }
 
@@ -915,16 +1034,16 @@ mod tests {
             0,
             0,
             1,
-            vec!["Storage and Indexing for OLTP", "Write amplification"],
+            vec!["Storage Systems", "fake section"],
             "body",
         );
         result.filename = "ch4.md".to_string();
         result.frontmatter = serde_json::json!({
             "type": "chapter",
-            "title": "4. Storage and Retrieval",
-            "resource": "../ddia.pdf#113-178",
-            "generated": { "by": "human:besthope", "at": "2026-08-13" },
-            "book": "ddia",
+            "title": "4. Fake Chapter",
+            "resource": "../demo.pdf#113-178",
+            "generated": { "by": "human:alice", "at": "2026-08-13" },
+            "book": "demo",
             "chapter": 4,
         });
         let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
@@ -933,11 +1052,11 @@ mod tests {
             lines,
             vec![
                 "<result>",
-                "[title]  ddia · ch4 \"4. Storage and Retrieval\" · Write amplification",
-                "[url]    ../ddia.pdf#113-178 · kb://ddia/ch4#write_amplification",
-                "[date]   2026-08-13 (generated: human:besthope)",
+                "[title]  demo · ch4 \"4. Fake Chapter\" · fake section",
+                "[url]    ../demo.pdf#113-178 · kb://demo/ch4#fake_section",
+                "[date]   2026-08-13 (generated: human:alice)",
                 "[score]  0.31 · VEC",
-                "[path]   Storage and Indexing for OLTP > Write amplification",
+                "[path]   Storage Systems > fake section",
                 "body",
                 "</result>",
             ]
@@ -995,15 +1114,15 @@ mod tests {
     fn result_lines_render_figures_with_decoded_blob_size() {
         let mut result = make_result_in("a", 0, 0, 1, vec!["Guide"], "body");
         result.figures = vec![Figure {
-            src: "fig/ddia_0404.png".to_string(),
-            caption: "Figure 4-4. A Bloom filter".to_string(),
+            src: "fig/demo_0404.png".to_string(),
+            caption: "Figure 4-4. A fake figure".to_string(),
             description: None,
             blob: Some("QUJDRA==".to_string()),
         }];
         let lines = result_lines(vec![(0.31, "VEC".to_string(), &result)]);
 
         assert!(lines.contains(
-            &"[figure] fig/ddia_0404.png · \"Figure 4-4. A Bloom filter\" · blob 4 B".to_string()
+            &"[figure] fig/demo_0404.png · \"Figure 4-4. A fake figure\" · blob 4 B".to_string()
         ));
     }
 
@@ -1046,7 +1165,7 @@ mod tests {
             "-l",
             "type=chapter",
             "-l",
-            "book!=ddia",
+            "book!=demo",
         ])
         .unwrap();
 
@@ -1058,7 +1177,7 @@ mod tests {
                 assert_eq!(filters[0].value, "chapter");
                 assert_eq!(filters[1].key, "book");
                 assert_eq!(filters[1].op, FilterOp::NotEq);
-                assert_eq!(filters[1].value, "ddia");
+                assert_eq!(filters[1].value, "demo");
             }
             _ => panic!("expected query command"),
         }

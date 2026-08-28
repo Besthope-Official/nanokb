@@ -3,7 +3,7 @@ use rstest::*;
 
 #[rstest]
 #[case("type=chapter", "type", FilterOp::Eq, "chapter")]
-#[case("book!=ddia", "book", FilterOp::NotEq, "ddia")]
+#[case("book!=demo", "book", FilterOp::NotEq, "demo")]
 #[case("title=a=b", "title", FilterOp::Eq, "a=b")]
 #[case("key!=a=b", "key", FilterOp::NotEq, "a=b")]
 #[case("key=", "key", FilterOp::Eq, "")]
@@ -51,7 +51,7 @@ fn predicate_not_eq_negates_the_whole_case() {
 
 #[test]
 fn where_clause_numbers_params_in_order() {
-    let filters = ["type=chapter".parse::<Filter>().unwrap(), "book!=ddia".parse::<Filter>().unwrap()];
+    let filters = ["type=chapter".parse::<Filter>().unwrap(), "book!=demo".parse::<Filter>().unwrap()];
     let clause = where_clause(&filters, 3).unwrap();
     assert_eq!(
         clause,

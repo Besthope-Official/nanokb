@@ -48,3 +48,9 @@ pipeline:
   worker_count: 8
   worker_poll_timeout_secs: 30
   worker_error_retry_secs: 5
+
+pdf:
+  api_base: "https://paddleocr.aistudio-app.com"
+  access_token: "{PADDLEOCR_ACCESS_TOKEN}"
+  model: "PaddleOCR-VL-1.6"
+  slice_pages: 20
