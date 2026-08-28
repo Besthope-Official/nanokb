@@ -508,7 +508,12 @@ impl AppConfig {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(path.as_ref(), &[], process_environment)
+        load_from_sources(
+            path.as_ref(),
+            &[],
+            process_environment,
+            user_config_dir().as_deref(),
+        )
     }
 
     /// Load the base config then merge each overlay file (in order) on top
@@ -520,8 +525,114 @@ impl AppConfig {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(base.as_ref(), overlays, process_environment)
+        load_from_sources(
+            base.as_ref(),
+            overlays,
+            process_environment,
+            user_config_dir().as_deref(),
+        )
     }
+}
+
+/// User-level config directory per the XDG Base Directory Specification:
+/// `$XDG_CONFIG_HOME/nanokb`, defaulting to `~/.config/nanokb`.
+pub(crate) fn user_config_dir() -> Option<PathBuf> {
+    match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir).join("nanokb")),
+        _ => std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".config").join("nanokb")),
+    }
+}
+
+/// Build a `.env` skeleton from a config template: one empty `KEY=` line per
+/// `{PLACEHOLDER}` referenced, in first-appearance order.
+pub(crate) fn dotenv_skeleton(config_template: &str) -> String {
+    let value: Value = yaml_serde::from_str(config_template)
+        .expect("embedded config.yaml template must parse");
+    let mut names: Vec<String> = Vec::new();
+    collect_placeholder_names(&value, &mut names);
+    let mut skeleton = String::from(
+        "# nanokb secrets: fill in a value for every placeholder referenced by config.yaml\n",
+    );
+    for name in names {
+        skeleton.push_str(&name);
+        skeleton.push_str("=\n");
+    }
+    skeleton
+}
+
+fn collect_placeholder_names(value: &Value, names: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            for name in all_placeholders(text) {
+                if !names.iter().any(|n| n.as_str() == name) {
+                    names.push(name);
+                }
+            }
+        }
+        Value::Sequence(sequence) => {
+            for item in sequence {
+                collect_placeholder_names(item, names);
+            }
+        }
+        Value::Mapping(mapping) => {
+            for (key, value) in mapping {
+                collect_placeholder_names(key, names);
+                collect_placeholder_names(value, names);
+            }
+        }
+        Value::Tagged(tagged) => collect_placeholder_names(&tagged.value, names),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn all_placeholders(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let relative_end = bytes[i + 1..].iter().position(|byte| *byte == b'}');
+        let Some(relative_end) = relative_end else { break };
+        let end = i + relative_end + 1;
+        let name = &text[i + 1..end];
+        if valid_placeholder_name(name) && !names.iter().any(|n| n.as_str() == name) {
+            names.push(name.to_string());
+        }
+        i = end + 1;
+    }
+    names
+}
+
+/// Prefer the local config file (development); fall back to the user-level
+/// config directory (`config.yaml` inside `user_dir`).
+///
+/// `user_dir` is `None` when neither `$XDG_CONFIG_HOME` nor `$HOME` is set,
+/// which disables the fallback.
+fn resolve_config_path(config_path: &Path, user_dir: Option<&Path>) -> Result<PathBuf> {
+    if config_path.exists() {
+        return Ok(config_path.to_path_buf());
+    }
+    let user_config = match user_dir {
+        Some(user_dir) => user_dir.join("config.yaml"),
+        None => {
+            bail!(
+                "configuration file {} does not exist, and neither XDG_CONFIG_HOME nor HOME is set to locate the user config",
+                config_path.display()
+            )
+        }
+    };
+    if user_config.exists() {
+        return Ok(user_config);
+    }
+    bail!(
+        "failed to find configuration file: neither {} nor {} exists; run `nanokb config init` to generate one",
+        config_path.display(),
+        user_config.display()
+    )
 }
 
 fn unicode_environment_variable(variable: (OsString, OsString)) -> Result<(String, String)> {
@@ -558,9 +669,11 @@ fn load_from_sources(
     config_path: &Path,
     overlays: &[PathBuf],
     process_environment: HashMap<String, String>,
+    user_dir: Option<&Path>,
 ) -> Result<AppConfig> {
+    let config_path = resolve_config_path(config_path, user_dir)?;
     let mut value: Value = yaml_serde::from_str(
-        &fs::read_to_string(config_path).with_context(|| {
+        &fs::read_to_string(&config_path).with_context(|| {
             format!(
                 "failed to read configuration file {}",
                 config_path.display()
@@ -584,7 +697,7 @@ fn load_from_sources(
         merge_values(&mut value, &overlay);
     }
 
-    let dotenv_path = dotenv_path(config_path);
+    let dotenv_path = dotenv_path(&config_path);
     let mut variables = if dotenv_path
         .try_exists()
         .with_context(|| format!("failed to inspect {}", dotenv_path.display()))?
