@@ -1,7 +1,11 @@
+[workspace]
+members = ["crates/nanokb-eval"]
+
 [package]
 name = "nanokb"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/Besthope-Official/nanokb"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -34,3 +38,8 @@ pdf = ["dep:lopdf", "dep:sha2", "dep:pdfium-render", "dep:pdfium-bundled", "dep:
 
 [dev-dependencies]
 rstest = "0.26"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

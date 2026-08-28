@@ -1725,6 +1725,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanokb-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nanokb",
+ "tokio",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
