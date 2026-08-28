@@ -8,8 +8,9 @@ use crate::filter::Filter;
 use crate::{AppConfig, postgres, task};
 #[cfg(feature = "pdf")]
 use crate::pdf::{self, ConvertStage};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use std::fs;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -211,6 +212,23 @@ enum TopLevelCommand {
     },
     #[command(name = "flush-db", about = "Drop every nanokb table")]
     FlushDb,
+    #[command(about = "Generate configuration files")]
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Write a config.yaml template and a .env secrets skeleton to the
+    /// user-level config dir (~/.config/nanokb), or to the current directory
+    /// with --local. Refuses to overwrite existing files.
+    Init {
+        /// Write config.yaml and .env to the current directory (development).
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 #[cfg(feature = "pdf")]
@@ -223,7 +241,7 @@ impl TopLevelCommand {
             | TopLevelCommand::Doc { .. }
             | TopLevelCommand::Query { .. }
             | TopLevelCommand::FlushDb => true,
-            TopLevelCommand::Convert { .. } => false,
+            TopLevelCommand::Convert { .. } | TopLevelCommand::Config { .. } => false,
         }
     }
 }
@@ -278,6 +296,10 @@ enum DocCommand {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    if let TopLevelCommand::Config { command } = &cli.command {
+        return run_config(command);
+    }
+
     let config = AppConfig::try_load_from("config.yaml")
         .context("failed to load application configuration")?;
 
@@ -286,6 +308,33 @@ pub async fn run() -> Result<()> {
         return run_convert(cli.command, &config).await;
     }
     run_db_command(cli.command, &config).await
+}
+
+fn run_config(command: &ConfigCommand) -> Result<()> {
+    let ConfigCommand::Init { local } = command;
+    let dir = if *local {
+        PathBuf::from(".")
+    } else {
+        crate::config::user_config_dir()
+            .context("neither XDG_CONFIG_HOME nor HOME is set; use --local to write to the current directory")?
+    };
+    let config_path = dir.join("config.yaml");
+    if config_path.exists() {
+        bail!("configuration file already exists at {}", config_path.display());
+    }
+    let env_path = dir.join(".env");
+    if env_path.exists() {
+        bail!("secrets file already exists at {}", env_path.display());
+    }
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let template = include_str!("../config.yaml");
+    fs::write(&config_path, template)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    fs::write(&env_path, crate::config::dotenv_skeleton(template))
+        .with_context(|| format!("failed to write {}", env_path.display()))?;
+    println!("wrote {} and {}", config_path.display(), env_path.display());
+    println!("fill in the .env secrets, then run nanokb kb create");
+    Ok(())
 }
 
 #[cfg(feature = "pdf")]
@@ -377,6 +426,9 @@ async fn run_db_command(command: TopLevelCommand, config: &AppConfig) -> Result<
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
+        TopLevelCommand::Config { .. } => {
+            unreachable!("config is handled before the configuration load")
+        }
         #[cfg(feature = "pdf")]
         TopLevelCommand::Convert { .. } => {
             unreachable!("convert is handled before the database connection")

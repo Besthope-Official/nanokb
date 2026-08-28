@@ -693,3 +693,42 @@ fn errors_when_local_missing_and_home_is_unset() {
         "unexpected error: {error}"
     );
 }
+
+#[test]
+fn dotenv_skeleton_lists_every_placeholder_from_the_template() {
+    let skeleton = dotenv_skeleton(include_str!("../config.yaml"));
+
+    for key in [
+        "DB_USER",
+        "DB_PASSWORD",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_NAME",
+        "BGE_M3_EMBED_API_BASE",
+        "BGE_M3_EMBED_API_KEY",
+        "QWEN_EMBED_API_BASE",
+        "QWEN_EMBED_API_KEY",
+        "DEEPSEEK_API_BASE",
+        "DEEPSEEK_API_KEY",
+        "BGE_M3_RERANKER_API_BASE",
+        "BGE_M3_RERANKER_API_KEY",
+        "PADDLEOCR_ACCESS_TOKEN",
+    ] {
+        assert!(
+            skeleton.contains(&format!("{key}=")),
+            "skeleton is missing {key}:\n{skeleton}"
+        );
+    }
+    assert_eq!(skeleton.lines().count(), 15);
+}
+
+#[test]
+fn dotenv_skeleton_deduplicates_and_ignores_non_placeholders() {
+    let skeleton = dotenv_skeleton("database:\n  url: \"{DB_USER}:{DB_USER}@{HOST}\"\n  plain: postgres://localhost\n");
+
+    assert_eq!(skeleton.lines().count(), 3);
+    assert!(skeleton.starts_with("# nanokb secrets"));
+    assert!(skeleton.contains("DB_USER=\n"));
+    assert!(skeleton.contains("HOST=\n"));
+    assert!(!skeleton.contains("plain"));
+}
