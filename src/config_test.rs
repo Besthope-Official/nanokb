@@ -44,7 +44,7 @@ fn loads_placeholders_from_adjacent_dotenv() {
     )
     .unwrap();
 
-    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
+    let config = load_from_sources(&config_path, &[], HashMap::new(), None).unwrap();
 
     assert_eq!(
         config.database.url,
@@ -74,7 +74,7 @@ fn process_environment_overrides_dotenv() {
         "postgres://from-process".to_string(),
     )]);
 
-    let config = load_from_sources(&config_path, &[], process_environment).unwrap();
+    let config = load_from_sources(&config_path, &[], process_environment, None).unwrap();
 
     assert_eq!(config.database.url, "postgres://from-process");
 }
@@ -89,7 +89,7 @@ fn pdf_access_token_is_optional_and_loaded_from_environment() {
     )
     .unwrap();
 
-    let config = load_from_sources(&config_path, &[], HashMap::new()).unwrap();
+    let config = load_from_sources(&config_path, &[], HashMap::new(), None).unwrap();
     assert!(config.pdf.access_token.is_empty());
 
     let config = load_from_sources(
@@ -99,6 +99,7 @@ fn pdf_access_token_is_optional_and_loaded_from_environment() {
             "PADDLEOCR_ACCESS_TOKEN".to_string(),
             "pdf-token".to_string(),
         )]),
+        None,
     )
     .unwrap();
     assert_eq!(config.pdf.access_token, "pdf-token");
@@ -593,4 +594,102 @@ fn try_load_overlay_with_placeholders() {
 
     // Overlay value wins over both the dotenv placeholder and the base url.
     assert_eq!(config.database.url, "postgres://production-host/nanokb");
+}
+
+#[test]
+fn falls_back_to_user_config_when_local_missing() {
+    let local_dir = TestDirectory::new();
+    let home = TestDirectory::new();
+    let user_config = home.path().join(".nanokb").join("config.yaml");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        "database:\n  url: \"postgres://{DB_USER}:{DB_PASSWORD}@postgres:5432/nanokb\"\nmodel:\n  embeddings: {}\n",
+    )
+    .unwrap();
+    fs::write(
+        user_config.parent().unwrap().join(".env"),
+        "DB_USER=nanokb\nDB_PASSWORD=secret\n",
+    )
+    .unwrap();
+
+    let config = load_from_sources(
+        &local_dir.path().join("config.yaml"),
+        &[],
+        HashMap::new(),
+        Some(home.path()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        config.database.url,
+        "postgres://nanokb:secret@postgres:5432/nanokb"
+    );
+}
+
+#[test]
+fn prefers_local_config_over_user_config() {
+    let local_dir = TestDirectory::new();
+    let home = TestDirectory::new();
+    fs::write(
+        local_dir.path().join("config.yaml"),
+        "database:\n  url: \"postgres://local@localhost/nanokb\"\nmodel:\n  embeddings: {}\n",
+    )
+    .unwrap();
+    let user_config = home.path().join(".nanokb").join("config.yaml");
+    fs::create_dir_all(user_config.parent().unwrap()).unwrap();
+    fs::write(
+        &user_config,
+        "database:\n  url: \"postgres://user@localhost/nanokb\"\nmodel:\n  embeddings: {}\n",
+    )
+    .unwrap();
+
+    let config = load_from_sources(
+        &local_dir.path().join("config.yaml"),
+        &[],
+        HashMap::new(),
+        Some(home.path()),
+    )
+    .unwrap();
+
+    assert_eq!(config.database.url, "postgres://local@localhost/nanokb");
+}
+
+#[test]
+fn errors_when_neither_config_exists() {
+    let local_dir = TestDirectory::new();
+    let home = TestDirectory::new();
+
+    let Err(error) = load_from_sources(
+        &local_dir.path().join("config.yaml"),
+        &[],
+        HashMap::new(),
+        Some(home.path()),
+    ) else {
+        panic!("expected an error");
+    };
+
+    assert!(
+        error.to_string().contains("failed to find configuration file"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn errors_when_local_missing_and_home_is_unset() {
+    let local_dir = TestDirectory::new();
+
+    let Err(error) = load_from_sources(
+        &local_dir.path().join("config.yaml"),
+        &[],
+        HashMap::new(),
+        None,
+    ) else {
+        panic!("expected an error");
+    };
+
+    assert!(
+        error.to_string().contains("$HOME is not set"),
+        "unexpected error: {error}"
+    );
 }

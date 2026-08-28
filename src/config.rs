@@ -508,7 +508,12 @@ impl AppConfig {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(path.as_ref(), &[], process_environment)
+        load_from_sources(
+            path.as_ref(),
+            &[],
+            process_environment,
+            home_dir().as_deref(),
+        )
     }
 
     /// Load the base config then merge each overlay file (in order) on top
@@ -520,8 +525,38 @@ impl AppConfig {
         let process_environment = env::vars_os()
             .map(unicode_environment_variable)
             .collect::<Result<HashMap<_, _>>>()?;
-        load_from_sources(base.as_ref(), overlays, process_environment)
+        load_from_sources(base.as_ref(), overlays, process_environment, home_dir().as_deref())
     }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Prefer the local config file (development); fall back to `~/.nanokb/config.yaml`.
+///
+/// `home` is `None` when `$HOME` is unavailable, which disables the fallback.
+fn resolve_config_path(config_path: &Path, home: Option<&Path>) -> Result<PathBuf> {
+    if config_path.exists() {
+        return Ok(config_path.to_path_buf());
+    }
+    let user_config = match home {
+        Some(home) => home.join(".nanokb").join("config.yaml"),
+        None => {
+            bail!(
+                "configuration file {} does not exist, and $HOME is not set so ~/.nanokb/config.yaml cannot be used",
+                config_path.display()
+            )
+        }
+    };
+    if user_config.exists() {
+        return Ok(user_config);
+    }
+    bail!(
+        "failed to find configuration file: neither {} nor {} exists",
+        config_path.display(),
+        user_config.display()
+    )
 }
 
 fn unicode_environment_variable(variable: (OsString, OsString)) -> Result<(String, String)> {
@@ -558,9 +593,11 @@ fn load_from_sources(
     config_path: &Path,
     overlays: &[PathBuf],
     process_environment: HashMap<String, String>,
+    home: Option<&Path>,
 ) -> Result<AppConfig> {
+    let config_path = resolve_config_path(config_path, home)?;
     let mut value: Value = yaml_serde::from_str(
-        &fs::read_to_string(config_path).with_context(|| {
+        &fs::read_to_string(&config_path).with_context(|| {
             format!(
                 "failed to read configuration file {}",
                 config_path.display()
@@ -584,7 +621,7 @@ fn load_from_sources(
         merge_values(&mut value, &overlay);
     }
 
-    let dotenv_path = dotenv_path(config_path);
+    let dotenv_path = dotenv_path(&config_path);
     let mut variables = if dotenv_path
         .try_exists()
         .with_context(|| format!("failed to inspect {}", dotenv_path.display()))?
