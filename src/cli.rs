@@ -213,6 +213,21 @@ enum TopLevelCommand {
     FlushDb,
 }
 
+#[cfg(feature = "pdf")]
+impl TopLevelCommand {
+    /// Every command reads or writes the kb through the postgres pool, except
+    /// `convert`, which runs purely on the filesystem and the OCR API.
+    fn needs_database(&self) -> bool {
+        match self {
+            TopLevelCommand::Kb { .. }
+            | TopLevelCommand::Doc { .. }
+            | TopLevelCommand::Query { .. }
+            | TopLevelCommand::FlushDb => true,
+            TopLevelCommand::Convert { .. } => false,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum KbCommand {
     #[command(about = "Create a kb from config.yaml, optionally merged with overlay files")]
@@ -265,13 +280,49 @@ pub async fn run() -> Result<()> {
 
     let config = AppConfig::try_load_from("config.yaml")
         .context("failed to load application configuration")?;
+
+    #[cfg(feature = "pdf")]
+    if !cli.command.needs_database() {
+        return run_convert(cli.command, &config).await;
+    }
+    run_db_command(cli.command, &config).await
+}
+
+#[cfg(feature = "pdf")]
+async fn run_convert(command: TopLevelCommand, config: &AppConfig) -> Result<()> {
+    let TopLevelCommand::Convert {
+        file,
+        out,
+        stage,
+        dry_run,
+        slice_pages,
+        doc_type,
+    } = command
+    else {
+        unreachable!("run_convert is only reachable for the convert command");
+    };
+    let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
+    let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
+    pdf::convert(
+        &config.pdf,
+        &file,
+        out.as_deref(),
+        stage,
+        dry_run,
+        slice_pages,
+        doc_type,
+    )
+    .await
+}
+
+async fn run_db_command(command: TopLevelCommand, config: &AppConfig) -> Result<()> {
     let pool = postgres::connect(&config.database.url).await?;
 
-    if !matches!(cli.command, TopLevelCommand::FlushDb) {
+    if !matches!(command, TopLevelCommand::FlushDb) {
         postgres::initialize(&pool).await?;
     }
 
-    match cli.command {
+    match command {
         TopLevelCommand::Kb {
             command: KbCommand::Create { name, config_path, overlay_files },
         } => {
@@ -325,29 +376,11 @@ pub async fn run() -> Result<()> {
             expand_depth,
             filters,
         } => run_query(&config, &pool, &kb, &text, mode, top_k, reranker.as_deref(), expand, expand_depth, &filters).await,
-        #[cfg(feature = "pdf")]
-        TopLevelCommand::Convert {
-            file,
-            out,
-            stage,
-            dry_run,
-            slice_pages,
-            doc_type,
-        } => {
-            let slice_pages = slice_pages.unwrap_or(config.pdf.slice_pages);
-            let doc_type = doc_type.unwrap_or(pdf::DocType::Auto);
-            pdf::convert(
-                &config.pdf,
-                &file,
-                out.as_deref(),
-                stage,
-                dry_run,
-                slice_pages,
-                doc_type,
-            )
-            .await
-        }
         TopLevelCommand::FlushDb => postgres::flush_db(&pool).await,
+        #[cfg(feature = "pdf")]
+        TopLevelCommand::Convert { .. } => {
+            unreachable!("convert is handled before the database connection")
+        }
     }
 }
 
